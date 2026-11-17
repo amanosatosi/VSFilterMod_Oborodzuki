@@ -51,11 +51,14 @@ CSRIAPI void csri_oborodzuki_profile_reset()
     render_profile() = RenderProfile{};
 }
 
-CSRIAPI void csri_oborodzuki_profile_read(uint64_t* ns, uint64_t* calls)
+CSRIAPI void csri_oborodzuki_profile_read(unsigned long long* ns, unsigned long long* calls)
 {
     const auto& profile = render_profile();
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    const double nanosecondsPerTick = 1e9 / frequency.QuadPart;
     for (unsigned i = 0; i < static_cast<unsigned>(RenderStage::Count); ++i) {
-        ns[i] = profile.ns[i];
+        ns[i] = static_cast<unsigned long long>(profile.ticks[i] * nanosecondsPerTick);
         calls[i] = profile.calls[i];
     }
 }
