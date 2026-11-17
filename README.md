@@ -27,8 +27,9 @@ Development pushes use the iteration suite. Select `full` for a workflow dispatc
 include `Benchmark-Suite: full` in the message of a development commit that triggers the
 workflow. Use the same suite when evaluating changes in render latency.
 
-The pre-optimization synthetic timings are preserved in
-[the original benchmark run](https://github.com/amanosatosi/VSFilterMod_Oborodzuki/actions/runs/44091239735).
+The [pre-optimization synthetic timings](benchmarks/baseline-44091239735/summary.md)
+preserve the results and renderer revisions from
+[run 44091239735](https://github.com/amanosatosi/VSFilterMod_Oborodzuki/actions/runs/44091239735).
 
 Usage
 =====
