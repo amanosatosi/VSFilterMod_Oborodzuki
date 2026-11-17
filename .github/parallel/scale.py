@@ -29,7 +29,8 @@ for name, (count, effects) in scenarios.items():
                  f"Worker overlap event {index}"
                  + (" 日本語 မြန်မာ" if name == "mixed" else "") + "\n")
     (ROOT / f"{name}.ass").write_text(text, encoding="utf-8")
-subprocess.run(["hosts/concurrent.exe", DLL, str((ROOT / "overlap-32.ass").resolve())], check=True)
+print("Checking concurrent instances and repeated teardown", flush=True)
+subprocess.run(["hosts/concurrent.exe", DLL, str((ROOT / "overlap-32.ass").resolve())], check=True, timeout=180)
 
 samples = []
 os.environ["OBORODZUKI_BENCH_ITERATION"] = "1"
@@ -37,10 +38,11 @@ for name in scenarios:
     for trial in range(3):
         order = WORKERS if trial % 2 == 0 else WORKERS[::-1]
         for workers in order:
+            print(f"Starting {name}, trial {trial + 1}, workers={workers}", flush=True)
             os.environ["OBORODZUKI_WORKERS"] = str(workers)
             result = subprocess.run([HOST, "csri", DLL, str((ROOT / f"{name}.ass").resolve()),
                                      "static" if name == "static" else "animation"],
-                                    text=True, capture_output=True)
+                                    text=True, capture_output=True, timeout=180)
             if result.returncode:
                 raise RuntimeError(f"{name}, workers={workers}: {result.stderr}")
             samples.append(dict(json.loads(result.stdout), workload=name, trial=trial + 1, workers=workers))
@@ -72,7 +74,7 @@ if os.environ.get("PARALLEL_FULL") == "true":
         dest = ROOT / f"workers-{workers}"
         subprocess.run([PLAYBACK, "csri", DLL, str(Path(plan["fixture"]).resolve()), str(dest.resolve()),
                         str(plan["dialogue_events"]), str(plan["size_bytes"]),
-                        *map(str, plan["capture_frames"])], check=True)
+                        *map(str, plan["capture_frames"])], check=True, timeout=900)
         with (dest / "frames.csv").open(newline="") as file:
             rows = list(csv.DictReader(file))
         if len(rows) != 5400 or [int(r["frame"]) for r in rows] != list(range(5400)):
@@ -96,7 +98,7 @@ if os.environ.get("PARALLEL_FULL") == "true":
         os.environ["OBORODZUKI_WORKERS"] = "1"
         dest = ROOT / "previous-single"
         subprocess.run([PLAYBACK, "csri", str(previous_dll.resolve()), str(Path(plan["fixture"]).resolve()),
-                        str(dest.resolve()), str(plan["dialogue_events"]), str(plan["size_bytes"])], check=True)
+                        str(dest.resolve()), str(plan["dialogue_events"]), str(plan["size_bytes"])], check=True, timeout=900)
         with (dest / "frames.csv").open(newline="") as file:
             rows = list(csv.DictReader(file))
         if len(rows) != 5400 or [row["rgb_hash"] for row in rows] != full[1]["hashes"]:
