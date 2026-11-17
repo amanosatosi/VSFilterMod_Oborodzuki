@@ -56,6 +56,11 @@ stores output bounds separately. Legacy scripts using video-relative coordinates
 can expose this pre-existing defect. The KFX and regression comparisons check for
 unexpected pixel changes.
 
+The scrolling-effect regression also exposed an existing switch fallthrough.
+Scroll processing entered vector-clip handling and read uninitialized timing
+fields from its Effect object. A break now ends the scroll case. This removes
+nondeterministic clipping independently of the event scheduler.
+
 Font keys now populate the same LOGFONT fields directly. The generic style
 conversion queried screen DPI to compute a height that the renderer immediately
 overwrote. Removing that query eliminates shared screen-DC operations in a hot
@@ -74,6 +79,11 @@ The [xy-VSFilter queue](https://github.com/pinterf/xy-VSFilter/blob/master/src/s
 also has a CAMThread producer, wait events and calls to RenderTo.
 These queues address frame delivery and overlap with playback. The event pool
 added here operates inside an individual frame.
+
+The XySubFilter provider wrapper handles a consumer's frame request, reuses a
+valid cached frame, then locks the provider around RenderEx when it needs fresh
+output. This separates consumer delivery from the renderer's internal event work.
+Its wrapper supplies no same-frame event scheduler. [Provider source](https://github.com/Cyberbeing/xy-VSFilter/blob/xy_sub_filter_rc5/src/subpic/XySubRenderProviderWrapper.cpp)
 
 The [archived Threaded VSFilter project description](https://storage.googleapis.com/google-code-archive/v2/code.google.com/threaded-vsfilter/project.json)
 describes multithreaded rasterization, rendering and duplicate-work caches. It

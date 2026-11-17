@@ -5200,6 +5200,9 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
 
                 fPosOverride = true;
             }
+            // Scroll has no vector-clip timing fields. Falling through reads
+            // uninitialized Effect::t values and enables an unintended mask move.
+            break;
 #ifdef _VSMOD // patch m006. moveable vector clip
             case EF_VECTCLP:
             {
