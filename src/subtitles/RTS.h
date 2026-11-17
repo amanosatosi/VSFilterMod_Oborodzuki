@@ -251,14 +251,7 @@ struct OverrideTagCache;
 struct TextGeometryCache;
 struct TextDeviceContext;
 class EventWorkerPool;
-struct EventWorkerStatistics
-{
-    unsigned long long batches = 0, tasks = 0, busyNs = 0, wakeNs = 0, waitNs = 0, dispatchNs = 0;
-    unsigned long long preparationNs = 0;
-    unsigned long long tasksByWorker[8]{}, busyByWorkerNs[8]{};
-    unsigned long long idleNs = 0, mutexNs = 0;
-    unsigned long long blendNs = 0, blendBatches = 0;
-};
+struct EventWorkerStatistics;
 
 [uuid("537DCACA-2812-4a4f-B2C6-1A34C17ADEB0")]
 class CRenderedTextSubtitle : public CSimpleTextSubtitle, public ISubPicProviderImpl, public ISubStream

@@ -141,7 +141,8 @@ void play(const Playback& playback, Render render, double setupMs, int parsedEve
         read(ns, calls);
         meta << ",\"profile\":[";
         for (unsigned i = 0; i < stages; ++i)
-            meta << (i ? "," : "") << "{\"ns\":" << ns[i] << ",\"calls\":" << calls[i] << '}';
+            meta << (i ? "," : "") << "{\"name\":\"" << RenderStageNames[i]
+                << "\",\"ns\":" << ns[i] << ",\"calls\":" << calls[i] << '}';
         meta << ']';
     }
     meta << "}\n";
@@ -163,7 +164,7 @@ void run_csri(HMODULE dll, const std::vector<char>& input, const Playback& playb
     if (!instance || csri_request_fmt(instance.get(), &format))
         throw std::runtime_error("CSRI rejected the input file or playback format");
     const auto reset = reinterpret_cast<ProfileReset>(GetProcAddress(dll, "csri_oborodzuki_profile_reset"));
-    const auto read = reinterpret_cast<ProfileRead>(GetProcAddress(dll, "csri_oborodzuki_profile_read"));
+    const auto read = reinterpret_cast<ProfileRead>(GetProcAddress(dll, "csri_oborodzuki_profile_read_v2"));
     play(playback, [&](int timestamp, uint8_t* pixels) {
         csri_frame frame{};
         frame.pixfmt = format.pixfmt;
@@ -174,14 +175,9 @@ void run_csri(HMODULE dll, const std::vector<char>& input, const Playback& playb
         const auto seconds = std::nextafter(timestamp / 1000.0, (std::numeric_limits<double>::infinity)());
         csri_render(instance.get(), &frame, seconds);
     }, elapsed_ms(start), -1, reset, read);
-    struct WorkerStats {
-        unsigned long long batches, tasks, busyNs, wakeNs, waitNs, dispatchNs;
-        unsigned long long preparationNs, tasksByWorker[8], busyByWorkerNs[8];
-        unsigned long long idleNs, mutexNs;
-        unsigned long long blendNs, blendBatches;
-    } stats{};
-    using ReadWorkers = void (*)(WorkerStats*, csri_inst*);
-    const auto workers = reinterpret_cast<ReadWorkers>(GetProcAddress(dll, "csri_oborodzuki_worker_stats"));
+    EventWorkerStatistics stats;
+    using ReadWorkers = void (*)(EventWorkerStatistics*, csri_inst*);
+    const auto workers = reinterpret_cast<ReadWorkers>(GetProcAddress(dll, "csri_oborodzuki_worker_stats_v2"));
     if (workers) {
         workers(&stats, instance.get());
         std::ofstream output(playback.output / "worker-stats.json");
@@ -195,7 +191,9 @@ void run_csri(HMODULE dll, const std::vector<char>& input, const Playback& playb
             << ",\"mutex_acquisition_ms\":" << stats.mutexNs / 1e6 << ",\"workers\":[";
         for (unsigned i = 0; i < 8; ++i)
             output << (i ? "," : "") << "{\"tasks\":" << stats.tasksByWorker[i]
-                << ",\"busy_ms\":" << stats.busyByWorkerNs[i] / 1e6 << "}";
+                << ",\"busy_ms\":" << stats.busyByWorkerNs[i] / 1e6
+                << ",\"glyph_requests\":" << stats.glyphRequests[i]
+                << ",\"glyph_hits\":" << stats.glyphHits[i] << "}";
         output << "]}\n";
     }
 }

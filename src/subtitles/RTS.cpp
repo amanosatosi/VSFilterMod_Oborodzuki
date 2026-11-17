@@ -98,6 +98,19 @@ public:
     ~TextDeviceScope() { g_hDC = previous; }
 };
 
+class SelectedTextFont
+{
+    HDC dc;
+    HFONT previous;
+
+public:
+    explicit SelectedTextFont(HFONT font) : dc(g_hDC), previous(SelectFont(dc, font)) {}
+    ~SelectedTextFont() { if (previous) SelectFont(dc, previous); }
+    explicit operator bool() const { return previous != nullptr; }
+    SelectedTextFont(const SelectedTextFont&) = delete;
+    SelectedTextFont& operator=(const SelectedTextFont&) = delete;
+};
+
 static long revcolor(long c)
 {
     return ((c & 0xff0000) >> 16) + (c & 0xff00) + ((c & 0xff) << 16);
@@ -236,6 +249,7 @@ struct TextGeometryCache
 
     void StartFrame()
     {
+        PROFILE_RENDER_STAGE(Cache);
         const unsigned revision = SubtitleFontRevision();
         FILETIME currentMachine{}, currentUser{};
         if (!FontStamp(HKEY_LOCAL_MACHINE, machineFonts, currentMachine) ||
@@ -250,6 +264,7 @@ struct TextGeometryCache
 
     TextGeometry& Get(const LOGFONT& font, const CStringW& text)
     {
+        PROFILE_RENDER_STAGE(Cache);
         TextGeometryKey key{font, text};
         const auto found = runs.find(key);
         if (found != runs.end())
@@ -261,6 +276,7 @@ struct TextGeometryCache
 
     void SavePath(TextGeometry& run, const POINT* points, const BYTE* types, size_t count)
     {
+        PROFILE_RENDER_STAGE(Cache);
         constexpr size_t maxBytes = 4 * 1024 * 1024;
         if (count > maxBytes / (sizeof(POINT) + sizeof(BYTE)))
             return;
@@ -385,6 +401,7 @@ class EventWorkerPool
 #ifdef OBORODZUKI_PROFILE
                 samples[index].wakeNs += Since(published);
                 render_profile() = RenderProfile{};
+                samples[index].stages = RenderProfile{};
 #endif
                 if (useTextContext)
                 {
@@ -494,6 +511,10 @@ public:
             ready[i].notify_one();
 #ifdef OBORODZUKI_PROFILE
         stats.dispatchNs += Since(dispatched);
+        constexpr auto glyph = static_cast<unsigned>(RenderStage::GlyphPath);
+        constexpr auto hit = static_cast<unsigned>(RenderStage::GlyphPathHit);
+        const auto callerRequests = render_profile().calls[glyph];
+        const auto callerHits = render_profile().calls[hit];
 #endif
         Drain(0);
 #ifdef OBORODZUKI_PROFILE
@@ -516,8 +537,12 @@ public:
             stats.preparationNs += Since(dispatched);
         ++stats.batches;
         stats.tasks += work.size();
+        stats.glyphRequests[0] += render_profile().calls[glyph] - callerRequests;
+        stats.glyphHits[0] += render_profile().calls[hit] - callerHits;
         for (unsigned worker = 1; worker < activeWorkers; ++worker)
         {
+            stats.glyphRequests[worker] += samples[worker].stages.calls[glyph];
+            stats.glyphHits[worker] += samples[worker].stages.calls[hit];
             for (unsigned stage = 0; stage < static_cast<unsigned>(RenderStage::Count); ++stage)
             {
                 render_profile().ns[stage] += samples[worker].stages.ns[stage];
@@ -1206,13 +1231,15 @@ CText::CText(STSStyle& style, CStringW str, int ktype, int kstart, int kend, dou
     };
     if (geometry && geometry->measured)
     {
+        PROFILE_RENDER_STAGE(TextMeasureHit);
         applyMetrics(geometry->ascent, geometry->descent);
         m_width = int(m_style.fontScaleX / 100 * int(measureWidth(geometry->extent)) + 4) >> 3;
         return;
     }
 
+    PROFILE_RENDER_STAGE(GdiMetrics);
     CMyFont font(logFont);
-    HFONT hOldFont = SelectFont(g_hDC, font);
+    const SelectedTextFont selected(font);
     TEXTMETRIC metrics{};
     const bool hasMetrics = !!GetTextMetrics(g_hDC, &metrics);
     const int ascent = (metrics.tmAscent + 4) >> 3;
@@ -1225,7 +1252,6 @@ CText::CText(STSStyle& style, CStringW str, int ktype, int kstart, int kend, dou
             CSize extent;
             if (!GetTextExtentPoint32W(g_hDC, s, 1, &extent))
             {
-                SelectFont(g_hDC, hOldFont);
                 ASSERT(0);
                 return;
             }
@@ -1241,12 +1267,11 @@ CText::CText(STSStyle& style, CStringW str, int ktype, int kstart, int kend, dou
         CSize extent;
         if (!GetTextExtentPoint32W(g_hDC, m_str, wcslen(str), &extent))
         {
-            SelectFont(g_hDC, hOldFont);
             ASSERT(0);
             return;
         }
         m_width = int(measureWidth(extent));
-        if (geometry && hasMetrics && hOldFont && font.GetSafeHandle())
+        if (geometry && hasMetrics && selected && font.GetSafeHandle())
         {
             geometry->extent = extent;
             geometry->ascent = ascent;
@@ -1255,7 +1280,6 @@ CText::CText(STSStyle& style, CStringW str, int ktype, int kstart, int kend, dou
         }
     }
     m_width = int(m_style.fontScaleX / 100 * m_width + 4) >> 3;
-    SelectFont(g_hDC, hOldFont);
 }
 
 CWord* CText::Copy()
@@ -1282,12 +1306,16 @@ bool CText::CreatePath()
     const auto logFont = TextLogFont(m_style);
     auto* geometry = !measureCharacters && activeTextGeometry && m_str.GetLength() <= 128
         ? &activeTextGeometry->Get(logFont, m_str) : nullptr;
-    if (geometry && geometry->hasPath &&
-        CopyPath(geometry->points.data(), geometry->types.data(), geometry->points.size()))
-        return true;
+    if (geometry && geometry->hasPath)
+    {
+        PROFILE_RENDER_STAGE(GlyphPathHit);
+        if (CopyPath(geometry->points.data(), geometry->types.data(), geometry->points.size()))
+            return true;
+    }
 
+    PROFILE_RENDER_STAGE(GdiPath);
     CMyFont font(logFont);
-    HFONT hOldFont = SelectFont(g_hDC, font);
+    const SelectedTextFont selected(font);
 
     int width = 0;
 
@@ -1300,7 +1328,6 @@ bool CText::CreatePath()
             CSize extent;
             if(!GetTextExtentPoint32W(g_hDC, s, 1, &extent))
             {
-                SelectFont(g_hDC, hOldFont);
                 ASSERT(0);
                 return(false);
             }
@@ -1318,7 +1345,6 @@ bool CText::CreatePath()
         CSize extent;
         if(!GetTextExtentPoint32W(g_hDC, m_str, m_str.GetLength(), &extent))
         {
-            SelectFont(g_hDC, hOldFont);
             ASSERT(0);
             return(false);
         }
@@ -1326,12 +1352,10 @@ bool CText::CreatePath()
         const bool begun = BeginPath(g_hDC);
         const bool drawn = !!TextOutW(g_hDC, 0, 0, m_str, m_str.GetLength());
         const bool ended = EndPath(g_hDC);
-        if (geometry && !geometry->hasPath && begun && drawn && ended && hOldFont &&
+        if (geometry && !geometry->hasPath && begun && drawn && ended && selected &&
             font.GetSafeHandle() && (!mPathPoints || (mpPathPoints && mpPathTypes)))
             activeTextGeometry->SavePath(*geometry, mpPathPoints, mpPathTypes, mPathPoints);
     }
-
-    SelectFont(g_hDC, hOldFont);
 
     return(true);
 }
@@ -2331,6 +2355,7 @@ CLine* CSubtitle::GetNextLine(POSITION& pos, int maxwidth)
 
 void CSubtitle::CreateClippers(CSize size)
 {
+    PROFILE_RENDER_STAGE(Mask);
     size.cx >>= 3;
     size.cy >>= 3;
 
@@ -2455,6 +2480,7 @@ void CSubtitle::CreateClippers(CSize size)
 
 void CSubtitle::MakeLines(CSize size, CRect marginRect)
 {
+    PROFILE_RENDER_STAGE(Layout);
     CSize spaceNeeded(0, 0);
 
     bool fFirstLine = true;
@@ -2502,6 +2528,7 @@ void CScreenLayoutAllocator::Empty()
 
 void CScreenLayoutAllocator::AdvanceToSegment(int segment, const CAtlArray<int>& sa)
 {
+    PROFILE_RENDER_STAGE(Collision);
     POSITION pos = m_subrects.GetHeadPosition();
     while(pos)
     {
@@ -2529,6 +2556,7 @@ void CScreenLayoutAllocator::AdvanceToSegment(int segment, const CAtlArray<int>&
 
 CRect CScreenLayoutAllocator::AllocRect(CSubtitle* s, int segment, int entry, int layer, int collisions)
 {
+    PROFILE_RENDER_STAGE(Collision);
     // TODO: handle collisions == 1 (reversed collisions)
 
     POSITION pos = m_subrects.GetHeadPosition();
@@ -2772,6 +2800,7 @@ void CRenderedTextSubtitle::ParseEffect(CSubtitle* sub, CString str)
 
 void CRenderedTextSubtitle::ParseString(CSubtitle* sub, CStringW str, STSStyle& style)
 {
+    PROFILE_RENDER_STAGE(Layout);
     if(!sub) return;
 
     str.Replace(L"\\N", L"\n");
@@ -2837,6 +2866,7 @@ void CRenderedTextSubtitle::ParseString(CSubtitle* sub, CStringW str, STSStyle& 
 
 void CRenderedTextSubtitle::ParsePolygon(CSubtitle* sub, CStringW str, STSStyle& style)
 {
+    PROFILE_RENDER_STAGE(Layout);
     if(!sub || !str.GetLength() || !m_nPolygon) return;
 
     if(CWord* w = DNew CPolygon(style, str, m_ktype, m_kstart, m_kend, sub->m_scalex / (1 << (m_nPolygon - 1)), sub->m_scaley / (1 << (m_nPolygon - 1)), m_polygonBaselineOffset))
@@ -3241,6 +3271,7 @@ std::shared_ptr<const OverrideTags> OverrideTagCache::Get(const CStringW& text)
 
 bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org, bool fAnimate)
 {
+    PROFILE_RENDER_STAGE(Overrides);
     if (!sub)
         return false;
 
@@ -3254,11 +3285,11 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         const auto& params = tag.parameters;
 #ifdef _LUA
         // Direct function call!
-        CStringA Func(tag.rawCommand);
         if(m_overrideTags->IsLuaFunction(*this, tag.rawCommand))
         {
             hasExternalLua = true;
             // Find function =D
+            const CStringA Func(tag.rawCommand);
             lua_getglobal(L, Func);
 
             // Create line table
@@ -3914,7 +3945,6 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         {
             if(params.size() > 0)
             {
-                CStringA Func(params[0]);
                 if(LuaHasFunction(L, params[0]))
                 {
                     hasExternalLua = true;
@@ -4380,6 +4410,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 
 bool CRenderedTextSubtitle::ParseHtmlTag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org)
 {
+    PROFILE_RENDER_STAGE(Overrides);
     if(str.Find(L"!--") == 0)
         return(true);
 
@@ -4497,15 +4528,17 @@ bool CRenderedTextSubtitle::ParseHtmlTag(CSubtitle* sub, CStringW str, STSStyle&
 
 double CRenderedTextSubtitle::CalcAnimation(double dst, double src, bool fAnimate)
 {
+    PROFILE_RENDER_STAGE(Animation);
     int s = m_animStart ? m_animStart : 0;
     int e = m_animEnd ? m_animEnd : m_delay;
 
-    if(fabs(dst - src) >= 0.0001 && fAnimate)
+    if(fAnimate && fabs(dst - src) >= 0.0001)
     {
         if(m_time < s) dst = src;
         else if(s <= m_time && m_time < e)
         {
-            double t = pow(1.0 * (m_time - s) / (e - s), m_animAccel);
+            const double fraction = 1.0 * (m_time - s) / (e - s);
+            const double t = m_animAccel == 1.0 ? fraction : pow(fraction, m_animAccel);
             dst = (1 - t) * src + t * dst;
         }
 //		else dst = dst;
@@ -4517,19 +4550,12 @@ double CRenderedTextSubtitle::CalcAnimation(double dst, double src, bool fAnimat
 CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry)
 {
     PROFILE_RENDER_STAGE(Subtitle);
-    CSubtitle* sub;
-    if(m_subtitleCache.Lookup(entry, sub))
-    {
-        if(sub->m_fAnimated)
-        {
-            m_subtitleCache.RemoveKey(entry);
-            delete sub;
-        }
-        else return(sub);
-    }
+    CSubtitle* previous = nullptr;
+    if (m_subtitleCache.Lookup(entry, previous) && !previous->m_fAnimated)
+        return previous;
 
     std::unique_ptr<CSubtitle> owned(DNew CSubtitle());
-    sub = owned.get();
+    CSubtitle* sub = owned.get();
     if(!sub) return(NULL);
 
 #if defined (_VSMOD) && defined(_LUA)
@@ -4707,7 +4733,7 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry)
     sub->MakeLines(m_size, marginRect);
 
     m_subtitleCache[entry] = sub;
-
+    delete previous;
     return owned.release();
 }
 
@@ -4867,24 +4893,28 @@ static CRect PaintFrameBands(EventWorkerPool& pool, const std::vector<FramePaint
     // Bound the number of jobs for large surfaces. Smaller bands distribute
     // overlapping effects independently of how many distinct events draw them.
     const int bandHeight = (std::max)(32, (height - 1) / 48 + 1);
-    std::vector<Band> bands((height - 1) / bandHeight + 1);
+    std::vector<Band> bands;
     CRect bounds(0, 0, 0, 0);
     uint64_t totalPixels = 0;
-    for (const auto& event : overlays)
     {
-        for (const auto& draw : event.draws)
+        PROFILE_RENDER_STAGE(BandPlan);
+        bands.resize((height - 1) / bandHeight + 1);
+        for (const auto& event : overlays)
         {
-            bounds |= draw.bounds;
-            totalPixels += uint64_t(draw.bounds.Width()) * draw.bounds.Height();
-            for (int i = draw.bounds.top / bandHeight; i <= (draw.bounds.bottom - 1) / bandHeight; ++i)
+            for (const auto& draw : event.draws)
             {
-                auto& band = bands[i];
-                band.top = i * bandHeight;
-                band.bottom = band.top + (std::min)(bandHeight, height - band.top);
-                const int rows = (std::min)(int(draw.bounds.bottom), band.bottom) -
-                    (std::max)(int(draw.bounds.top), band.top);
-                band.pixels += uint64_t(rows) * draw.bounds.Width();
-                band.draws.push_back(&draw);
+                bounds |= draw.bounds;
+                totalPixels += uint64_t(draw.bounds.Width()) * draw.bounds.Height();
+                for (int i = draw.bounds.top / bandHeight; i <= (draw.bounds.bottom - 1) / bandHeight; ++i)
+                {
+                    auto& band = bands[i];
+                    band.top = i * bandHeight;
+                    band.bottom = band.top + (std::min)(bandHeight, height - band.top);
+                    const int rows = (std::min)(int(draw.bounds.bottom), band.bottom) -
+                        (std::max)(int(draw.bounds.top), band.top);
+                    band.pixels += uint64_t(rows) * draw.bounds.Width();
+                    band.draws.push_back(&draw);
+                }
             }
         }
     }
@@ -4900,16 +4930,19 @@ static CRect PaintFrameBands(EventWorkerPool& pool, const std::vector<FramePaint
 
     // Each band visits commands in the original event and paint order. Only
     // the scheduling order of whole, disjoint bands may change.
-    std::sort(bands.begin(), bands.end(), [](const Band& a, const Band& b) { return a.pixels > b.pixels; });
-    work.clear();
-    for (const auto& band : bands)
     {
-        if (band.draws.empty())
-            break;
-        work.emplace_back([job = &band] {
-            for (const auto* draw : job->draws)
-                draw->Blend(job->top, job->bottom);
-        });
+        PROFILE_RENDER_STAGE(BandPlan);
+        std::sort(bands.begin(), bands.end(), [](const Band& a, const Band& b) { return a.pixels > b.pixels; });
+        work.clear();
+        for (const auto& band : bands)
+        {
+            if (band.draws.empty())
+                break;
+            work.emplace_back([job = &band] {
+                for (const auto* draw : job->draws)
+                    draw->Blend(job->top, job->bottom);
+            });
+        }
     }
     pool.Run(work, EventWorkerPool::Batch::Blend,
         unsigned((std::min)(totalPixels / pixelsPerWorker, uint64_t(bands.size()))));
@@ -4929,7 +4962,11 @@ try
 
     int segment;
 //    TRACE(_T("search started: %d"), t);
-    const STSSegment* stss = SearchSubs(t, fps, &segment);
+    const STSSegment* stss;
+    {
+        PROFILE_RENDER_STAGE(ActiveEvents);
+        stss = SearchSubs(t, fps, &segment);
+    }
 //    TRACE(_T("search complete: %d"), t);
     if(!stss) return S_FALSE;
 
@@ -4943,6 +4980,7 @@ try
 
     // clear any cached subs that current position is not in its bounds
     {
+        PROFILE_RENDER_STAGE(Cache);
         POSITION pos = m_subtitleCache.GetStartPosition();
         while(pos)
         {
@@ -4964,16 +5002,16 @@ try
 
     CAtlArray<LSub> subs;
 
-    for(ptrdiff_t i = 0, j = stss->subs.GetCount(); i < j; i++)
     {
-        LSub ls;
-        ls.idx = stss->subs[i];
-        ls.layer = GetAt(stss->subs[i]).layer;
-        ls.readorder = GetAt(stss->subs[i]).readorder;
-        subs.Add(ls);
+        PROFILE_RENDER_STAGE(ActiveEvents);
+        for(ptrdiff_t i = 0, j = stss->subs.GetCount(); i < j; i++)
+        {
+            const int index = stss->subs[i];
+            const auto& entry = GetAt(index);
+            subs.Add({index, entry.layer, entry.readorder});
+        }
+        qsort(subs.GetData(), subs.GetCount(), sizeof(LSub), lscomp);
     }
-
-    qsort(subs.GetData(), subs.GetCount(), sizeof(LSub), lscomp);
 
     if (!m_eventWorkers)
         m_eventWorkers = std::make_unique<EventWorkerPool>();
@@ -5081,6 +5119,7 @@ try
         {
             if(!s->m_effects[k]) continue;
 
+            PROFILE_RENDER_STAGE(Animation);
             switch(k)
             {
             case EF_MOVE: // {\move(x1=param[0], y1=param[1], x2=param[2], y2=param[3], t1=t[0], t2=t[1])}
@@ -5400,6 +5439,7 @@ try
                 preparations.push_back(std::move(prepare));
         }
         auto paint = [=, &spd]() mutable {
+        PROFILE_RENDER_STAGE(EventPaint);
         CRect bbox2(0, 0, 0, 0);
         CPoint p, p2(0, r.top);
 

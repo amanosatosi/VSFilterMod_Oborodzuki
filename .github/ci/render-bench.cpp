@@ -176,8 +176,8 @@ void measure(Render render, const Workload& workload, double setup_ms,
     if (read_profile) {
         std::printf(",\"profile\":[");
         for (unsigned i = 0; i < stages; ++i)
-            std::printf("%s{\"ns\":%llu,\"calls\":%llu}", i ? "," : "",
-                static_cast<unsigned long long>(ns[i]), static_cast<unsigned long long>(calls[i]));
+            std::printf("%s{\"name\":\"%s\",\"ns\":%llu,\"calls\":%llu}", i ? "," : "",
+                RenderStageNames[i], static_cast<unsigned long long>(ns[i]), static_cast<unsigned long long>(calls[i]));
         std::printf("]");
     }
     std::puts("}");
@@ -196,7 +196,7 @@ void run_csri(HMODULE dll, const std::vector<char>& script, const Workload& work
     if (!instance || csri_request_fmt(instance, &format))
         throw std::runtime_error("CSRI initialization failed");
     auto reset = reinterpret_cast<ProfileReset>(GetProcAddress(dll, "csri_oborodzuki_profile_reset"));
-    auto read = reinterpret_cast<ProfileRead>(GetProcAddress(dll, "csri_oborodzuki_profile_read"));
+    auto read = reinterpret_cast<ProfileRead>(GetProcAddress(dll, "csri_oborodzuki_profile_read_v2"));
     measure([&](int t, uint8_t* pixels) {
         csri_frame frame{};
         frame.pixfmt = format.pixfmt;

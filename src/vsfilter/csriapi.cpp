@@ -46,7 +46,7 @@ typedef struct csri_vsfilter_inst csri_inst;
 #include "csri.h"
 
 #ifdef OBORODZUKI_PROFILE
-CSRIAPI void csri_oborodzuki_worker_stats(EventWorkerStatistics* result, csri_inst* instance)
+CSRIAPI void csri_oborodzuki_worker_stats_v2(EventWorkerStatistics* result, csri_inst* instance)
 {
     if (result && instance)
     {
@@ -59,7 +59,7 @@ CSRIAPI void csri_oborodzuki_profile_reset()
     render_profile() = RenderProfile{};
 }
 
-CSRIAPI void csri_oborodzuki_profile_read(uint64_t* ns, uint64_t* calls)
+CSRIAPI void csri_oborodzuki_profile_read_v2(uint64_t* ns, uint64_t* calls)
 {
     const auto& profile = render_profile();
     for (unsigned i = 0; i < static_cast<unsigned>(RenderStage::Count); ++i) {

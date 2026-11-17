@@ -1206,7 +1206,7 @@ CRect Rasterizer::Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int x
     draw.bounds = bbox;
     draw.body = fBody;
     auto& info = draw.info;
-    info.dst = reinterpret_cast<DWORD*>(spd.bits + ptrdiff_t(spd.pitch) * y) + x;
+    info.dst = reinterpret_cast<DWORD*>(static_cast<BYTE*>(spd.bits) + ptrdiff_t(spd.pitch) * y) + x;
     std::copy_n(switchpts, 4, info.sw);
     info.w = w;
     info.h = h;
