@@ -366,6 +366,12 @@ public:
 
     void Run(const std::vector<std::function<void()>>& work)
     {
+        if (!CanParallelize(work.size()))
+        {
+            for (const auto& task : work)
+                task();
+            return;
+        }
         // Thread creation failure leaves the existing pool usable.
         while (threads.size() + 1 < workers)
         {
@@ -4627,11 +4633,14 @@ static std::function<void()> PrepareEventGeometry(CSubtitle* subtitle, CPoint or
             else if (style.outlineWidthX + style.outlineWidthY > 0 &&
                 !(word->m_ktype == 2 && time < word->m_kstart))
                 layer = 3;
-            words.push_back({word, position, layer});
+            if (word->NeedsPreparation(position))
+                words.push_back({word, position, layer});
             x += word->m_width;
         }
         y += line->m_ascent + line->m_descent;
     }
+    if (words.empty())
+        return {};
     return [words = std::move(words), transformOrigin] {
         for (const auto& prepared : words)
         {
@@ -5073,7 +5082,11 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
 
         const int eventTime = m_time;
         if (parallel)
-            preparations.push_back(PrepareEventGeometry(s, org, org2, r, eventTime, rt));
+        {
+            auto prepare = PrepareEventGeometry(s, org, org2, r, eventTime, rt);
+            if (prepare)
+                preparations.push_back(std::move(prepare));
+        }
         auto paint = [=, &spd, &bbox2]() mutable {
         CPoint p, p2(0, r.top);
 

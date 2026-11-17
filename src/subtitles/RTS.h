@@ -73,6 +73,10 @@ public:
 
     virtual CWord* Copy() = 0;
     virtual bool Append(CWord* w);
+    bool NeedsPreparation(CPoint p) const
+    {
+        return !m_fDrawn || (m_p.x & 7) != (p.x & 7) || (m_p.y & 7) != (p.y & 7);
+    }
 
 #if defined (_VSMOD) && defined(_LUA)
     void Paint(CPoint p, CPoint org, int Layer);
