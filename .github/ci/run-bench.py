@@ -3,17 +3,18 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import statistics
 import subprocess
 import sys
 import time
 
 
-def run_engine(engine, fixture, workload):
+def run_engine(engine, fixture, workload, span=()):
     name, mode, dll = engine
     start = time.perf_counter()
     process = subprocess.run(
-        ["render-bench.exe", mode, dll, str(fixture.resolve()), workload],
+        [str(harness), mode, dll, str(fixture.resolve()), workload, *map(str, span)],
         text=True, capture_output=True
     )
     if process.returncode:
@@ -23,16 +24,30 @@ def run_engine(engine, fixture, workload):
     return row
 
 
-output, original, baseline, candidate, mangetsu = sys.argv[1:]
-output = Path(output)
+profiling = sys.argv[1:] == ["--profile"]
+output = Path("profile-results" if profiling else sys.argv[1])
+output.mkdir(exist_ok=True)
+harness = Path("benchmark-harness/render-bench.exe").resolve(strict=True)
 source = Path(__file__).with_name("shared.ass")
-engines = [
-    ("Original VSFilterMod r5.2.7", "csri", original),
-    ("Oborodzuki baseline", "csri", baseline),
-    ("Mangetsu legacy", "legacy", mangetsu),
-    ("Mangetsu RGBA", "rgba", mangetsu),
-    ("Oborodzuki candidate", "csri", candidate),
-]
+primary = Path(__file__).with_name("op.fx.4testing.ass")
+primary_bytes = primary.read_bytes()
+primary_sha256 = hashlib.sha256(primary_bytes).hexdigest()
+if not profiling and primary_sha256 != os.environ["BENCH_INPUT_SHA256"]:
+    raise RuntimeError("Primary benchmark SHA-256 differs from Prepare job")
+
+
+def as_milliseconds(timestamp):
+    hours, minutes, seconds, centiseconds = map(int, re.split(r"[:.]", timestamp))
+    return ((hours * 60 + minutes) * 60 + seconds) * 1000 + centiseconds * 10
+
+
+timestamp = r"([0-9]+:[0-9]{2}:[0-9]{2}\.[0-9]{2})"
+events = re.findall(r"^Dialogue:\s*[^,\r\n]*,\s*" + timestamp + r",\s*" + timestamp,
+                    primary_bytes.decode("utf-8-sig"), re.MULTILINE)
+if not events:
+    raise RuntimeError("No dialogue timestamps found in op.fx.4testing.ass")
+real_span = (min(as_milliseconds(start) for start, _ in events),
+             max(as_milliseconds(stop) for _, stop in events))
 
 shared = source.read_text(encoding="utf-8")
 animated = output / "animated.ass"
@@ -49,8 +64,46 @@ heavy.write_text(shared + "".join(
     rf"\bord4\blur3\alpha&H20&\t(\frz25)}}{{\kf100}}Heavy {{\kf300}}karaoke {i + 1}"
     "\n" for i in range(24)
 ), encoding="utf-8")
-fixtures = {"idle": source, "static": source, "animation": animated,
+fixtures = {"real": primary, "idle": source, "static": source, "animation": animated,
             "seek": animated, "heavy": heavy}
+
+if profiling:
+    stages = ["Frame bookkeeping and effects", "Subtitle parsing and layout",
+              "Font lookup and text measurement", "Glyph path construction", "Transform",
+              "Scan conversion", "Outline widening", "Rasterization", "Blur", "Compositing"]
+    engine = ("Oborodzuki profile", "csri", str(Path("bundle/renderer.dll").resolve(strict=True)))
+    profiles = {}
+    for workload, fixture in fixtures.items():
+        sample = run_engine(engine, fixture, workload, real_span if workload == "real" else ())
+        profile = sample.get("profile", [])
+        if len(profile) != len(stages) or not profile[0]["calls"]:
+            raise RuntimeError(f"Missing instrumented render stage data for {workload}")
+        profiles[workload] = dict(zip(stages, profile))
+    (output / "profile.json").write_text(json.dumps({
+        "primary_input": primary.name, "primary_sha256": primary_sha256,
+        "timestamp_range_ms": real_span, "stages": profiles
+    }, indent=2), encoding="utf-8")
+    lines = ["### Exclusive rendering wall time", "",
+             "Instrumentation adds overhead. The real workload uses 240 frames and synthetic workloads use 600.",
+             "", "| Workload | Stage | Exclusive ms | Calls |", "|---|---|---:|---:|"]
+    for workload, stages_result in profiles.items():
+        for name, score in sorted(stages_result.items(), key=lambda item: item[1]["ns"], reverse=True):
+            lines.append(f'| {workload} | {name} | {score["ns"] / 1e6:.3f} | {score["calls"]} |')
+    profile_report = "\n".join(lines) + "\n"
+    (output / "profile.md").write_text(profile_report, encoding="utf-8")
+    print(profile_report)
+    if "GITHUB_STEP_SUMMARY" in os.environ:
+        Path(os.environ["GITHUB_STEP_SUMMARY"]).write_text(profile_report, encoding="utf-8")
+    sys.exit()
+
+_, original, baseline, candidate, mangetsu = sys.argv[1:]
+engines = [
+    ("Original VSFilterMod r5.2.7", "csri", original),
+    ("Oborodzuki baseline", "csri", baseline),
+    ("Mangetsu legacy", "legacy", mangetsu),
+    ("Mangetsu RGBA", "rgba", mangetsu),
+    ("Oborodzuki candidate", "csri", candidate),
+]
 samples = []
 
 for workload, fixture in fixtures.items():
@@ -62,16 +115,21 @@ for workload, fixture in fixtures.items():
         for position, engine in enumerate(order, 1):
             name = engine[0]
             print(f"{workload}, trial {trial + 1}, position {position}: {name}", flush=True)
-            row = run_engine(engine, fixture, workload)
+            row = run_engine(engine, fixture, workload, real_span if workload == "real" else ())
             samples.append(dict(row, engine=name, workload=workload, trial=trial + 1,
                                 order=position, fixture_sha256=digest))
             (output / "trials.json").write_text(json.dumps(samples, indent=2), encoding="utf-8")
 
 summary = [
-    "Public synthetic fixtures, 1920×1080 BGRX/BGRA on black.",
-    "Each result uses 5 fresh processes, 30 warmup frames, and 600 measured frames per process.",
+    f"Primary real fixture: {primary.name}, SHA-256 {primary_sha256}.",
+    f"All {len(events)} dialogue events were loaded unchanged. "
+    f"Sampled 240 presentation times across {real_span[0]}–{real_span[1]} ms, with 12 warmup frames.",
+    "Each result uses 5 fresh processes at 1920×1080 BGRX/BGRA on black.",
+    "Supplementary synthetic workloads use 30 warmup frames and 600 measured frames.",
     "Wall timing includes compositing. Render FPS excludes frame clearing and process startup.",
     "The Mangetsu legacy path uses the harness's scalar BGR compositor.",
+    "The real fixture contains VSFilterMod-style gradient overrides (1vc/3vc). "
+    "Mangetsu timings on that fixture are reported separately from equivalent-workload speedup claims.",
     "The first render follows setup in a fresh process. The OS font and file caches may still be warm.",
     "Range is the minimum to maximum of the five per-trial median frame times.",
     "",
@@ -102,6 +160,8 @@ for workload in fixtures:
             mismatches.append(workload)
     candidate_ms = median_by_engine[engines[-1][0]]
     for name, _, _ in engines[:-1]:
+        if workload == "real" and name.startswith("Mangetsu"):
+            continue
         reference_ms = median_by_engine[name]
         if candidate_ms > 0 and reference_ms > 0:
             comparison.append(f"| {workload} | {name} | {reference_ms / candidate_ms:.2f}× | "

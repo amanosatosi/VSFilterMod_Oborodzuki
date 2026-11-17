@@ -83,17 +83,28 @@ uint64_t frame_hash(const std::vector<uint8_t>& pixels)
 using ProfileReset = void (*)();
 using ProfileRead = void (*)(uint64_t*, uint64_t*);
 
+struct Workload {
+    std::wstring name;
+    int first_ms = 0;
+    int stop_ms = 0;
+};
+
 template <class Render>
-void measure(Render render, const std::wstring& workload, double setup_ms,
+void measure(Render render, const Workload& workload, double setup_ms,
     ProfileReset reset_profile = nullptr, ProfileRead read_profile = nullptr)
 {
     std::vector<uint8_t> pixels(pitch * height);
     std::vector<double> timings;
     std::vector<uint64_t> hashes;
-    auto time_at = [&workload](int i) {
-        if (workload == L"static") return 1500;
-        if (workload == L"idle") return 0;
-        if (workload == L"seek") return 1000 + (i * 1879 % 4000);
+    const bool real = workload.name == L"real";
+    const bool regression = workload.name == L"regression";
+    const int count = regression ? 20 : real ? 240 : 600;
+    auto time_at = [&workload, real, count](int i) {
+        if (real)
+            return workload.first_ms + int(int64_t(workload.stop_ms - workload.first_ms - 1) * i / (count - 1));
+        if (workload.name == L"static") return 1500;
+        if (workload.name == L"idle") return 0;
+        if (workload.name == L"seek") return 1000 + (i * 1879 % 4000);
         return 1000 + i * 20 % 4000;
     };
     auto one_frame = [&](int t) {
@@ -104,12 +115,10 @@ void measure(Render render, const std::wstring& workload, double setup_ms,
         const double ms = elapsed(start);
         return std::pair<double, uint64_t>{ms, cpu_ticks() - cpu};
     };
-    const double first = one_frame(time_at(0)).first;
-    const bool regression = workload == L"regression";
-    const int warmup = regression ? 0 : 30;
-    const int count = regression ? 20 : 600;
+    const double first = one_frame(time_at(real ? count / 2 : 0)).first;
+    const int warmup = regression ? 0 : real ? 12 : 30;
     for (int i = 0; i < warmup; ++i)
-        one_frame(time_at(i));
+        one_frame(time_at(real ? i * (count - 1) / (warmup - 1) : i));
     if (reset_profile)
         reset_profile();
     uint64_t cpu = 0;
@@ -124,12 +133,17 @@ void measure(Render render, const std::wstring& workload, double setup_ms,
         read_profile(ns, calls);
 
     // Hash a separate set of frames outside the timed loop.
-    for (int t : {0, 1000, 1500, 3200, 2600, 5200, 1500}) {
+    const uint64_t blank_hash = frame_hash(std::vector<uint8_t>(pixels.size(), 0));
+    const std::vector<int> checks = real
+        ? std::vector<int>{time_at(0), time_at(count / 3), time_at(count / 2),
+            time_at(count * 2 / 3), time_at(count / 4), time_at(count - 1), time_at(count / 2)}
+        : std::vector<int>{0, 1000, 1500, 3200, 2600, 5200, 1500};
+    for (int t : checks) {
         one_frame(t);
         hashes.push_back(frame_hash(pixels));
     }
-    if (hashes[0] == hashes[2])
-        throw std::runtime_error("Fixture produced no visible pixels at 1500 ms");
+    if (std::all_of(hashes.begin(), hashes.end(), [&](uint64_t hash) { return hash == blank_hash; }))
+        throw std::runtime_error("Fixture produced no visible pixels at any verification timestamp");
     if (regression && hashes[2] != hashes.back())
         throw std::runtime_error("Rendered pixels changed after seeking back to 1500 ms");
 
@@ -158,7 +172,7 @@ void measure(Render render, const std::wstring& workload, double setup_ms,
     std::puts("}");
 }
 
-void run_csri(HMODULE dll, const std::vector<char>& script, const std::wstring& workload)
+void run_csri(HMODULE dll, const std::vector<char>& script, const Workload& workload)
 {
     API(csri_renderer_default);
     API(csri_open_mem);
@@ -182,7 +196,7 @@ void run_csri(HMODULE dll, const std::vector<char>& script, const std::wstring& 
     csri_close(instance);
 }
 
-void run_mangetsu(HMODULE dll, std::vector<char>& script, const std::wstring& workload, bool rgba)
+void run_mangetsu(HMODULE dll, std::vector<char>& script, const Workload& workload, bool rgba)
 {
     API(ass_library_init);
     API(ass_library_done);
@@ -231,7 +245,7 @@ void run_mangetsu(HMODULE dll, std::vector<char>& script, const std::wstring& wo
 
 int wmain(int argc, wchar_t** argv)
 {
-    if (argc != 5)
+    if (argc != 5 && argc != 7)
         return 2;
     try {
         std::ifstream file(std::filesystem::path(argv[3]), std::ios::binary);
@@ -242,10 +256,21 @@ int wmain(int argc, wchar_t** argv)
         if (!dll)
             throw std::runtime_error("Could not load renderer DLL");
         const std::wstring mode = argv[1];
+        Workload workload{argv[4]};
+        if (workload.name == L"real") {
+            if (argc != 7)
+                throw std::runtime_error("The real workload requires a timestamp range");
+            workload.first_ms = std::stoi(argv[5]);
+            workload.stop_ms = std::stoi(argv[6]);
+            if (workload.first_ms < 0 || workload.stop_ms <= workload.first_ms)
+                throw std::runtime_error("Invalid real workload timestamp range");
+        }
         if (mode == L"csri")
-            run_csri(dll, script, argv[4]);
+            run_csri(dll, script, workload);
+        else if (mode == L"legacy" || mode == L"rgba")
+            run_mangetsu(dll, script, workload, mode == L"rgba");
         else
-            run_mangetsu(dll, script, argv[4], mode == L"rgba");
+            throw std::runtime_error("Unknown renderer mode");
         FreeLibrary(dll);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());

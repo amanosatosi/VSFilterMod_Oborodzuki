@@ -15,9 +15,11 @@ The **Windows renderer** workflow builds `Release (MOD)` with MSVC v143 for x86 
 Download the artifact for your host's architecture after the DLL loading and CSRI render checks pass.
 
 The **Renderer benchmarks** workflow builds pinned VSFilterMod r5.2.7, pre-optimization
-Oborodzuki, the candidate, and Mangetsu on the same Windows runner. It uploads per-trial JSON,
-runner and compiler details, fixture hashes, a comparison table, and a separate instrumented profile.
-The public workloads are synthetic. The legacy Mangetsu path includes the harness's scalar
+Oborodzuki, the candidate, and Mangetsu in parallel. A single Windows runner downloads the
+four renderer artifacts and the compiled benchmark host, then runs the trials sequentially.
+The primary fixture is `op.fx.4testing.ass`. The results include the file's SHA-256, per-trial
+JSON, build and runner details, and comparison tables. Profiling uses a separate job and artifact.
+The supplementary synthetic workloads cover shared ASS features. The legacy Mangetsu path includes the harness's scalar
 compositor, while the RGBA path uses Mangetsu's BGRA compositor. Cross-engine pixel output
 can differ because the renderers use different typography and rasterization implementations.
 The visual regression checks compare the VSFilterMod variants separately.
