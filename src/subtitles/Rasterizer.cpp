@@ -560,23 +560,21 @@ bool Rasterizer::ScanConvert()
 
 using namespace std;
 
-void Rasterizer::_OverlapRegion(tSpanBuffer& dst, tSpanBuffer& src, int dx, int dy)
+void Rasterizer::_OverlapRegion(tSpanBuffer& dst, tSpanBuffer& scratch,
+    tSpanBuffer::const_iterator first, tSpanBuffer::const_iterator last, int dx, int dy)
 {
-    tSpanBuffer temp;
+    const auto verticalOffset = static_cast<unsigned __int64>(dy) << 32;
+    const auto offset1 = verticalOffset - dx;
+    const auto offset2 = verticalOffset + dx;
 
-    temp.reserve(dst.size() + src.size());
+    scratch.clear();
+    scratch.reserve(dst.size() + (last - first));
+    dst.swap(scratch);
 
-    dst.swap(temp);
-
-    tSpanBuffer::iterator itA = temp.begin();
-    tSpanBuffer::iterator itAE = temp.end();
-    tSpanBuffer::iterator itB = src.begin();
-    tSpanBuffer::iterator itBE = src.end();
-
-    // Don't worry -- even if dy<0 this will still work! // G: hehe, the evil twin :)
-
-    unsigned __int64 offset1 = (((__int64)dy) << 32) - dx;
-    unsigned __int64 offset2 = (((__int64)dy) << 32) + dx;
+    auto itA = scratch.cbegin();
+    const auto itAE = scratch.cend();
+    auto itB = first;
+    const auto itBE = last;
 
     while(itA != itAE && itB != itBE)
     {
@@ -682,6 +680,62 @@ void Rasterizer::_OverlapRegion(tSpanBuffer& dst, tSpanBuffer& src, int dx, int 
     }
 }
 
+bool Rasterizer::WidenOutlineByRow(int rx, int ry)
+{
+    std::vector<int> radius(size_t(ry) + 1);
+    for (int dy = 0; dy <= ry; ++dy)
+        radius[dy] = int(0.5 + sqrt(float(ry * ry - dy * dy)) * float(rx) / float(ry));
+    const DWORD maxRadius = static_cast<DWORD>(radius.front());
+
+    // Packed spans are sorted by subpixel row. Each destination row receives
+    // the same source rows in the same order as the whole-outline merge.
+    std::vector<size_t> rowStarts(size_t(mHeight) + 1);
+    size_t span = 0;
+    for (int y = 0; y < mHeight; ++y)
+    {
+        rowStarts[y] = span;
+        const auto packedY = static_cast<unsigned __int64>(y) + 0x40000000;
+        while (span < mOutline.size() && (mOutline[span].first >> 32) == packedY)
+        {
+            const auto& current = mOutline[span];
+            if ((current.second >> 32) != packedY || DWORD(current.first) < maxRadius ||
+                DWORD(current.second) > MAXDWORD - maxRadius)
+                return false;
+            ++span;
+        }
+    }
+    if (span != mOutline.size())
+        return false;
+    rowStarts[mHeight] = span;
+
+    tSpanBuffer row;
+    tSpanBuffer scratch;
+    mWideOutline.reserve(mOutline.size());
+    for (int y = -ry; y < mHeight + ry; ++y)
+    {
+        row.clear();
+        const int firstSource = min(y + ry, mHeight - 1);
+        const int lastSource = max(y - ry, 0);
+        for (int source = firstSource; source >= lastSource; --source)
+        {
+            const size_t begin = rowStarts[source];
+            const size_t end = rowStarts[source + 1];
+            if (begin != end)
+            {
+                const int dy = y - source;
+                const DWORD dx = radius[abs(dy)];
+                if (row.size() == 1 && DWORD(row.front().first) <= DWORD(mOutline[begin].first) - dx &&
+                    DWORD(row.front().second) >= DWORD(mOutline[end - 1].second) + dx)
+                    continue;
+                _OverlapRegion(row, scratch, mOutline.cbegin() + begin,
+                    mOutline.cbegin() + end, int(dx), dy);
+            }
+        }
+        mWideOutline.insert(mWideOutline.end(), row.begin(), row.end());
+    }
+    return true;
+}
+
 bool Rasterizer::CreateWidenedRegion(int rx, int ry)
 {
     PROFILE_RENDER_STAGE(WidenOutline);
@@ -689,7 +743,16 @@ bool Rasterizer::CreateWidenedRegion(int rx, int ry)
     if(ry < 0) ry = 0;
 
     mWideBorder = max(rx, ry);
+    if (mOutline.empty())
+        return true;
 
+    // Keep the whole-outline path for dimensions where the packed horizontal
+    // offset may carry into the row, or where indexing rows would be costly.
+    if (ry > 0 && ry <= 2048 && rx <= 0x20000000 && mHeight > 0 && mHeight <= 0x100000 &&
+        mWideOutline.empty() && WidenOutlineByRow(rx, ry))
+        return true;
+
+    tSpanBuffer scratch;
     if(ry > 0)
     {
         // Do a half circle.
@@ -698,14 +761,14 @@ bool Rasterizer::CreateWidenedRegion(int rx, int ry)
         {
             int x = (int)(0.5 + sqrt(float(ry * ry - y * y)) * float(rx) / float(ry));
 
-            _OverlapRegion(mWideOutline, mOutline, x, y);
+            _OverlapRegion(mWideOutline, scratch, mOutline.cbegin(), mOutline.cend(), x, y);
         }
     }
     else if(ry == 0 && rx > 0)
     {
         // There are artifacts if we don't make at least two overlaps of the line, even at same Y coord
-        _OverlapRegion(mWideOutline, mOutline, rx, 0);
-        _OverlapRegion(mWideOutline, mOutline, rx, 0);
+        _OverlapRegion(mWideOutline, scratch, mOutline.cbegin(), mOutline.cend(), rx, 0);
+        _OverlapRegion(mWideOutline, scratch, mOutline.cbegin(), mOutline.cend(), rx, 0);
     }
 
     return true;

@@ -27,75 +27,89 @@
 #include <omp.h>
 #endif
 #include <math.h>
+#include <vector>
+
+inline unsigned char NormalizeFilterValue(int sum, int divisor)
+{
+    const int value = sum / divisor;
+    return static_cast<unsigned char>(value < 0 ? 0 : value > 255 ? 255 : value);
+}
 
 // Filter an image in horizontal direction with a one-dimensional filter
 // PixelWidth is the distance in bytes between pixels
 template<ptrdiff_t PixelDist>
 void SeparableFilterX(unsigned char *src, unsigned char *dst, int width, int height, ptrdiff_t stride, int *kernel, int kernel_size, int divisor, int direction)
 {
+    const bool filterAxis = direction != 2;
+    const int radius = kernel_size / 2;
+    const int interiorEnd = width - (kernel_size - radius - 1);
+    const ptrdiff_t tapStep = filterAxis ? PixelDist : 0;
 #pragma omp parallel for
     for(int y = 0; y < height; y++)
     {
-        unsigned char *in = src + y * stride;
+        const unsigned char *in = src + y * stride;
         unsigned char *out = dst + y * stride;
         for(int x = 0; x < width; x++)
         {
-            int accum = 0;
-            for(int k = 0; k < kernel_size; k++)
+            int sum = 0;
+            if (filterAxis && (x < radius || x >= interiorEnd))
             {
-                int xofs = 0;
-                if (direction != 2)
+                for (int k = 0; k < kernel_size; ++k)
                 {
-                    xofs = k - kernel_size / 2;
-                    if (x + xofs < 0) xofs += width;
-                    if (x + xofs >= width) xofs -= width;
+                    int tap = x + k - radius;
+                    if (tap < 0) tap += width;
+                    if (tap >= width) tap -= width;
+                    sum += in[tap * PixelDist] * kernel[k];
                 }
-                accum += (int)(in[xofs*PixelDist] * kernel[k]);
             }
-            accum /= divisor;
-            if(accum > 255) accum = 255;
-            if(accum < 0) accum = 0;
-            *out = (unsigned char)accum;
-            in += PixelDist;
-            out += PixelDist;
+            else
+            {
+                const auto* tap = in + (x - (filterAxis ? radius : 0)) * PixelDist;
+                for (int k = 0; k < kernel_size; ++k)
+                    sum += tap[k * tapStep] * kernel[k];
+            }
+            out[x * PixelDist] = NormalizeFilterValue(sum, divisor);
         }
     }
 }
 
 
 // Filter an image in vertical direction with a one-dimensional filter
-// This one templated with PixelWidth since the channel interlacing is horizontal only,
-// filtering once vertically will automatically catch all channels.
-// (Width must be multiplied by pixel width for that to happen though.)
+// Resolve wrapped source rows once per output row and traverse contiguous pixels.
+// PixelDist selects the same interleaved channel in both passes.
 template<ptrdiff_t PixelDist>
 void SeparableFilterY(unsigned char *src, unsigned char *dst, int width, int height, ptrdiff_t stride, int *kernel, int kernel_size, int divisor, int direction)
 {
-    width *= PixelDist;
-#pragma omp parallel for
-    for(int  x = 0; x < width; x += PixelDist)
+    const bool filterAxis = direction != 1;
+    const int radius = kernel_size / 2;
+#pragma omp parallel
     {
-        unsigned char *in = src + x;
-        unsigned char *out = dst + x;
+        const unsigned char* localTaps[64];
+        const unsigned char** taps = localTaps;
+        std::vector<const unsigned char*> largeKernelTaps;
+        if (kernel_size > 64)
+        {
+            largeKernelTaps.resize(kernel_size);
+            taps = largeKernelTaps.data();
+        }
+#pragma omp for
         for(int y = 0; y < height; y++)
         {
-            int accum = 0;
-            for(int k = 0; k < kernel_size; k++)
+            for (int k = 0; k < kernel_size; ++k)
             {
-                int yofs = 0;
-                if (direction != 1)
-                {
-                    yofs = k - kernel_size / 2;
-                    if (y + yofs < 0) yofs += height;
-                    if (y + yofs >= height) yofs -= height;
-                }
-                accum += (int)(in[yofs*stride] * kernel[k]);
+                int row = filterAxis ? y + k - radius : y;
+                if (row < 0) row += height;
+                if (row >= height) row -= height;
+                taps[k] = src + row * stride;
             }
-            accum /= divisor;
-            if(accum > 255) accum = 255;
-            if(accum < 0) accum = 0;
-            *out = (unsigned char)accum;
-            in += stride;
-            out += stride;
+            auto* out = dst + y * stride;
+            for (int x = 0; x < width; ++x)
+            {
+                int sum = 0;
+                for (int k = 0; k < kernel_size; ++k)
+                    sum += taps[k][x * PixelDist] * kernel[k];
+                out[x * PixelDist] = NormalizeFilterValue(sum, divisor);
+            }
         }
     }
 }

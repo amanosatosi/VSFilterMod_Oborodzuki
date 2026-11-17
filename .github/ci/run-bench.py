@@ -193,6 +193,10 @@ compatibility.write_text(shared + (
     r"Dialogue: 3,0:00:01.00,0:00:05.00,Default,,0,0,0,,"
     r"{\an7\pos(600,500)\c&H304050&\alpha&H44&\clip(m 400 300 l 1500 300 1500 800 400 800)}"
     r"{\p1}m 0 0 l 600 0 600 120 0 120{\p0}" "\n"
+    r"Dialogue: 4,0:00:01.00,0:00:05.00,Default,,0,0,0,,"
+    r"{\an7\pos(0,280)\xbord0\ybord3\xblur2\yblur0}Horizontal blur / vertical outline" "\n"
+    r"Dialogue: 5,0:00:01.00,0:00:05.00,Default,,0,0,0,,"
+    r"{\an3\pos(1920,900)\xbord4\ybord0\xblur0\yblur2}Vertical blur / horizontal outline" "\n"
 ), encoding="utf-8-sig")
 ssa = output / "legacy.ssa"
 ssa.write_text(

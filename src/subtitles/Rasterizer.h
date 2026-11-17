@@ -133,7 +133,9 @@ private:
     void _EvaluateBezier(int ptbase, bool fBSpline);
     void _EvaluateLine(int pt1idx, int pt2idx);
     void _EvaluateLine(int x0, int y0, int x1, int y1);
-    static void _OverlapRegion(tSpanBuffer& dst, tSpanBuffer& src, int dx, int dy);
+    static void _OverlapRegion(tSpanBuffer& dst, tSpanBuffer& scratch,
+        tSpanBuffer::const_iterator first, tSpanBuffer::const_iterator last, int dx, int dy);
+    bool WidenOutlineByRow(int rx, int ry);
 public:
 #if defined (_VSMOD) && defined(_LUA)
     int     m_entry; // id
