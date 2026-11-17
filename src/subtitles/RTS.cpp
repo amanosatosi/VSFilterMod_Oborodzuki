@@ -5232,7 +5232,9 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
     }
     if (parallel)
     {
-        m_eventWorkers->Run(preparations);
+        try { m_eventWorkers->Run(preparations); }
+        catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+        catch (const std::exception&) { return E_FAIL; }
         for (auto& paint : compositions)
             paint();
     }

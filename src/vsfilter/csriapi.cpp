@@ -138,7 +138,8 @@ CSRIAPI void csri_close(csri_inst *inst)
 
 CSRIAPI int csri_request_fmt(csri_inst *inst, const struct csri_fmt *fmt)
 {
-    if(!inst) return -1;
+    if(!inst || !fmt) return -1;
+    CAutoLock lock(inst->cs);
 
     if(!fmt->width || !fmt->height)
         return -1;
@@ -164,6 +165,9 @@ CSRIAPI int csri_request_fmt(csri_inst *inst, const struct csri_fmt *fmt)
 
 CSRIAPI void csri_render(csri_inst *inst, struct csri_frame *frame, double time)
 {
+    if (!inst || !frame)
+        return;
+    CAutoLock lock(inst->cs);
     const double arbitrary_framerate = 25.0;
     SubPicDesc spd;
     spd.w = inst->screen_res.cx;
