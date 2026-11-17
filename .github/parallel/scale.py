@@ -62,12 +62,14 @@ if os.environ.get("PARALLEL_FULL") == "true":
     from importlib.machinery import SourceFileLoader
     fixture_module = SourceFileLoader("kfx_fixture", ".github/kfx/fixture.py").load_module()
     plan = fixture_module.inspect_fixture()
+    (ROOT / "input.json").write_text(json.dumps(plan, indent=2))
     full = {}
     for workers in WORKERS:
         os.environ["OBORODZUKI_WORKERS"] = str(workers)
         dest = ROOT / f"workers-{workers}"
         subprocess.run([PLAYBACK, "csri", DLL, str(Path(plan["fixture"]).resolve()), str(dest.resolve()),
-                        str(plan["dialogue_events"]), str(plan["size_bytes"])], check=True)
+                        str(plan["dialogue_events"]), str(plan["size_bytes"]),
+                        *map(str, plan["capture_frames"])], check=True)
         with (dest / "frames.csv").open(newline="") as file:
             rows = list(csv.DictReader(file))
         if len(rows) != 5400 or [int(r["frame"]) for r in rows] != list(range(5400)):
@@ -84,7 +86,21 @@ if os.environ.get("PARALLEL_FULL") == "true":
                              median_ms=statistics.median(values), p95_ms=values[5129], p99_ms=values[5345],
                              maximum_ms=max(values), over_16=sum(v > 16.67 for v in values),
                              over_33=sum(v > 33.33 for v in values), longest_slow_run=longest,
+                             total_render_ms=sum(values), cpu_percent_of_one_core=100 * metadata["render_cpu_ms"] / sum(values),
                              render_fps=5400 * 1000 / sum(values))
+    previous_dll = Path("previous-renderer/renderer.dll")
+    if previous_dll.exists():
+        os.environ["OBORODZUKI_WORKERS"] = "1"
+        dest = ROOT / "previous-single"
+        subprocess.run([PLAYBACK, "csri", str(previous_dll.resolve()), str(Path(plan["fixture"]).resolve()),
+                        str(dest.resolve()), str(plan["dialogue_events"]), str(plan["size_bytes"])], check=True)
+        with (dest / "frames.csv").open(newline="") as file:
+            rows = list(csv.DictReader(file))
+        if len(rows) != 5400 or [row["rgb_hash"] for row in rows] != full[1]["hashes"]:
+            raise RuntimeError("Current one-worker output differs from the pre-threading renderer")
+        previous_mean = statistics.mean(float(row["render_ms"]) for row in rows)
+        lines += ["", f"Previous optimized one-worker mean on this runner: {previous_mean:.3f} ms. "
+                  f"Current one-worker mean: {full[1]['average_ms']:.3f} ms. All 5,400 hashes match."]
     (ROOT / "full.json").write_text(json.dumps(full, indent=2))
     lines += ["", "## Full KFX, 5,400 consecutive frames per setting", "",
               "| Workers | Avg ms | Median ms | p95 | p99 | Max | FPS | Speedup | Efficiency | >16.67 | >33.33 | Longest slow run | Peak MiB |",

@@ -407,6 +407,7 @@ public:
         tasks = nullptr;
 #ifdef OBORODZUKI_PROFILE
         stats.waitNs += Since(waiting);
+        stats.preparationNs += Since(dispatched);
         ++stats.batches;
         stats.tasks += work.size();
         for (unsigned worker = 1; worker <= threads.size(); ++worker)
@@ -426,10 +427,13 @@ public:
     {
 #ifdef OBORODZUKI_PROFILE
         auto result = stats;
-        for (const auto& sample : samples)
+        for (unsigned index = 0; index < 8; ++index)
         {
+            const auto& sample = samples[index];
             result.busyNs += sample.busyNs;
             result.wakeNs += sample.wakeNs;
+            result.tasksByWorker[index] = sample.tasks;
+            result.busyByWorkerNs[index] = sample.busyNs;
         }
         return result;
 #else
