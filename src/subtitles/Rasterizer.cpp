@@ -735,9 +735,64 @@ bool Rasterizer::WidenOutlineByRow(int rx, int ry)
             {
                 const int dy = y - source;
                 const DWORD dx = radius[abs(dy)];
-                if (rowCount == 1 && row[0].first <= sourceSpans[begin].first - dx &&
-                    row[0].second >= sourceSpans[end - 1].second + dx)
-                    continue;
+                if (end - begin == 1)
+                {
+                    const DWORD left = sourceSpans[begin].first - dx;
+                    const DWORD right = sourceSpans[begin].second + dx;
+                    size_t first = 0;
+                    while (first < rowCount && row[first].second < left)
+                        ++first;
+                    if (first < rowCount && row[first].first <= right)
+                    {
+                        row[first].first = (std::min)(row[first].first, left);
+                        row[first].second = (std::max)(row[first].second, right);
+                        size_t next = first + 1;
+                        while (next < rowCount && row[next].first <= row[first].second)
+                        {
+                            row[first].second = (std::max)(row[first].second, row[next].second);
+                            ++next;
+                        }
+                        if (next > first + 1)
+                        {
+                            std::move(row + next, row + rowCount, row + first + 1);
+                            rowCount -= next - first - 1;
+                        }
+                        continue;
+                    }
+                    if (rowCount < rowCapacity)
+                    {
+                        std::move_backward(row + first, row + rowCount, row + rowCount + 1);
+                        row[first] = RowSpan(left, right);
+                        ++rowCount;
+                        continue;
+                    }
+                }
+                if (rowCount == 1)
+                {
+                    if (row[0].first <= sourceSpans[begin].first - dx &&
+                        row[0].second >= sourceSpans[end - 1].second + dx)
+                        continue;
+                }
+                // A shifted row wholly covered by existing disjoint spans
+                // cannot change the merge. Check neighbours too: overlapping
+                // legacy spans can coalesce even if the new span is contained.
+                else if (rowCount > 1)
+                {
+                    size_t covered = begin, span = 0;
+                    for (; covered < end; ++covered)
+                    {
+                        const DWORD left = sourceSpans[covered].first - dx;
+                        const DWORD right = sourceSpans[covered].second + dx;
+                        while (span < rowCount && row[span].second < left)
+                            ++span;
+                        if (span == rowCount || row[span].first > left || row[span].second < right ||
+                            (span && row[span - 1].second >= row[span].first) ||
+                            (span + 1 < rowCount && row[span + 1].first <= row[span].second))
+                            break;
+                    }
+                    if (covered == end)
+                        continue;
+                }
                 if (rowCount + end - begin > rowCapacity)
                 {
                     mWideOutline.clear();
