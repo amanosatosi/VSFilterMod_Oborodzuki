@@ -99,10 +99,18 @@ jobs:
         run: |
           python .github/kfx/fixture.py
           $plan = Get-Content kfx-plan.json -Raw | ConvertFrom-Json
-          foreach ($workers in @(1,2,4)) {
+          foreach ($workers in @(1,2,4,6,8)) {
             $env:OBORODZUKI_WORKERS = "$workers"
             & hosts/kfx-playback.exe csri "$pwd/bundle/renderer.dll" "$pwd/$($plan.fixture)" "$pwd/worker-profile/$workers" "$($plan.dialogue_events)" "$($plan.size_bytes)"
             if ($LASTEXITCODE) { throw 'Instrumented playback failed' }
+          }
+          python .github/parallel/scale.py --fixtures-only
+          $env:OBORODZUKI_BENCH_ITERATION = '1'
+          foreach ($workers in @(1,4)) {
+            $env:OBORODZUKI_WORKERS = "$workers"
+            & hosts/render-bench.exe csri "$pwd/bundle/renderer.dll" "$pwd/parallel-results/mixed.ass" animation |
+              Set-Content "worker-profile/mixed-$workers.json"
+            if ($LASTEXITCODE) { throw 'Instrumented mixed workload failed' }
           }
       - uses: actions/upload-artifact@v4
         if: always()

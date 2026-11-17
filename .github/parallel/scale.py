@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import statistics
 import subprocess
+import sys
 
 WORKERS = [1, 2, 4, 6, 8]
 ROOT = Path("parallel-results")
@@ -20,9 +21,16 @@ scenarios = {"static": (1, ""), "animated": (1, ""), **{f"overlap-{n}": (n, "") 
              "blur": (16, r"\bord6\blur6"), "clip": (16, r"\clip(100,100,1800,1000)\frx15\fry20"),
              "mixed": (16, r"\1vc(&H00FF00&,&H0000FF&,&HFF0000&,&HFFFFFF&)\alpha&H40&"
                        r"\iclip(m 800 300 l 1200 300 1200 750 800 750)\fry20"),
+             "random": (16, r"\rnd0.2\rnds42\jitter(1,1,1,1,50,7)"),
+             "lua": (16, r"\eventstyle"),
              "banner": (8, ""), "scroll": (8, "")}
+lua = ROOT / "callbacks.lua"
+lua.write_text("counter = 0\nfunction eventstyle(line)\n counter = counter + 1\n"
+               " return {frz = counter % 7 * 2, fscx = 100 + line.id % 3 * 3}\nend\n", encoding="ascii")
 for name, (count, effects) in scenarios.items():
     text = header
+    if name == "lua":
+        text = text.replace("[Script Info]", "[Script Info]\nLua: " + lua.resolve().as_posix())
     for index in range(count):
         motion = "" if name == "static" else r"\t(0,4000,\frz30\fscx120\fscy85)"
         effect = "Banner;10;0;40" if name == "banner" else "Scroll up;80;900;20;40" if name == "scroll" else ""
@@ -31,6 +39,8 @@ for name, (count, effects) in scenarios.items():
                  f"Worker overlap event {index}"
                  + (" 日本語 မြန်မာ" if name == "mixed" else "") + "\n")
     (ROOT / f"{name}.ass").write_text(text, encoding="utf-8")
+if sys.argv[1:] == ["--fixtures-only"]:
+    raise SystemExit()
 print("Checking concurrent instances and repeated teardown", flush=True)
 subprocess.run(["hosts/concurrent.exe", DLL, str((ROOT / "overlap-32.ass").resolve())], check=True, timeout=180)
 

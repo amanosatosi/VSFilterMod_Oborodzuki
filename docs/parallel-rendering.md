@@ -39,6 +39,12 @@ OpenMP builds, event workers constrain filter parallelism to one OpenMP thread
 and restore the previous setting afterward. This conditional configuration needs
 its own validation. Production CI validates the persistent-pool configuration.
 
+Identical vector clips share immutable alpha masks in the caller's geometry cache.
+That cache retains at most eight masks and 16 MiB. Banner and scroll fades detach
+a writable copy before changing pixels. Normal masked compositing skips empty
+glyph coverage and fully clipped pixels before evaluating gradients. Custom blend
+modes keep their existing path.
+
 ## Cache invalidation correction
 
 The old CSRI wrapper used its video rectangle as the renderer's output-bounds

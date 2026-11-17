@@ -5,6 +5,8 @@ Set `OBORODZUKI_WORKERS` before constructing a renderer to select its worker cou
 The separate Parallel renderer validation workflow compares all worker counts.
 Its `full` dispatch input or explicit `Parallel-KFX full` verification marker
 retains 5,400 frames per worker configuration and a one-worker reference pass.
+The worker regression suite also exercises scrolling and banner masks, randomized
+geometry, and Lua callback fallback before full playback comparisons.
 
 In GitHub Actions, select **KFX Stress Test**, choose the development branch, and run
 one pass per renderer by default. Set **repetitions** to 2–5 for additional passes.
