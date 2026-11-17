@@ -25,6 +25,7 @@
 #include <math.h>
 #include <time.h>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <vector>
 #include <atomic>
@@ -2506,6 +2507,32 @@ struct OverrideTagCache {
     size_t characters = 0;
 
     std::shared_ptr<const OverrideTags> Get(const CStringW& text);
+#if defined(_VSMOD) && defined(_LUA)
+    bool defaultFunctionsKnown = false;
+    std::set<CStringW> defaultFunctions;
+
+    bool IsLuaFunction(CMyLua& owner, const CStringW& command)
+    {
+        if (owner.hasExternalLua)
+            return owner.LuaHasFunction(owner.L, command);
+        if (!defaultFunctionsKnown)
+        {
+            // Before any user code executes, the global function table comes
+            // exclusively from luaL_openlibs. Snapshot its actual names once.
+            const int top = lua_gettop(owner.L);
+            lua_pushnil(owner.L);
+            while (lua_next(owner.L, LUA_GLOBALSINDEX))
+            {
+                if (lua_type(owner.L, -2) == LUA_TSTRING && lua_isfunction(owner.L, -1))
+                    defaultFunctions.insert(CStringW(CStringA(lua_tostring(owner.L, -2))));
+                lua_pop(owner.L, 1);
+            }
+            lua_settop(owner.L, top);
+            defaultFunctionsKnown = true;
+        }
+        return defaultFunctions.find(command) != defaultFunctions.end();
+    }
+#endif
 };
 
 
@@ -3134,7 +3161,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #ifdef _LUA
         // Direct function call!
         CStringA Func(tag.rawCommand);
-        if(LuaHasFunction(L, tag.rawCommand))
+        if(m_overrideTags->IsLuaFunction(*this, tag.rawCommand))
         {
             hasExternalLua = true;
             // Find function =D
