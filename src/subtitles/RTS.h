@@ -245,6 +245,10 @@ struct OverrideTagCache;
 struct TextGeometryCache;
 struct TextDeviceContext;
 class EventWorkerPool;
+struct EventWorkerStatistics
+{
+    unsigned long long batches = 0, tasks = 0, busyNs = 0, wakeNs = 0, waitNs = 0, dispatchNs = 0;
+};
 
 [uuid("537DCACA-2812-4a4f-B2C6-1A34C17ADEB0")]
 class CRenderedTextSubtitle : public CSimpleTextSubtitle, public ISubPicProviderImpl, public ISubStream
@@ -295,6 +299,7 @@ protected:
     virtual void OnChanged();
 
 public:
+    EventWorkerStatistics WorkerStatistics() const;
     CRenderedTextSubtitle(CCritSec* pLock, STSStyle *styleOverride = NULL, bool doOverride = false);
     virtual ~CRenderedTextSubtitle();
 

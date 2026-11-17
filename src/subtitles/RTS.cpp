@@ -253,6 +253,20 @@ class EventWorkerPool
     bool stopping = false;
     std::exception_ptr failure;
     unsigned workers = 1;
+#ifdef OBORODZUKI_PROFILE
+    struct alignas(64) Sample
+    {
+        unsigned long long tasks = 0, busyNs = 0, wakeNs = 0;
+        RenderProfile stages;
+    };
+    Sample samples[8];
+    EventWorkerStatistics stats;
+    RenderProfile::Clock::time_point published;
+    static unsigned long long Since(RenderProfile::Clock::time_point start)
+    {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(RenderProfile::Clock::now() - start).count();
+    }
+#endif
 
     void RecordFailure()
     {
@@ -261,19 +275,26 @@ class EventWorkerPool
             failure = std::current_exception();
     }
 
-    void Drain()
+    void Drain(unsigned worker)
     {
         for (;;)
         {
             const size_t index = next.fetch_add(1, std::memory_order_relaxed);
             if (index >= tasks->size())
                 return;
+#ifdef OBORODZUKI_PROFILE
+            const auto started = RenderProfile::Clock::now();
+#endif
             try { (*tasks)[index](); }
             catch (...) { RecordFailure(); }
+#ifdef OBORODZUKI_PROFILE
+            ++samples[worker].tasks;
+            samples[worker].busyNs += Since(started);
+#endif
         }
     }
 
-    void Worker(size_t observed)
+    void Worker(size_t observed, unsigned index)
     {
         std::unique_ptr<TextDeviceContext> dc;
         std::unique_ptr<TextGeometryCache> geometry;
@@ -288,6 +309,10 @@ class EventWorkerPool
             }
             try
             {
+#ifdef OBORODZUKI_PROFILE
+                samples[index].wakeNs += Since(published);
+                render_profile() = RenderProfile{};
+#endif
                 if (!dc)
                     dc = std::make_unique<TextDeviceContext>();
                 if (!geometry)
@@ -295,7 +320,10 @@ class EventWorkerPool
                 geometry->StartFrame();
                 const TextDeviceScope deviceScope(dc->dc);
                 const TextGeometryScope geometryScope(geometry.get());
-                Drain();
+                Drain(index);
+#ifdef OBORODZUKI_PROFILE
+                samples[index].stages = render_profile();
+#endif
             }
             catch (...) { RecordFailure(); }
             {
@@ -342,9 +370,13 @@ public:
         while (threads.size() + 1 < workers)
         {
             const size_t observed = generation;
-            try { threads.emplace_back([this, observed] { Worker(observed); }); }
+            const unsigned index = unsigned(threads.size()) + 1;
+            try { threads.emplace_back([this, observed, index] { Worker(observed, index); }); }
             catch (const std::system_error&) { break; }
         }
+#ifdef OBORODZUKI_PROFILE
+        const auto dispatched = RenderProfile::Clock::now();
+#endif
         {
             std::lock_guard<std::mutex> lock(mutex);
             tasks = &work;
@@ -352,16 +384,58 @@ public:
             pending = unsigned(threads.size());
             failure = nullptr;
             ++generation;
+#ifdef OBORODZUKI_PROFILE
+            published = RenderProfile::Clock::now();
+#endif
         }
         ready.notify_all();
-        Drain();
+#ifdef OBORODZUKI_PROFILE
+        stats.dispatchNs += Since(dispatched);
+#endif
+        Drain(0);
+#ifdef OBORODZUKI_PROFILE
+        const auto waiting = RenderProfile::Clock::now();
+#endif
         std::unique_lock<std::mutex> lock(mutex);
         finished.wait(lock, [&] { return pending == 0; });
         tasks = nullptr;
+#ifdef OBORODZUKI_PROFILE
+        stats.waitNs += Since(waiting);
+        ++stats.batches;
+        stats.tasks += work.size();
+        for (unsigned worker = 1; worker <= threads.size(); ++worker)
+        {
+            for (unsigned stage = 0; stage < static_cast<unsigned>(RenderStage::Count); ++stage)
+            {
+                render_profile().ns[stage] += samples[worker].stages.ns[stage];
+                render_profile().calls[stage] += samples[worker].stages.calls[stage];
+            }
+        }
+#endif
         if (failure)
             std::rethrow_exception(failure);
     }
+
+    EventWorkerStatistics Statistics() const
+    {
+#ifdef OBORODZUKI_PROFILE
+        auto result = stats;
+        for (const auto& sample : samples)
+        {
+            result.busyNs += sample.busyNs;
+            result.wakeNs += sample.wakeNs;
+        }
+        return result;
+#else
+        return {};
+#endif
+    }
 };
+
+EventWorkerStatistics CRenderedTextSubtitle::WorkerStatistics() const
+{
+    return m_eventWorkers ? m_eventWorkers->Statistics() : EventWorkerStatistics{};
+}
 
 // CWord
 

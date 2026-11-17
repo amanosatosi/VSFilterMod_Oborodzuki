@@ -46,6 +46,11 @@ typedef struct csri_vsfilter_inst csri_inst;
 #include "csri.h"
 
 #ifdef OBORODZUKI_PROFILE
+CSRIAPI void csri_oborodzuki_worker_stats(EventWorkerStatistics* result, csri_inst* instance)
+{
+    if (result && instance)
+        *result = instance->rts->WorkerStatistics();
+}
 CSRIAPI void csri_oborodzuki_profile_reset()
 {
     render_profile() = RenderProfile{};

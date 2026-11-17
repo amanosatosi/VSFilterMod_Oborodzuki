@@ -172,6 +172,19 @@ void run_csri(HMODULE dll, const std::vector<char>& input, const Playback& playb
         const auto seconds = std::nextafter(timestamp / 1000.0, (std::numeric_limits<double>::infinity)());
         csri_render(instance.get(), &frame, seconds);
     }, elapsed_ms(start), -1, reset, read);
+    struct WorkerStats {
+        unsigned long long batches, tasks, busyNs, wakeNs, waitNs, dispatchNs;
+    } stats{};
+    using ReadWorkers = void (*)(WorkerStats*, csri_inst*);
+    const auto workers = reinterpret_cast<ReadWorkers>(GetProcAddress(dll, "csri_oborodzuki_worker_stats"));
+    if (workers) {
+        workers(&stats, instance.get());
+        std::ofstream output(playback.output / "worker-stats.json");
+        output << "{\"batches\":" << stats.batches << ",\"tasks\":" << stats.tasks
+            << ",\"busy_ms\":" << stats.busyNs / 1e6 << ",\"wake_delay_ms\":" << stats.wakeNs / 1e6
+            << ",\"completion_wait_ms\":" << stats.waitNs / 1e6
+            << ",\"dispatch_ms\":" << stats.dispatchNs / 1e6 << "}\n";
+    }
 }
 
 void run_mangetsu(HMODULE dll, std::vector<char>& input, const Playback& playback, bool rgba)
