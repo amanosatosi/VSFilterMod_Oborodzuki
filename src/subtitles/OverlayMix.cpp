@@ -242,8 +242,16 @@ void COverlayMixerSSE2::Draw(bool Body)
                 const auto fill = _mm_and_si128(both, bodyMask);
                 const auto border = _mm_srli_epi16(both, 8);
                 const auto coverage = Body ? (bodyUsesBorder ? border : fill) : _mm_subs_epu16(border, fill);
-                const auto colors = solid ? repeatedColor : _mm_setr_epi32((Color->*getColor)(x, y),
-                    (Color->*getColor)(x + 1, y), (Color->*getColor)(x + 2, y), (Color->*getColor)(x + 3, y));
+                // At zero coverage the destination is unchanged, including
+                // the fourth byte. The legacy source term is at most 255/256.
+                const int empty = _mm_movemask_epi8(_mm_cmpeq_epi16(coverage, _mm_setzero_si128()));
+                if ((empty & 0xff) == 0xff)
+                    continue;
+                const auto colors = solid ? repeatedColor : _mm_setr_epi32(
+                    (empty & 0x01) ? 0 : (Color->*getColor)(x, y),
+                    (empty & 0x04) ? 0 : (Color->*getColor)(x + 1, y),
+                    (empty & 0x10) ? 0 : (Color->*getColor)(x + 2, y),
+                    (empty & 0x40) ? 0 : (Color->*getColor)(x + 3, y));
                 MixFourNormalPixels(dst + x, colors, coverage);
             }
             for (; x < end; ++x)
@@ -251,7 +259,8 @@ void COverlayMixerSSE2::Draw(bool Body)
                 const auto fill = mask[2 * x];
                 const auto border = mask[2 * x + 1];
                 const auto coverage = Body ? (bodyUsesBorder ? border : fill) : SafeSubstract(border, fill);
-                PixMix(dst + x, solid ? color : (Color->*getColor)(x, y), BYTE(coverage), BLEND_NORMAL);
+                if (coverage)
+                    PixMix(dst + x, solid ? color : (Color->*getColor)(x, y), BYTE(coverage), BLEND_NORMAL);
             }
         };
         drawRange(0, gran, &COverlayGetter::getcolor1);
