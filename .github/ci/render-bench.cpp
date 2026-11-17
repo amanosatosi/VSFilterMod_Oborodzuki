@@ -136,16 +136,24 @@ void measure(Render render, const Workload& workload, double setup_ms,
         read_profile(ns, calls);
 
     // Hash a separate set of frames outside the timed loop.
-    const uint64_t blank_hash = frame_hash(std::vector<uint8_t>(pixels.size(), 0));
+    std::vector<uint8_t> background(pixels.size());
+    for (size_t i = 0; i < background.size(); i += 4) {
+        background[i] = uint8_t(i >> 2);
+        background[i + 1] = uint8_t(i >> 7);
+        background[i + 2] = uint8_t(i >> 12);
+        background[i + 3] = 255;
+    }
+    const uint64_t background_hash = frame_hash(background);
     const std::vector<int> checks = real
         ? std::vector<int>{time_at(0), time_at(count / 3), time_at(count / 2),
             time_at(count * 2 / 3), time_at(count / 4), time_at(count - 1), time_at(count / 2)}
         : std::vector<int>{0, 1000, 1500, 3200, 2600, 5200, 1500};
     for (int t : checks) {
-        one_frame(t);
+        std::copy(background.begin(), background.end(), pixels.begin());
+        render(t, pixels.data());
         hashes.push_back(frame_hash(pixels));
     }
-    if (std::all_of(hashes.begin(), hashes.end(), [&](uint64_t hash) { return hash == blank_hash; }))
+    if (std::all_of(hashes.begin(), hashes.end(), [&](uint64_t hash) { return hash == background_hash; }))
         throw std::runtime_error("Fixture produced no visible pixels at any verification timestamp");
     if (regression && hashes[2] != hashes.back())
         throw std::runtime_error("Rendered pixels changed after seeking back to 1500 ms");

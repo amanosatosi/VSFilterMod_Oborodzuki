@@ -48,9 +48,10 @@ def as_milliseconds(timestamp):
     return ((hours * 60 + minutes) * 60 + seconds) * 1000 + centiseconds * 10
 
 
+primary_text = primary_bytes.decode("utf-8-sig")
 timestamp = r"([0-9]+:[0-9]{2}:[0-9]{2}\.[0-9]{2})"
 events = re.findall(r"^Dialogue:\s*[^,\r\n]*,\s*" + timestamp + r",\s*" + timestamp,
-                    primary_bytes.decode("utf-8-sig"), re.MULTILINE)
+                    primary_text, re.MULTILINE)
 if not events:
     raise RuntimeError("No dialogue timestamps found in op.fx.4testing.ass")
 real_span = (min(as_milliseconds(start) for start, _ in events),
@@ -105,6 +106,10 @@ if profiling:
     sys.exit()
 
 _, original, baseline, candidate, mangetsu = sys.argv[1:]
+style_fonts = {font.strip() for font in re.findall(r"^Style:[^,\r\n]*,([^,\r\n]+)", primary_text, re.MULTILINE)}
+environment = json.loads((output / "environment.json").read_text(encoding="utf-8"))
+registered_fonts = {name.casefold() for name in environment["registered_fonts"]}
+missing_fonts = sorted(font for font in style_fonts if font.casefold() not in registered_fonts)
 engines = [
     ("Original VSFilterMod r5.2.7", "csri", original),
     ("Oborodzuki baseline", "csri", baseline),
@@ -140,6 +145,9 @@ summary = [
     "The Mangetsu legacy path uses the harness's scalar BGR compositor.",
     "The real fixture contains VSFilterMod-style gradient overrides (1vc/3vc). "
     "Mangetsu timings on that fixture are reported separately from equivalent-workload speedup claims.",
+    ("Fixture style fonts missing from the Windows font registry: " + ", ".join(missing_fonts) + "."
+     if missing_fonts else "Every fixture style font is listed in the Windows font registry."),
+    "Pixel checks use a non-uniform colour background. The timed trials use black.",
     "The first render follows setup in a fresh process. The OS font and file caches may still be warm.",
     "Range is the minimum to maximum of the per-trial median frame times.",
     "",

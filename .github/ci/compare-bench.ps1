@@ -25,11 +25,22 @@ if (!(Test-Path $harness -PathType Leaf) -or !(Test-Path $harnessInfo -PathType 
 }
 $harnessMetadata = Get-Content $harnessInfo -Raw | ConvertFrom-Json
 if ($harnessMetadata.revision -ne $env:GITHUB_SHA) { throw 'Harness revision mismatch' }
+$fontKeys = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts',
+    'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
+)
+$fontNames = foreach ($key in $fontKeys) {
+    if (Test-Path -LiteralPath $key) {
+        (Get-Item -LiteralPath $key).GetValueNames() |
+            ForEach-Object { $_ -replace '\s+\([^)]*\)$', '' }
+    }
+}
 @{
     image = $env:ImageOS
     image_version = $env:ImageVersion
     cpu = Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors
     ram_bytes = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
+    registered_fonts = @($fontNames | Sort-Object -Unique)
     renderers = $renderers
     harness = $harnessMetadata
     suite = $env:BENCH_SUITE

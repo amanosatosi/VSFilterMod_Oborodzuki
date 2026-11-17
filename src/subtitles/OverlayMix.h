@@ -95,6 +95,7 @@ protected:
 public:
     COverlayMixerSSE2(RasterizerNfo* Info, COverlayGetter* Color) : COverlayMixer(Info, Color) {}
 
+    void Draw(bool Body) override;
     void PixMix(DWORD* dst, DWORD color, BYTE alpha, MOD_BLEND mod_blendMode);
     DWORD SafeSubstract(DWORD a, DWORD b);
 };
