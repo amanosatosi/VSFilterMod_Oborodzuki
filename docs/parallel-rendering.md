@@ -3,8 +3,10 @@
 Set `OBORODZUKI_WORKERS` to an integer from 1 through 8 before initializing a
 renderer. The setting counts the calling thread. The default is the smaller of
 four and the detected logical processor count. Each renderer owns its pool.
-Workers are created only when at least twice that many events need preparation.
-Cached geometry and small scenes run on the caller. Set 1 for the sequential
+Each batch uses up to one worker per two events needing preparation, bounded by
+the configured limit. Four events can use two workers with a higher configured
+limit. Cached geometry and scenes with fewer than four preparation tasks run on
+the caller. Workers above a batch's selected count stay idle. Set 1 for the sequential
 reference using the same binary.
 
 ## Execution and ownership

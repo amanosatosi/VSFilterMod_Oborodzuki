@@ -305,6 +305,7 @@ class EventWorkerPool
     bool stopping = false;
     std::exception_ptr failure;
     unsigned workers = 1;
+    unsigned activeWorkers = 1;
 #ifdef OBORODZUKI_PROFILE
     struct alignas(64) Sample
     {
@@ -369,6 +370,8 @@ class EventWorkerPool
                 if (stopping)
                     return;
                 observed = generation;
+                if (index >= activeWorkers)
+                    continue;
             }
             try
             {
@@ -431,7 +434,7 @@ public:
             thread.join();
     }
 
-    bool CanParallelize(size_t events) const { return workers > 1 && events >= workers * 2; }
+    bool CanParallelize(size_t events) const { return workers > 1 && events >= 4; }
 
     void Run(const std::vector<std::function<void()>>& work)
     {
@@ -441,8 +444,9 @@ public:
                 task();
             return;
         }
+        const unsigned desiredWorkers = (std::min)(workers, unsigned(work.size() / 2));
         // Thread creation failure leaves the existing pool usable.
-        while (threads.size() + 1 < workers)
+        while (threads.size() + 1 < desiredWorkers)
         {
             const size_t observed = generation;
             const unsigned index = unsigned(threads.size()) + 1;
@@ -459,7 +463,8 @@ public:
 #endif
             tasks = &work;
             next.store(0, std::memory_order_relaxed);
-            pending = unsigned(threads.size());
+            activeWorkers = (std::min)(desiredWorkers, unsigned(threads.size()) + 1);
+            pending = activeWorkers - 1;
             failure = nullptr;
             ++generation;
 #ifdef OBORODZUKI_PROFILE
@@ -485,7 +490,7 @@ public:
         stats.preparationNs += Since(dispatched);
         ++stats.batches;
         stats.tasks += work.size();
-        for (unsigned worker = 1; worker <= threads.size(); ++worker)
+        for (unsigned worker = 1; worker < activeWorkers; ++worker)
         {
             for (unsigned stage = 0; stage < static_cast<unsigned>(RenderStage::Count); ++stage)
             {
