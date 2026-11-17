@@ -21,6 +21,7 @@
 
 #include "stdafx.h"
 #include "RenderProfile.h"
+#include <algorithm>
 #include <cmath>
 #include <math.h>
 #include <time.h>
