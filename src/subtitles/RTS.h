@@ -124,6 +124,7 @@ public:
 class CClipper : public CPolygon
 {
 private:
+    std::shared_ptr<BYTE> m_maskStorage;
     CWord* Copy();
     virtual bool Append(CWord* w);
 
@@ -137,6 +138,7 @@ public:
     CClipper(CStringW str, CSize size, double scalex, double scaley, bool inverse);
 #endif
     virtual ~CClipper();
+    void MakeMaskWritable();
 
     CSize m_size;
     bool m_inverse;

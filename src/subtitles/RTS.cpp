@@ -26,6 +26,7 @@
 #include <time.h>
 #include <map>
 #include <set>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 #include <atomic>
@@ -188,12 +189,31 @@ struct TextGeometryCache
     unsigned embeddedRevision = 0;
     size_t pathBytes = 0;
     bool saturated = false;
+    using ClipKey = std::tuple<CStringW, int, int, double, double, bool>;
+    std::map<ClipKey, std::shared_ptr<BYTE>> clipMasks;
+    size_t clipBytes = 0;
 
     void Clear()
     {
         runs.clear();
         pathBytes = 0;
         saturated = false;
+        clipMasks.clear();
+        clipBytes = 0;
+    }
+
+    void SaveClip(const ClipKey& key, const std::shared_ptr<BYTE>& pixels, size_t bytes)
+    {
+        constexpr size_t limit = 16 * 1024 * 1024;
+        if (bytes > limit)
+            return;
+        if (clipMasks.size() >= 8 || clipBytes + bytes > limit)
+        {
+            clipMasks.clear();
+            clipBytes = 0;
+        }
+        if (clipMasks.emplace(key, pixels).second)
+            clipBytes += bytes;
     }
 
     static bool FontStamp(HKEY root, CRegKey& key, FILETIME& stamp)
@@ -1616,7 +1636,35 @@ void CClipper::ParseLuaTable(STSStyle& style, CPoint & pos, CPoint & org)
     m_size.cx = m_size.cy = 0;
     m_pAlphaMask = NULL;
 
-    if(size.cx < 0 || size.cy < 0 || !(m_pAlphaMask = DNew BYTE[size.cx*size.cy])) return;
+    if (size.cx < 0 || size.cy < 0)
+        return;
+    const size_t maskBytes = size_t(size.cx) * size.cy;
+    bool cacheMask = activeTextGeometry && str.GetLength() <= 1024 &&
+        std::isfinite(scalex) && std::isfinite(scaley) && maskBytes <= 16 * 1024 * 1024;
+#if defined(_VSMOD) && defined(_LUA)
+    cacheMask = cacheMask && LuaStyle.IsEmpty();
+#endif
+    const TextGeometryCache::ClipKey key(str, size.cx, size.cy, scalex, scaley, inverse);
+    if (cacheMask)
+    {
+        const auto found = activeTextGeometry->clipMasks.find(key);
+        if (found != activeTextGeometry->clipMasks.end())
+        {
+            m_maskStorage = found->second;
+            m_pAlphaMask = m_maskStorage.get();
+            m_size = size;
+            m_inverse = inverse;
+#if defined(_VSMOD) && defined(_LUA)
+            this->L = L;
+            this->LuaLog = LuaLog;
+            this->LuaStyle = LuaStyle;
+            m_entry = entry;
+#endif
+            return;
+        }
+    }
+    m_maskStorage = std::shared_ptr<BYTE>(DNew BYTE[maskBytes], std::default_delete<BYTE[]>());
+    m_pAlphaMask = m_maskStorage.get();
 
 #if defined (_VSMOD) && defined(_LUA)
     this->L = L;
@@ -1723,12 +1771,25 @@ void CClipper::ParseLuaTable(STSStyle& style, CPoint & pos, CPoint & org)
         for(ptrdiff_t i = size.cx * size.cy; i > 0; --i, ++dst)
             *dst = 0x40 - *dst; // mask is 6 bit
     }
+    if (cacheMask)
+        activeTextGeometry->SaveClip(key, m_maskStorage, maskBytes);
 }
 
 CClipper::~CClipper()
 {
-    if(m_pAlphaMask) delete [] m_pAlphaMask;
     m_pAlphaMask = NULL;
+}
+
+void CClipper::MakeMaskWritable()
+{
+    if (m_maskStorage && !m_maskStorage.unique())
+    {
+        const size_t bytes = size_t(m_size.cx) * m_size.cy;
+        auto pixels = std::shared_ptr<BYTE>(DNew BYTE[bytes], std::default_delete<BYTE[]>());
+        memcpy(pixels.get(), m_pAlphaMask, bytes);
+        m_maskStorage = std::move(pixels);
+        m_pAlphaMask = m_maskStorage.get();
+    }
 }
 
 CWord* CClipper::Copy()
@@ -2260,6 +2321,7 @@ void CSubtitle::CreateClippers(CSize size)
             if(!m_pClipper) return;
         }
 
+        m_pClipper->MakeMaskWritable();
         int da = (64 << 8) / width;
         BYTE* am = m_pClipper->m_pAlphaMask;
 
@@ -2302,6 +2364,7 @@ void CSubtitle::CreateClippers(CSize size)
             if(!m_pClipper) return;
         }
 
+        m_pClipper->MakeMaskWritable();
         int da = (64 << 8) / height;
         int a = 0;
         int k = m_effects[EF_SCROLL]->param[0] >> 3;
