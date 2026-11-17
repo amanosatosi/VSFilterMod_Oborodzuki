@@ -288,6 +288,29 @@ template<class T> void COverlayAlphaMixer<T>::Draw(bool Body)
     DWORD* dst = Info->dst;
     int gran = (Info->sw[1] == 0xffffffff) ? Info->w : min(Info->sw[3] + 1 - Info->xo, Info->w);
 
+    if (Info->mod_blendMode == BLEND_NORMAL && gran >= 0)
+    {
+        for (int row = h - 1; row >= 0; --row)
+        {
+            const auto drawRange = [&](int first, int end, DWORD (COverlayGetter::*get)(int, int)) {
+                for (int x = first; x < end; ++x)
+                {
+                    const DWORD coverage = Body ? s[2 * x] : SafeSubstract(s[2 * x + 1], s[2 * x]);
+                    if (!coverage)
+                        continue;
+                    const BYTE clipped = BYTE(coverage * (Alpha->*get)(x, row) >> 6);
+                    if (clipped)
+                        PixMix(dst + x, (Color->*get)(x, row), clipped, BLEND_NORMAL);
+                }
+            };
+            drawRange(0, gran, &COverlayGetter::getcolor1);
+            drawRange(gran, Info->w, &COverlayGetter::getcolor2);
+            s += 2 * Info->overlayp;
+            dst = reinterpret_cast<DWORD*>(reinterpret_cast<char*>(dst) + Info->pitch);
+        }
+        return;
+    }
+
     if (Body)
     {
         while (h--)
