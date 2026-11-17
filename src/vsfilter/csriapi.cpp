@@ -214,7 +214,10 @@ CSRIAPI void csri_render(csri_inst *inst, struct csri_frame *frame, double time)
     }
     spd.vidrect = inst->video_rect;
 
-    inst->rts->Render(spd, (REFERENCE_TIME)(time * 10000000), arbitrary_framerate, inst->video_rect);
+    // Render writes subtitle output bounds. They are independent of the video
+    // viewport used to key layout and geometry caches on the following frame.
+    CRect subtitleBounds;
+    inst->rts->Render(spd, (REFERENCE_TIME)(time * 10000000), arbitrary_framerate, subtitleBounds);
 }
 
 
