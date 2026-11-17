@@ -14,7 +14,7 @@ on:
   # An explicit opt-in allows verification while the workflow is only on
   # the development branch. Ordinary pushes never run playback.
   push:
-    branches: [develop/oborodzuki]
+    branches: [develop/oborodzuki, feature/parallel-event-rendering]
     paths:
       - '.github/workflows/kfx-stress-test.yml'
       - '.github/kfx/**'

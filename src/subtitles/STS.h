@@ -43,6 +43,7 @@ extern "C"
 class CMyLua
 {
 public:
+    bool hasExternalLua = false;
     lua_State * L;
     std::wofstream * LuaLog;
 

@@ -1409,6 +1409,7 @@ void CMyLua::CreateLuaState()
 
 void CMyLua::LoadLuaFile(CString Filename)
 {
+    hasExternalLua = true;
     CStringA aFilename(Filename);
     LPSTR pszFilename = aFilename.GetBuffer(Filename.GetLength());
 
@@ -2380,6 +2381,7 @@ void CSimpleTextSubtitle::Copy(CSimpleTextSubtitle& sts)
 #ifdef _VSMOD
 #ifdef _LUA
     L = sts.L;
+    hasExternalLua = sts.hasExternalLua;
    LuaLog = sts.LuaLog;
 #endif
 #endif

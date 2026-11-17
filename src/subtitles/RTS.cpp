@@ -27,15 +27,49 @@
 #include <map>
 #include <unordered_map>
 #include <vector>
+#include <atomic>
+#include <condition_variable>
+#include <exception>
+#include <functional>
+#include <mutex>
+#include <thread>
+#include <stdexcept>
 #include "RTS.h"
 
 #if defined (_VSMOD) && defined(_LUA)
 // path m012. Lua animation
 #endif
 
-// WARNING: this isn't very thread safe, use only one RTS a time.
-static HDC g_hDC;
-static int g_hDC_refcnt = 0;
+struct TextDeviceContext
+{
+    HDC dc = nullptr;
+    TextDeviceContext()
+    {
+        const HDC screen = GetDC(nullptr);
+        dc = CreateCompatibleDC(screen);
+        if (screen)
+            ReleaseDC(nullptr, screen);
+        if (!dc)
+            throw std::runtime_error("Could not create the subtitle GDI context");
+        SetGraphicsMode(dc, GM_ADVANCED);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, 0xffffff);
+        SetMapMode(dc, MM_TEXT);
+    }
+    ~TextDeviceContext() { if (dc) DeleteDC(dc); }
+    TextDeviceContext(const TextDeviceContext&) = delete;
+    TextDeviceContext& operator=(const TextDeviceContext&) = delete;
+};
+
+static thread_local HDC g_hDC = nullptr;
+
+class TextDeviceScope
+{
+    HDC previous;
+public:
+    explicit TextDeviceScope(HDC dc) : previous(g_hDC) { g_hDC = dc; }
+    ~TextDeviceScope() { g_hDC = previous; }
+};
 
 static long revcolor(long c)
 {
@@ -205,6 +239,128 @@ public:
         activeTextGeometry = cache;
     }
     ~TextGeometryScope() { activeTextGeometry = previous; }
+};
+
+class EventWorkerPool
+{
+    std::vector<std::thread> threads;
+    std::mutex mutex;
+    std::condition_variable ready, finished;
+    const std::vector<std::function<void()>>* tasks = nullptr;
+    std::atomic<size_t> next{0};
+    size_t generation = 0;
+    unsigned pending = 0;
+    bool stopping = false;
+    std::exception_ptr failure;
+    unsigned workers = 1;
+
+    void RecordFailure()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!failure)
+            failure = std::current_exception();
+    }
+
+    void Drain()
+    {
+        for (;;)
+        {
+            const size_t index = next.fetch_add(1, std::memory_order_relaxed);
+            if (index >= tasks->size())
+                return;
+            try { (*tasks)[index](); }
+            catch (...) { RecordFailure(); }
+        }
+    }
+
+    void Worker(size_t observed)
+    {
+        std::unique_ptr<TextDeviceContext> dc;
+        std::unique_ptr<TextGeometryCache> geometry;
+        for (;;)
+        {
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                ready.wait(lock, [&] { return stopping || generation != observed; });
+                if (stopping)
+                    return;
+                observed = generation;
+            }
+            try
+            {
+                if (!dc)
+                    dc = std::make_unique<TextDeviceContext>();
+                if (!geometry)
+                    geometry = std::make_unique<TextGeometryCache>();
+                geometry->StartFrame();
+                const TextDeviceScope deviceScope(dc->dc);
+                const TextGeometryScope geometryScope(geometry.get());
+                Drain();
+            }
+            catch (...) { RecordFailure(); }
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (--pending == 0)
+                    finished.notify_one();
+            }
+        }
+    }
+
+public:
+    EventWorkerPool()
+    {
+        SYSTEM_INFO system{};
+        GetSystemInfo(&system);
+        workers = (std::min)(4u, (std::max)(1u, system.dwNumberOfProcessors));
+        wchar_t option[16]{};
+        const DWORD length = GetEnvironmentVariableW(L"OBORODZUKI_WORKERS", option, 16);
+        if (length && length < 16)
+        {
+            wchar_t* end = nullptr;
+            const auto count = wcstoul(option, &end, 10);
+            if (end != option && !*end && count >= 1 && count <= 8)
+                workers = unsigned(count);
+        }
+    }
+
+    ~EventWorkerPool()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        ready.notify_all();
+        for (auto& thread : threads)
+            thread.join();
+    }
+
+    bool CanParallelize(size_t events) const { return workers > 1 && events >= workers * 2; }
+
+    void Run(const std::vector<std::function<void()>>& work)
+    {
+        // Thread creation failure leaves the existing pool usable.
+        while (threads.size() + 1 < workers)
+        {
+            const size_t observed = generation;
+            try { threads.emplace_back([this, observed] { Worker(observed); }); }
+            catch (const std::system_error&) { break; }
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            tasks = &work;
+            next.store(0, std::memory_order_relaxed);
+            pending = unsigned(threads.size());
+            failure = nullptr;
+            ++generation;
+        }
+        ready.notify_all();
+        Drain();
+        std::unique_lock<std::mutex> lock(mutex);
+        finished.wait(lock, [&] { return pending == 0; });
+        tasks = nullptr;
+        if (failure)
+            std::rethrow_exception(failure);
+    }
 };
 
 // CWord
@@ -2217,26 +2373,13 @@ CRenderedTextSubtitle::CRenderedTextSubtitle(CCritSec* pLock, STSStyle *styleOve
 {
     m_size = CSize(0, 0);
 
-    if(g_hDC_refcnt == 0)
-    {
-        g_hDC = CreateCompatibleDC(NULL);
-#ifdef _VSMOD // patch m007. symbol rotating
-        SetGraphicsMode(g_hDC, GM_ADVANCED); // patch for lfOrientation
-#endif
-        SetBkMode(g_hDC, TRANSPARENT);
-        SetTextColor(g_hDC, 0xffffff);
-        SetMapMode(g_hDC, MM_TEXT);
-    }
-
-    g_hDC_refcnt++;
 }
 
 CRenderedTextSubtitle::~CRenderedTextSubtitle()
 {
+    m_eventWorkers.reset();
     Deinit();
 
-    g_hDC_refcnt--;
-    if(g_hDC_refcnt == 0) DeleteDC(g_hDC);
 }
 
 void CRenderedTextSubtitle::Copy(CSimpleTextSubtitle& sts)
@@ -2294,6 +2437,7 @@ void CRenderedTextSubtitle::Deinit()
 {
     m_overrideTags.reset();
     m_textGeometry.reset();
+    m_textDC.reset();
     POSITION pos = m_subtitleCache.GetStartPosition();
     while(pos)
     {
@@ -4366,6 +4510,67 @@ static int lscomp(const void* ls1, const void* ls2)
     return(ret);
 }
 
+struct PreparedWord
+{
+    CWord* word;
+    CPoint position;
+    int layer;
+};
+
+static std::function<void()> PrepareEventGeometry(CSubtitle* subtitle, CPoint origin,
+    CPoint transformOrigin, CRect rectangle, int time, REFERENCE_TIME timestamp)
+{
+    std::vector<PreparedWord> words;
+    int y = rectangle.top;
+    POSITION linePosition = subtitle->GetHeadPosition();
+    while (linePosition)
+    {
+        CLine* line = subtitle->GetNext(linePosition);
+        int x = subtitle->m_scrAlignment % 3 == 1 ? origin.x :
+            subtitle->m_scrAlignment % 3 == 0 ? origin.x - line->m_width : origin.x - line->m_width / 2;
+        POSITION wordPosition = line->GetHeadPosition();
+        while (wordPosition)
+        {
+            CWord* word = line->GetNext(wordPosition);
+            if (word->m_fLineBreak)
+                break;
+            const auto& style = word->m_style;
+            CPoint position(x, y + line->m_ascent - word->m_ascent);
+            int layer = 1;
+#ifdef _VSMOD
+            position.x -= style.mod_horizontalSpace;
+            position.y -= style.mod_verticalSpace;
+            position += word->m_style.mod_jitter.getOffset(timestamp);
+#endif
+            // Match the first Paint invocation, because its origin determines
+            // the path transform and its subpixel phase determines rasterization.
+            if (style.shadowDepthX != 0 || style.shadowDepthY != 0)
+            {
+                position.x += int(style.shadowDepthX + 0.5);
+                position.y += int(style.shadowDepthY + 0.5);
+                layer = 4;
+            }
+            else if (style.outlineWidthX + style.outlineWidthY > 0 &&
+                !(word->m_ktype == 2 && time < word->m_kstart))
+                layer = 3;
+            words.push_back({word, position, layer});
+            x += word->m_width;
+        }
+        y += line->m_ascent + line->m_descent;
+    }
+    return [words = std::move(words), transformOrigin] {
+        for (const auto& prepared : words)
+        {
+#if defined(_VSMOD) && defined(_LUA)
+            prepared.word->Paint(prepared.position, transformOrigin, prepared.layer);
+#else
+            prepared.word->Paint(prepared.position, transformOrigin);
+#endif
+        }
+    };
+}
+
+
 STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, double fps, RECT& bbox)
 {
     PROFILE_RENDER_STAGE(Frame);
@@ -4384,6 +4589,9 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
 
     if (!m_textGeometry)
         m_textGeometry = std::make_unique<TextGeometryCache>();
+    if (!m_textDC)
+        m_textDC = std::make_unique<TextDeviceContext>();
+    const TextDeviceScope deviceScope(m_textDC->dc);
     m_textGeometry->StartFrame();
     const TextGeometryScope geometryScope(m_textGeometry.get());
 
@@ -4420,6 +4628,21 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
     }
 
     qsort(subs.GetData(), subs.GetCount(), sizeof(LSub), lscomp);
+
+    if (!m_eventWorkers)
+        m_eventWorkers = std::make_unique<EventWorkerPool>();
+    bool parallel = m_eventWorkers->CanParallelize(subs.GetCount());
+#if defined(_VSMOD) && defined(_LUA)
+    // User scripts may observe callback order and shared Lua globals.
+    parallel = parallel && !hasExternalLua;
+#endif
+    std::vector<std::function<void()>> preparations;
+    std::vector<std::function<void()>> compositions;
+    if (parallel)
+    {
+        preparations.reserve(subs.GetCount());
+        compositions.reserve(subs.GetCount());
+    }
 
     for(ptrdiff_t i = 0, j = subs.GetCount(); i < j; i++)
     {
@@ -4774,6 +4997,10 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
 
         if(!fOrgOverride) org2 = org;
 
+        const int eventTime = m_time;
+        if (parallel)
+            preparations.push_back(PrepareEventGeometry(s, org, org2, r, eventTime, rt));
+        auto paint = [=, &spd, &bbox2]() mutable {
         CPoint p, p2(0, r.top);
 
         POSITION pos;
@@ -4799,26 +5026,26 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
 #ifdef _VSMOD // patch m006. moveable vector clip
             if(s->m_clipInverse)
             {
-                bbox2 |= l->PaintShadow(spd, iclipRect[0], pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
-                bbox2 |= l->PaintShadow(spd, iclipRect[1], pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
-                bbox2 |= l->PaintShadow(spd, iclipRect[2], pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
-                bbox2 |= l->PaintShadow(spd, iclipRect[3], pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
+                bbox2 |= l->PaintShadow(spd, iclipRect[0], pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
+                bbox2 |= l->PaintShadow(spd, iclipRect[1], pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
+                bbox2 |= l->PaintShadow(spd, iclipRect[2], pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
+                bbox2 |= l->PaintShadow(spd, iclipRect[3], pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
             }
             else
             {
-                bbox2 |= l->PaintShadow(spd, clipRect, pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
+                bbox2 |= l->PaintShadow(spd, clipRect, pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
             }
 #else
             if(s->m_clipInverse)
             {
-                bbox2 |= l->PaintShadow(spd, iclipRect[0], pAlphaMask, p, org2, m_time, alpha);
-                bbox2 |= l->PaintShadow(spd, iclipRect[1], pAlphaMask, p, org2, m_time, alpha);
-                bbox2 |= l->PaintShadow(spd, iclipRect[2], pAlphaMask, p, org2, m_time, alpha);
-                bbox2 |= l->PaintShadow(spd, iclipRect[3], pAlphaMask, p, org2, m_time, alpha);
+                bbox2 |= l->PaintShadow(spd, iclipRect[0], pAlphaMask, p, org2, eventTime, alpha);
+                bbox2 |= l->PaintShadow(spd, iclipRect[1], pAlphaMask, p, org2, eventTime, alpha);
+                bbox2 |= l->PaintShadow(spd, iclipRect[2], pAlphaMask, p, org2, eventTime, alpha);
+                bbox2 |= l->PaintShadow(spd, iclipRect[3], pAlphaMask, p, org2, eventTime, alpha);
             }
             else
             {
-                bbox2 |= l->PaintShadow(spd, clipRect, pAlphaMask, p, org2, m_time, alpha);
+                bbox2 |= l->PaintShadow(spd, clipRect, pAlphaMask, p, org2, eventTime, alpha);
             }
 #endif
             p.y += l->m_ascent + l->m_descent;
@@ -4838,26 +5065,26 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
 #ifdef _VSMOD // patch m006. moveable vector clip
             if(s->m_clipInverse)
             {
-                bbox2 |= l->PaintOutline(spd, iclipRect[0], pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
-                bbox2 |= l->PaintOutline(spd, iclipRect[1], pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
-                bbox2 |= l->PaintOutline(spd, iclipRect[2], pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
-                bbox2 |= l->PaintOutline(spd, iclipRect[3], pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
+                bbox2 |= l->PaintOutline(spd, iclipRect[0], pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
+                bbox2 |= l->PaintOutline(spd, iclipRect[1], pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
+                bbox2 |= l->PaintOutline(spd, iclipRect[2], pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
+                bbox2 |= l->PaintOutline(spd, iclipRect[3], pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
             }
             else
             {
-                bbox2 |= l->PaintOutline(spd, clipRect, pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
+                bbox2 |= l->PaintOutline(spd, clipRect, pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
             }
 #else
             if(s->m_clipInverse)
             {
-                bbox2 |= l->PaintOutline(spd, iclipRect[0], pAlphaMask, p, org2, m_time, alpha);
-                bbox2 |= l->PaintOutline(spd, iclipRect[1], pAlphaMask, p, org2, m_time, alpha);
-                bbox2 |= l->PaintOutline(spd, iclipRect[2], pAlphaMask, p, org2, m_time, alpha);
-                bbox2 |= l->PaintOutline(spd, iclipRect[3], pAlphaMask, p, org2, m_time, alpha);
+                bbox2 |= l->PaintOutline(spd, iclipRect[0], pAlphaMask, p, org2, eventTime, alpha);
+                bbox2 |= l->PaintOutline(spd, iclipRect[1], pAlphaMask, p, org2, eventTime, alpha);
+                bbox2 |= l->PaintOutline(spd, iclipRect[2], pAlphaMask, p, org2, eventTime, alpha);
+                bbox2 |= l->PaintOutline(spd, iclipRect[3], pAlphaMask, p, org2, eventTime, alpha);
             }
             else
             {
-                bbox2 |= l->PaintOutline(spd, clipRect, pAlphaMask, p, org2, m_time, alpha);
+                bbox2 |= l->PaintOutline(spd, clipRect, pAlphaMask, p, org2, eventTime, alpha);
             }
 #endif
             p.y += l->m_ascent + l->m_descent;
@@ -4877,26 +5104,26 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
 #ifdef _VSMOD // patch m006. moveable vector clip
             if(s->m_clipInverse)
             {
-                bbox2 |= l->PaintBody(spd, iclipRect[0], pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
-                bbox2 |= l->PaintBody(spd, iclipRect[1], pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
-                bbox2 |= l->PaintBody(spd, iclipRect[2], pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
-                bbox2 |= l->PaintBody(spd, iclipRect[3], pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
+                bbox2 |= l->PaintBody(spd, iclipRect[0], pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
+                bbox2 |= l->PaintBody(spd, iclipRect[1], pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
+                bbox2 |= l->PaintBody(spd, iclipRect[2], pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
+                bbox2 |= l->PaintBody(spd, iclipRect[3], pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
             }
             else
             {
-                bbox2 |= l->PaintBody(spd, clipRect, pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
+                bbox2 |= l->PaintBody(spd, clipRect, pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
             }
 #else
             if(s->m_clipInverse)
             {
-                bbox2 |= l->PaintBody(spd, iclipRect[0], pAlphaMask, p, org2, m_time, alpha);
-                bbox2 |= l->PaintBody(spd, iclipRect[1], pAlphaMask, p, org2, m_time, alpha);
-                bbox2 |= l->PaintBody(spd, iclipRect[2], pAlphaMask, p, org2, m_time, alpha);
-                bbox2 |= l->PaintBody(spd, iclipRect[3], pAlphaMask, p, org2, m_time, alpha);
+                bbox2 |= l->PaintBody(spd, iclipRect[0], pAlphaMask, p, org2, eventTime, alpha);
+                bbox2 |= l->PaintBody(spd, iclipRect[1], pAlphaMask, p, org2, eventTime, alpha);
+                bbox2 |= l->PaintBody(spd, iclipRect[2], pAlphaMask, p, org2, eventTime, alpha);
+                bbox2 |= l->PaintBody(spd, iclipRect[3], pAlphaMask, p, org2, eventTime, alpha);
             }
             else
             {
-                bbox2 |= l->PaintBody(spd, clipRect, pAlphaMask, p, org2, m_time, alpha);
+                bbox2 |= l->PaintBody(spd, clipRect, pAlphaMask, p, org2, eventTime, alpha);
             }
 #endif
             p.y += l->m_ascent + l->m_descent;
@@ -4905,11 +5132,22 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
         // Remove user data
         {
             CStringA index;
-            index.Format("sub_%d", m_entry);
+            index.Format("sub_%d", entry);
             lua_pushnil(L);
             lua_setglobal(L, index);
         }
 #endif
+        };
+        if (parallel)
+            compositions.push_back(std::move(paint));
+        else
+            paint();
+    }
+    if (parallel)
+    {
+        m_eventWorkers->Run(preparations);
+        for (auto& paint : compositions)
+            paint();
     }
 
     bbox = bbox2;

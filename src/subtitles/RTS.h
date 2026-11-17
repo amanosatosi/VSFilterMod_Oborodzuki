@@ -243,6 +243,8 @@ public:
 
 struct OverrideTagCache;
 struct TextGeometryCache;
+struct TextDeviceContext;
+class EventWorkerPool;
 
 [uuid("537DCACA-2812-4a4f-B2C6-1A34C17ADEB0")]
 class CRenderedTextSubtitle : public CSimpleTextSubtitle, public ISubPicProviderImpl, public ISubStream
@@ -250,6 +252,8 @@ class CRenderedTextSubtitle : public CSimpleTextSubtitle, public ISubPicProvider
     CAtlMap<int, CSubtitle*> m_subtitleCache;
     std::unique_ptr<OverrideTagCache> m_overrideTags;
     std::unique_ptr<TextGeometryCache> m_textGeometry;
+    std::unique_ptr<TextDeviceContext> m_textDC;
+    std::unique_ptr<EventWorkerPool> m_eventWorkers;
 
     CScreenLayoutAllocator m_sla;
 
