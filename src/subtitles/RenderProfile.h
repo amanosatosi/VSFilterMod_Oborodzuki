@@ -15,23 +15,23 @@ enum class RenderStage {
 };
 
 #ifdef OBORODZUKI_PROFILE
-#include <windows.h>
+#include <chrono>
+#include <cstdint>
 
 // Attribute time to the innermost instrumented stage, so stage totals
 // do not double-count nested work (e.g. glyph paths during layout).
 struct RenderProfile {
-    unsigned long long ticks[static_cast<unsigned>(RenderStage::Count)]{};
-    unsigned long long calls[static_cast<unsigned>(RenderStage::Count)]{};
-    LONGLONG previous = 0;
+    using Clock = std::chrono::steady_clock;
+    uint64_t ns[static_cast<unsigned>(RenderStage::Count)]{};
+    uint64_t calls[static_cast<unsigned>(RenderStage::Count)]{};
+    Clock::time_point previous{};
     int active = -1;
 
-    void charge()
+    void charge(Clock::time_point now)
     {
-        LARGE_INTEGER now{};
-        QueryPerformanceCounter(&now);
         if (active >= 0)
-            ticks[active] += now.QuadPart - previous;
-        previous = now.QuadPart;
+            ns[active] += std::chrono::duration_cast<std::chrono::nanoseconds>(now - previous).count();
+        previous = now;
     }
 };
 
@@ -47,14 +47,14 @@ class RenderStageScope {
 public:
     explicit RenderStageScope(RenderStage stage) : profile(render_profile()), parent(profile.active)
     {
-        profile.charge();
+        profile.charge(RenderProfile::Clock::now());
         profile.active = static_cast<int>(stage);
         ++profile.calls[profile.active];
     }
 
     ~RenderStageScope()
     {
-        profile.charge();
+        profile.charge(RenderProfile::Clock::now());
         profile.active = parent;
     }
 };

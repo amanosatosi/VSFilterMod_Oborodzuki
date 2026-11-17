@@ -23,6 +23,12 @@ The supplementary synthetic workloads cover shared ASS features. The legacy Mang
 compositor, while the RGBA path uses Mangetsu's BGRA compositor. Cross-engine pixel output
 can differ because the renderers use different typography and rasterization implementations.
 The visual regression checks compare the VSFilterMod variants separately.
+Development pushes use the iteration suite. Select `full` for a workflow dispatch, or
+include `Benchmark-Suite: full` in the message of a development commit that triggers the
+workflow. Use the same suite when evaluating changes in render latency.
+
+The pre-optimization synthetic timings are preserved in
+[the original benchmark run](https://github.com/amanosatosi/VSFilterMod_Oborodzuki/actions/runs/44091239735).
 
 Usage
 =====

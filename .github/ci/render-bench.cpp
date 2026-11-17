@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -98,13 +99,15 @@ void measure(Render render, const Workload& workload, double setup_ms,
     std::vector<uint64_t> hashes;
     const bool real = workload.name == L"real";
     const bool regression = workload.name == L"regression";
-    const int count = regression ? 20 : real ? 240 : 600;
-    auto time_at = [&workload, real, count](int i) {
+    const bool iteration = std::getenv("OBORODZUKI_BENCH_ITERATION") != nullptr;
+    const int count = regression ? 20 : real ? (iteration ? 60 : 240) : (iteration ? 120 : 600);
+    auto time_at = [&workload, real, count, iteration](int i) {
         if (real)
             return workload.first_ms + int(int64_t(workload.stop_ms - workload.first_ms - 1) * i / (count - 1));
         if (workload.name == L"static") return 1500;
         if (workload.name == L"idle") return 0;
         if (workload.name == L"seek") return 1000 + (i * 1879 % 4000);
+        if (iteration && workload.name != L"regression") return 1000 + i * 3999 / (count - 1);
         return 1000 + i * 20 % 4000;
     };
     auto one_frame = [&](int t) {
@@ -116,7 +119,7 @@ void measure(Render render, const Workload& workload, double setup_ms,
         return std::pair<double, uint64_t>{ms, cpu_ticks() - cpu};
     };
     const double first = one_frame(time_at(real ? count / 2 : 0)).first;
-    const int warmup = regression ? 0 : real ? 12 : 30;
+    const int warmup = regression ? 0 : real ? (iteration ? 6 : 12) : (iteration ? 10 : 30);
     for (int i = 0; i < warmup; ++i)
         one_frame(time_at(real ? i * (count - 1) / (warmup - 1) : i));
     if (reset_profile)
@@ -153,10 +156,10 @@ void measure(Render render, const Workload& workload, double setup_ms,
     PROCESS_MEMORY_COUNTERS memory{};
     if (!GetProcessMemoryInfo(GetCurrentProcess(), &memory, sizeof(memory)))
         throw std::runtime_error("GetProcessMemoryInfo failed");
-    std::printf("{\"setup_ms\":%.6f,\"first_frame_ms\":%.6f,\"avg_ms\":%.6f,"
+    std::printf("{\"frames\":%d,\"warmup_frames\":%d,\"setup_ms\":%.6f,\"first_frame_ms\":%.6f,\"avg_ms\":%.6f,"
         "\"median_ms\":%.6f,\"p95_ms\":%.6f,\"fps\":%.3f,\"cpu_ms\":%.3f,"
         "\"cpu_percent_of_one_core\":%.3f,\"peak_working_set_bytes\":%llu,\"hashes\":[",
-        setup_ms, first, total / count, (timings[count / 2 - 1] + timings[count / 2]) / 2,
+        count, warmup, setup_ms, first, total / count, (timings[count / 2 - 1] + timings[count / 2]) / 2,
         timings[(count * 95 + 99) / 100 - 1], 1000 * count / total, cpu_ms, 100 * cpu_ms / total,
         static_cast<unsigned long long>(memory.PeakWorkingSetSize));
     for (size_t i = 0; i < hashes.size(); ++i)

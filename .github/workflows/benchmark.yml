@@ -5,16 +5,25 @@ on:
     branches: [develop/oborodzuki]
     paths:
       - 'src/**'
+      - 'include/**'
+      - 'vapoursynth/**'
       - '.gitattributes'
       - '.github/ci/**'
       - '.github/workflows/benchmark.yml'
   workflow_dispatch:
+    inputs:
+      suite:
+        description: Benchmark suite
+        type: choice
+        options: [iteration, full]
+        default: full
 
 permissions:
   contents: read
 
 env:
   VCPKG_REVISION: f3419f137f1a1e79b33b880ae6845f873d87820b
+  BENCH_SUITE: ${{ inputs.suite || (contains(github.event.head_commit.message, 'Benchmark-Suite: full') && 'full') || 'iteration' }}
 
 jobs:
   prepare:
@@ -70,7 +79,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: bundle
-          key: benchmark-dll-${{ matrix.kind }}-${{ matrix.ref }}-x64-${{ steps.image.outputs.version }}-${{ hashFiles('.github/ci/build-bench-component.ps1', '.github/workflows/benchmark.yml') }}
+          key: benchmark-dll-${{ matrix.kind }}-${{ matrix.ref }}-x64-${{ steps.image.outputs.version }}-${{ matrix.kind == 'mangetsu' && env.VCPKG_REVISION || 'native' }}-${{ hashFiles('.github/ci/build-bench-component.ps1') }}
 
       - uses: actions/checkout@v4
         if: steps.renderer-cache.outputs.cache-hit != 'true' && matrix.kind != 'candidate'
@@ -177,6 +186,7 @@ jobs:
     needs: [prepare, harness]
     runs-on: windows-2022
     timeout-minutes: 30
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
         with:

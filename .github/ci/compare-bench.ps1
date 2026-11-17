@@ -32,6 +32,7 @@ if ($harnessMetadata.revision -ne $env:GITHUB_SHA) { throw 'Harness revision mis
     ram_bytes = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
     renderers = $renderers
     harness = $harnessMetadata
+    suite = $env:BENCH_SUITE
     primary_input = 'op.fx.4testing.ass'
     primary_input_sha256 = $env:BENCH_INPUT_SHA256
 } | ConvertTo-Json -Depth 8 | Set-Content "$($results.FullName)\environment.json"

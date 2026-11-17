@@ -25,6 +25,13 @@ def run_engine(engine, fixture, workload, span=()):
 
 
 profiling = sys.argv[1:] == ["--profile"]
+suite = os.environ.get("BENCH_SUITE", "full")
+iteration = suite == "iteration"
+if iteration:
+    os.environ["OBORODZUKI_BENCH_ITERATION"] = "1"
+trial_count = 3 if iteration else 5
+real_count, real_warmup = (60, 6) if iteration else (240, 12)
+synthetic_count, synthetic_warmup = (120, 10) if iteration else (600, 30)
 output = Path("profile-results" if profiling else sys.argv[1])
 output.mkdir(exist_ok=True)
 harness = Path("benchmark-harness/render-bench.exe").resolve(strict=True)
@@ -80,11 +87,12 @@ if profiling:
             raise RuntimeError(f"Missing instrumented render stage data for {workload}")
         profiles[workload] = dict(zip(stages, profile))
     (output / "profile.json").write_text(json.dumps({
-        "primary_input": primary.name, "primary_sha256": primary_sha256,
+        "suite": suite, "primary_input": primary.name, "primary_sha256": primary_sha256,
         "timestamp_range_ms": real_span, "stages": profiles
     }, indent=2), encoding="utf-8")
     lines = ["### Exclusive rendering wall time", "",
-             "Instrumentation adds overhead. The real workload uses 240 frames and synthetic workloads use 600.",
+             f"Instrumentation adds overhead. The real workload uses {real_count} frames and "
+             f"synthetic workloads use {synthetic_count}.",
              "", "| Workload | Stage | Exclusive ms | Calls |", "|---|---|---:|---:|"]
     for workload, stages_result in profiles.items():
         for name, score in sorted(stages_result.items(), key=lambda item: item[1]["ns"], reverse=True):
@@ -108,30 +116,32 @@ samples = []
 
 for workload, fixture in fixtures.items():
     digest = hashlib.sha256(fixture.read_bytes()).hexdigest()
-    for trial in range(5):
+    for trial in range(trial_count):
         order = engines if trial % 2 == 0 else engines[::-1]
-        if trial == 4:
+        if trial == trial_count - 1:
             order = engines[2:] + engines[:2]
         for position, engine in enumerate(order, 1):
             name = engine[0]
             print(f"{workload}, trial {trial + 1}, position {position}: {name}", flush=True)
             row = run_engine(engine, fixture, workload, real_span if workload == "real" else ())
-            samples.append(dict(row, engine=name, workload=workload, trial=trial + 1,
+            samples.append(dict(row, suite=suite, engine=name, workload=workload, trial=trial + 1,
                                 order=position, fixture_sha256=digest))
             (output / "trials.json").write_text(json.dumps(samples, indent=2), encoding="utf-8")
 
 summary = [
+    f"Suite: {suite}.",
     f"Primary real fixture: {primary.name}, SHA-256 {primary_sha256}.",
     f"All {len(events)} dialogue events were loaded unchanged. "
-    f"Sampled 240 presentation times across {real_span[0]}–{real_span[1]} ms, with 12 warmup frames.",
-    "Each result uses 5 fresh processes at 1920×1080 BGRX/BGRA on black.",
-    "Supplementary synthetic workloads use 30 warmup frames and 600 measured frames.",
+    f"Sampled {real_count} presentation times across {real_span[0]}–{real_span[1]} ms, "
+    f"with {real_warmup} warmup frames.",
+    f"Each result uses {trial_count} fresh processes at 1920×1080 BGRX/BGRA on black.",
+    f"Supplementary synthetic workloads use {synthetic_warmup} warmup frames and {synthetic_count} measured frames.",
     "Wall timing includes compositing. Render FPS excludes frame clearing and process startup.",
     "The Mangetsu legacy path uses the harness's scalar BGR compositor.",
     "The real fixture contains VSFilterMod-style gradient overrides (1vc/3vc). "
     "Mangetsu timings on that fixture are reported separately from equivalent-workload speedup claims.",
     "The first render follows setup in a fresh process. The OS font and file caches may still be warm.",
-    "Range is the minimum to maximum of the five per-trial median frame times.",
+    "Range is the minimum to maximum of the per-trial median frame times.",
     "",
     "| Workload | Engine | Mean ms | Median ms | Range ms | p95 ms | FPS | First frame ms | CPU ms | Peak MiB |",
     "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
