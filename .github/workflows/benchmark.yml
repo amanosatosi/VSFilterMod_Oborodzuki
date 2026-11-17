@@ -47,6 +47,7 @@ jobs:
         with:
           path: vcpkg-binaries
           key: mangetsu-vcpkg-windows-2022-${{ hashFiles('.github/ci/build-bench.ps1', '.github/workflows/benchmark.yml') }}
+          restore-keys: mangetsu-vcpkg-windows-2022-
       - name: Build pinned renderers and benchmark sequentially
         shell: cmd
         run: |

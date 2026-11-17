@@ -153,6 +153,7 @@ for fixture in (source, animated, heavy, compatibility, ssa):
 (output / "regression.json").write_text(json.dumps(regressions, indent=2), encoding="utf-8")
 report = "\n".join(summary) + "\n"
 (output / "summary.md").write_text(report, encoding="utf-8")
+print(report)
 if "GITHUB_STEP_SUMMARY" in os.environ:
     with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as target:
         target.write(report)

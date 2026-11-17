@@ -59,7 +59,7 @@ public:
     }
 };
 
-#define PROFILE_RENDER_STAGE(stage) RenderStageScope profile_scope(RenderStage::stage)
+#define PROFILE_RENDER_STAGE(stage) RenderStageScope profile_scope_##stage(RenderStage::stage)
 #else
 #define PROFILE_RENDER_STAGE(stage)
 #endif
