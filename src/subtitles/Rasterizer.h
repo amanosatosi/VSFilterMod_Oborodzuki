@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include <memory>
 #include <vector>
 #include "..\SubPic\ISubPic.h"
 #ifdef _VSMOD // patch m004. gradient colors
@@ -45,7 +46,7 @@ public:
 
     MOD_MOVEVC();
 
-    byte GetAlphaValue(int wx, int wy);
+    byte GetAlphaValue(int wx, int wy) const;
     void clear();
 };
 #endif
@@ -59,29 +60,54 @@ class RasterizerNfo
 public:
     int w;
     int h;
-    int spdw;
+    int rowOffset = 0;
     int overlayp;
     int pitch;
-    DWORD color;
 
     int xo;
-    int yo;
 
-    const DWORD* sw;
+    DWORD sw[4];
     byte* s;
     byte* src;
     DWORD* dst;
+    MOD_BLEND mod_blendMode = BLEND_NORMAL;
+};
+
+struct OverlayDraw
+{
+    CRect bounds;
+    RasterizerNfo info;
+    bool body;
+    BYTE* alphaMask;
 
 #ifdef _VSMOD
-    int typ;
-    MOD_GRADIENT mod_grad;
-    MOD_MOVEVC mod_vc;
-    MOD_BLEND mod_blendMode;
+    int colorType;
+    MOD_GRADIENT gradient;
+    MOD_MOVEVC maskPosition;
 #else
-    byte* am;
+    int maskPitch;
 #endif
 
-    RasterizerNfo();
+    void Blend(int top, int bottom) const;
+};
+
+struct OverlayDrawList
+{
+    std::vector<OverlayDraw> draws;
+    // A word can replace its coverage mask between the shadow and outline.
+    // Keep earlier phases alive until all bands have read them.
+    std::vector<std::unique_ptr<BYTE[]>> retiredMasks;
+};
+
+class OverlayCaptureScope
+{
+    OverlayDrawList* previous;
+
+public:
+    explicit OverlayCaptureScope(OverlayDrawList& list);
+    ~OverlayCaptureScope();
+    OverlayCaptureScope(const OverlayCaptureScope&) = delete;
+    OverlayCaptureScope& operator=(const OverlayCaptureScope&) = delete;
 };
 
 #if defined (_VSMOD) && defined(_LUA)

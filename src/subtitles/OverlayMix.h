@@ -30,11 +30,11 @@ public:
 class COverlayGradient : public COverlayGetter
 {
 private:
-    MOD_GRADIENT mod_grad;
+    const MOD_GRADIENT& mod_grad;
     int type;
 
 public:
-    COverlayGradient(MOD_GRADIENT m, int typ) { mod_grad = m; type = typ; }
+    COverlayGradient(const MOD_GRADIENT& gradient, int typ) : mod_grad(gradient), type(typ) {}
 
     DWORD getcolor1(int x, int y) { return mod_grad.getmixcolor(x, y, type); }
     DWORD getcolor2(int x, int y) { return mod_grad.getmixcolor(x, y, 1); }
@@ -44,10 +44,10 @@ public:
 class COverlayAlpha : public COverlayGetter
 {
 private:
-    MOD_MOVEVC mod_vc;
+    const MOD_MOVEVC& mod_vc;
 
 public:
-    COverlayAlpha(MOD_MOVEVC m) { mod_vc = m; }
+    explicit COverlayAlpha(const MOD_MOVEVC& mask) : mod_vc(mask) {}
 
     DWORD getcolor1(int x, int y) { return mod_vc.GetAlphaValue(x, y); }
     DWORD getcolor2(int x, int y) { return mod_vc.GetAlphaValue(x, y); }

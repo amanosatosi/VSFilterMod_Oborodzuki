@@ -134,7 +134,8 @@ DWORD COverlayMixer::SafeSubstract(DWORD a, DWORD b)
 // Draw
 void COverlayMixer::Draw(bool Body)
 {
-    int h = Info->h;
+    const int bottom = Info->rowOffset;
+    int h = Info->h + bottom;
 
     byte* s = Info->s;
     DWORD* dst = Info->dst;
@@ -142,7 +143,7 @@ void COverlayMixer::Draw(bool Body)
 
     if (Body)
     {
-        while (h--)
+        while (h-- > bottom)
         {
             for (int wt = 0; wt < gran; ++wt)
                 PixMix(&dst[wt], Color->getcolor1(wt, h), s[wt * 2], Info->mod_blendMode);
@@ -156,7 +157,7 @@ void COverlayMixer::Draw(bool Body)
     else
     {
         s = Info->src;
-        while (h--)
+        while (h-- > bottom)
         {
             for (int wt = 0; wt < gran; ++wt)
                 PixMix(&dst[wt], Color->getcolor1(wt, h), SafeSubstract(s[wt * 2 + 1], s[wt * 2]), Info->mod_blendMode);
@@ -231,7 +232,8 @@ void COverlayMixerSSE2::Draw(bool Body)
     DWORD* dst = Info->dst;
     const auto bodyMask = _mm_set1_epi16(255);
 
-    for (int y = Info->h - 1; y >= 0; --y)
+    const int bottom = Info->rowOffset;
+    for (int y = Info->h + bottom - 1; y >= bottom; --y)
     {
         auto drawRange = [&](int x, int end, DWORD (COverlayGetter::*getColor)(int, int)) {
             const DWORD color = solid ? (solid->*getColor)(0, 0) : 0;
@@ -282,7 +284,8 @@ DWORD COverlayMixerSSE2::SafeSubstract(DWORD a, DWORD b)
 
 template<class T> void COverlayAlphaMixer<T>::Draw(bool Body)
 {
-    int h = Info->h;
+    const int bottom = Info->rowOffset;
+    int h = Info->h + bottom;
 
     byte* s = Info->s;
     DWORD* dst = Info->dst;
@@ -290,7 +293,7 @@ template<class T> void COverlayAlphaMixer<T>::Draw(bool Body)
 
     if (Info->mod_blendMode == BLEND_NORMAL && gran >= 0)
     {
-        for (int row = h - 1; row >= 0; --row)
+        for (int row = h - 1; row >= bottom; --row)
         {
             const auto drawRange = [&](int first, int end, DWORD (COverlayGetter::*get)(int, int)) {
                 for (int x = first; x < end; ++x)
@@ -313,7 +316,7 @@ template<class T> void COverlayAlphaMixer<T>::Draw(bool Body)
 
     if (Body)
     {
-        while (h--)
+        while (h-- > bottom)
         {
             for (int wt = 0; wt < gran; ++wt)
                 PixMix(&dst[wt], Color->getcolor1(wt, h), s[wt * 2] * Alpha->getcolor1(wt, h) >> 6, Info->mod_blendMode);
@@ -326,7 +329,7 @@ template<class T> void COverlayAlphaMixer<T>::Draw(bool Body)
     }
     else
     {
-        while (h--)
+        while (h-- > bottom)
         {
             for (int wt = 0; wt < gran; ++wt)
                 PixMix(&dst[wt], Color->getcolor1(wt, h), SafeSubstract(s[wt * 2 + 1], s[wt * 2]) * Alpha->getcolor1(wt, h) >> 6, Info->mod_blendMode);

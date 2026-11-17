@@ -4138,10 +4138,12 @@ void MOD_GRADIENT::clear()
     subpixy = 0;
     fadalpha = 0xFF;
     bodyIsGradAlpha = false;
+    img_alpha = 0;
+    clipDiff = 0;
 }
 
 #include <math.h>
-DWORD MOD_GRADIENT::getmixcolor(int tx, int ty, int i) // too slow T.T
+DWORD MOD_GRADIENT::getmixcolor(int tx, int ty, int i) const
 {
     DWORD colorb = 0;
     tx += xoffset;

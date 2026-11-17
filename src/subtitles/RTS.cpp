@@ -31,6 +31,7 @@
 #include <vector>
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <mutex>
@@ -297,7 +298,7 @@ class EventWorkerPool
 {
     std::vector<std::thread> threads;
     mutable std::mutex mutex;
-    std::condition_variable ready, finished;
+    std::condition_variable ready[7], finished;
     const std::vector<std::function<void()>>* tasks = nullptr;
     std::atomic<size_t> next{0};
     size_t generation = 0;
@@ -306,11 +307,14 @@ class EventWorkerPool
     std::exception_ptr failure;
     unsigned workers = 1;
     unsigned activeWorkers = 1;
+    bool needsTextContext = true;
 #ifdef OBORODZUKI_PROFILE
-    struct alignas(64) Sample
+    struct Sample
     {
         unsigned long long tasks = 0, busyNs = 0, wakeNs = 0, idleNs = 0, mutexNs = 0;
         RenderProfile stages;
+        // Separate active counters without requiring over-aligned heap allocation.
+        char padding[64];
     };
     Sample samples[8];
     EventWorkerStatistics stats;
@@ -354,6 +358,7 @@ class EventWorkerPool
         std::unique_ptr<TextGeometryCache> geometry;
         for (;;)
         {
+            bool useTextContext;
             {
 #ifdef OBORODZUKI_PROFILE
                 const auto acquiring = RenderProfile::Clock::now();
@@ -363,15 +368,16 @@ class EventWorkerPool
                 samples[index].mutexNs += Since(acquiring);
                 const auto waiting = RenderProfile::Clock::now();
 #endif
-                ready.wait(lock, [&] { return stopping || generation != observed; });
+                ready[index - 1].wait(lock, [&] {
+                    return stopping || (generation != observed && index < activeWorkers);
+                });
 #ifdef OBORODZUKI_PROFILE
                 samples[index].idleNs += Since(waiting);
 #endif
                 if (stopping)
                     return;
                 observed = generation;
-                if (index >= activeWorkers)
-                    continue;
+                useTextContext = needsTextContext;
             }
             try
             {
@@ -379,14 +385,19 @@ class EventWorkerPool
                 samples[index].wakeNs += Since(published);
                 render_profile() = RenderProfile{};
 #endif
-                if (!dc)
-                    dc = std::make_unique<TextDeviceContext>();
-                if (!geometry)
-                    geometry = std::make_unique<TextGeometryCache>();
-                geometry->StartFrame();
-                const TextDeviceScope deviceScope(dc->dc);
-                const TextGeometryScope geometryScope(geometry.get());
-                Drain(index);
+                if (useTextContext)
+                {
+                    if (!dc)
+                        dc = std::make_unique<TextDeviceContext>();
+                    if (!geometry)
+                        geometry = std::make_unique<TextGeometryCache>();
+                    geometry->StartFrame();
+                    const TextDeviceScope deviceScope(dc->dc);
+                    const TextGeometryScope geometryScope(geometry.get());
+                    Drain(index);
+                }
+                else
+                    Drain(index);
 #ifdef OBORODZUKI_PROFILE
                 samples[index].stages = render_profile();
 #endif
@@ -407,6 +418,8 @@ class EventWorkerPool
     }
 
 public:
+    enum class Batch { Preparation, Capture, Blend };
+
     EventWorkerPool()
     {
         SYSTEM_INFO system{};
@@ -429,22 +442,26 @@ public:
             std::lock_guard<std::mutex> lock(mutex);
             stopping = true;
         }
-        ready.notify_all();
+        for (auto& wake : ready)
+            wake.notify_one();
         for (auto& thread : threads)
             thread.join();
     }
 
     bool CanParallelize(size_t events) const { return workers > 1 && events >= 4; }
 
-    void Run(const std::vector<std::function<void()>>& work)
+    void Run(const std::vector<std::function<void()>>& work, Batch batch = Batch::Preparation,
+        unsigned blendLimit = 1)
     {
-        if (!CanParallelize(work.size()))
+        const auto available = batch == Batch::Blend
+            ? (std::min)(work.size(), size_t(blendLimit)) : work.size() / 2;
+        const unsigned desiredWorkers = unsigned((std::min)(size_t(workers), available));
+        if (desiredWorkers < 2)
         {
             for (const auto& task : work)
                 task();
             return;
         }
-        const unsigned desiredWorkers = (std::min)(workers, unsigned(work.size() / 2));
         // Thread creation failure leaves the existing pool usable.
         while (threads.size() + 1 < desiredWorkers)
         {
@@ -464,6 +481,7 @@ public:
             tasks = &work;
             next.store(0, std::memory_order_relaxed);
             activeWorkers = (std::min)(desiredWorkers, unsigned(threads.size()) + 1);
+            needsTextContext = batch != Batch::Blend;
             pending = activeWorkers - 1;
             failure = nullptr;
             ++generation;
@@ -471,7 +489,8 @@ public:
             published = RenderProfile::Clock::now();
 #endif
         }
-        ready.notify_all();
+        for (unsigned i = 0; i + 1 < activeWorkers; ++i)
+            ready[i].notify_one();
 #ifdef OBORODZUKI_PROFILE
         stats.dispatchNs += Since(dispatched);
 #endif
@@ -487,7 +506,13 @@ public:
         tasks = nullptr;
 #ifdef OBORODZUKI_PROFILE
         stats.waitNs += Since(waiting);
-        stats.preparationNs += Since(dispatched);
+        if (batch == Batch::Blend)
+        {
+            stats.blendNs += Since(dispatched);
+            ++stats.blendBatches;
+        }
+        else
+            stats.preparationNs += Since(dispatched);
         ++stats.batches;
         stats.tasks += work.size();
         for (unsigned worker = 1; worker < activeWorkers; ++worker)
@@ -4496,13 +4521,14 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry)
     {
         if(sub->m_fAnimated)
         {
+            m_subtitleCache.RemoveKey(entry);
             delete sub;
-            sub = NULL;
         }
         else return(sub);
     }
 
-    sub = DNew CSubtitle();
+    std::unique_ptr<CSubtitle> owned(DNew CSubtitle());
+    sub = owned.get();
     if(!sub) return(NULL);
 
 #if defined (_VSMOD) && defined(_LUA)
@@ -4681,7 +4707,7 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry)
 
     m_subtitleCache[entry] = sub;
 
-    return(sub);
+    return owned.release();
 }
 
 //
@@ -4811,8 +4837,86 @@ static std::function<void()> PrepareEventGeometry(CSubtitle* subtitle, CPoint or
     };
 }
 
+struct FramePaint
+{
+    std::function<CRect()> paint;
+    int entry;
+};
+
+static CRect PaintFrameBands(EventWorkerPool& pool, const std::vector<FramePaint>& events, int height)
+{
+    std::vector<OverlayDrawList> overlays(events.size());
+    std::vector<std::function<void()>> work;
+    work.reserve(events.size());
+    for (size_t i = 0; i < events.size(); ++i)
+    {
+        work.emplace_back([&, i] {
+            const OverlayCaptureScope capture(overlays[i]);
+            events[i].paint();
+        });
+    }
+    pool.Run(work, EventWorkerPool::Batch::Capture);
+
+    struct Band
+    {
+        int top = 0, bottom = 0;
+        uint64_t pixels = 0;
+        std::vector<const OverlayDraw*> draws;
+    };
+    // Bound the number of jobs for large surfaces. Smaller bands distribute
+    // overlapping effects independently of how many distinct events draw them.
+    const int bandHeight = (std::max)(32, (height - 1) / 48 + 1);
+    std::vector<Band> bands((height - 1) / bandHeight + 1);
+    CRect bounds(0, 0, 0, 0);
+    uint64_t totalPixels = 0;
+    for (const auto& event : overlays)
+    {
+        for (const auto& draw : event.draws)
+        {
+            bounds |= draw.bounds;
+            totalPixels += uint64_t(draw.bounds.Width()) * draw.bounds.Height();
+            for (int i = draw.bounds.top / bandHeight; i <= (draw.bounds.bottom - 1) / bandHeight; ++i)
+            {
+                auto& band = bands[i];
+                band.top = i * bandHeight;
+                band.bottom = band.top + (std::min)(bandHeight, height - band.top);
+                const int rows = (std::min)(int(draw.bounds.bottom), band.bottom) -
+                    (std::max)(int(draw.bounds.top), band.top);
+                band.pixels += uint64_t(rows) * draw.bounds.Width();
+                band.draws.push_back(&draw);
+            }
+        }
+    }
+
+    constexpr uint64_t pixelsPerWorker = 64 * 1024;
+    if (totalPixels < 2 * pixelsPerWorker)
+    {
+        for (const auto& event : overlays)
+            for (const auto& draw : event.draws)
+                draw.Blend(draw.bounds.top, draw.bounds.bottom);
+        return bounds;
+    }
+
+    // Each band visits commands in the original event and paint order. Only
+    // the scheduling order of whole, disjoint bands may change.
+    std::sort(bands.begin(), bands.end(), [](const Band& a, const Band& b) { return a.pixels > b.pixels; });
+    work.clear();
+    for (const auto& band : bands)
+    {
+        if (band.draws.empty())
+            break;
+        work.emplace_back([job = &band] {
+            for (const auto* draw : job->draws)
+                draw->Blend(job->top, job->bottom);
+        });
+    }
+    pool.Run(work, EventWorkerPool::Batch::Blend,
+        unsigned((std::min)(totalPixels / pixelsPerWorker, uint64_t(bands.size()))));
+    return bounds;
+}
 
 STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, double fps, RECT& bbox)
+try
 {
     PROFILE_RENDER_STAGE(Frame);
     CRect bbox2(0, 0, 0, 0);
@@ -4876,14 +4980,53 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
 #if defined(_VSMOD) && defined(_LUA)
     // User scripts may observe callback order and shared Lua globals.
     parallel = parallel && !hasExternalLua;
+    if (m_doOverrideStyle && m_pStyleOverride)
+    {
+        const auto& style = *m_pStyleOverride;
+        parallel = parallel && style.LuaCustomTransformHandler.IsEmpty() &&
+            style.LuaBeforeTransformHandler.IsEmpty() && style.LuaAfterTransformHandler.IsEmpty() &&
+            style.LuaRendererHandler.IsEmpty();
+    }
 #endif
+    const auto rowBytes = int64_t(spd.w) * int64_t(sizeof(DWORD));
+    const bool captureOverlays = parallel && subs.GetCount() >= 8 && spd.bpp == 32 &&
+        spd.w > 0 && spd.h > 0 && spd.bits &&
+        (int64_t(spd.pitch) >= rowBytes || int64_t(spd.pitch) <= -rowBytes);
     std::vector<std::function<void()>> preparations;
-    std::vector<std::function<void()>> compositions;
+    std::vector<FramePaint> compositions;
     if (parallel)
     {
-        preparations.reserve(subs.GetCount());
+        if (!captureOverlays)
+            preparations.reserve(subs.GetCount());
         compositions.reserve(subs.GetCount());
     }
+    const auto clearLuaData = [this](int entry) {
+#if defined (_VSMOD) && defined(_LUA)
+        CStringA index;
+        index.Format("sub_%d", entry);
+        lua_pushnil(L);
+        lua_setglobal(L, index);
+#endif
+    };
+    const auto finishEvents = [&](bool captureOverlays) {
+        if (captureOverlays)
+        {
+            bbox2 |= PaintFrameBands(*m_eventWorkers, compositions, spd.h);
+            for (const auto& event : compositions)
+                clearLuaData(event.entry);
+        }
+        else
+        {
+            m_eventWorkers->Run(preparations);
+            for (const auto& event : compositions)
+            {
+                bbox2 |= event.paint();
+                clearLuaData(event.entry);
+            }
+        }
+        preparations.clear();
+        compositions.clear();
+    };
 
     for(ptrdiff_t i = 0, j = subs.GetCount(); i < j; i++)
     {
@@ -4907,11 +5050,7 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
 #if defined(_VSMOD) && defined(_LUA)
         if (parallel && hasExternalLua)
         {
-            m_eventWorkers->Run(preparations);
-            for (auto& paint : compositions)
-                paint();
-            preparations.clear();
-            compositions.clear();
+            finishEvents(false);
             parallel = false;
         }
 #endif
@@ -5253,13 +5392,14 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
         if(!fOrgOverride) org2 = org;
 
         const int eventTime = m_time;
-        if (parallel)
+        if (parallel && !captureOverlays)
         {
             auto prepare = PrepareEventGeometry(s, org, org2, r, eventTime, rt);
             if (prepare)
                 preparations.push_back(std::move(prepare));
         }
-        auto paint = [=, &spd, &bbox2]() mutable {
+        auto paint = [=, &spd]() mutable {
+        CRect bbox2(0, 0, 0, 0);
         CPoint p, p2(0, r.top);
 
         POSITION pos;
@@ -5387,33 +5527,32 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
 #endif
             p.y += l->m_ascent + l->m_descent;
         }
-#if defined (_VSMOD) && defined(_LUA)
-        // Remove user data
-        {
-            CStringA index;
-            index.Format("sub_%d", entry);
-            lua_pushnil(L);
-            lua_setglobal(L, index);
-        }
-#endif
+        return bbox2;
         };
         if (parallel)
-            compositions.push_back(std::move(paint));
+            compositions.push_back({std::move(paint), entry});
         else
-            paint();
+        {
+            bbox2 |= paint();
+            clearLuaData(entry);
+        }
     }
     if (parallel)
-    {
-        try { m_eventWorkers->Run(preparations); }
-        catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
-        catch (const std::exception&) { return E_FAIL; }
-        for (auto& paint : compositions)
-            paint();
-    }
+        finishEvents(captureOverlays);
 
     bbox = bbox2;
 
     return (subs.GetCount() && !bbox2.IsRectEmpty()) ? S_OK : S_FALSE;
+}
+catch (const std::bad_alloc&)
+{
+    Deinit();
+    return E_OUTOFMEMORY;
+}
+catch (...)
+{
+    Deinit();
+    return E_FAIL;
 }
 
 // IPersist

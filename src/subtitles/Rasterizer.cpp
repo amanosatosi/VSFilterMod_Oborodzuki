@@ -39,6 +39,18 @@
 #define _IMPL_MIN _MIN
 #endif
 
+static thread_local OverlayDrawList* activeOverlayDraws = nullptr;
+
+OverlayCaptureScope::OverlayCaptureScope(OverlayDrawList& list) : previous(activeOverlayDraws)
+{
+    activeOverlayDraws = &list;
+}
+
+OverlayCaptureScope::~OverlayCaptureScope()
+{
+    activeOverlayDraws = previous;
+}
+
 int Rasterizer::getOverlayWidth()
 {
     return mOverlayWidth * 8;
@@ -885,7 +897,14 @@ void Rasterizer::DeleteOutlines()
 bool Rasterizer::Rasterize(int xsub, int ysub, int fBlur, double fGaussianBlurX, double fGaussianBlurY)
 {
     PROFILE_RENDER_STAGE(Rasterize);
-    _TrashOverlay();
+    if (activeOverlayDraws && mpOverlayBuffer)
+    {
+        std::unique_ptr<BYTE[]> previous(mpOverlayBuffer);
+        mpOverlayBuffer = nullptr;
+        activeOverlayDraws->retiredMasks.push_back(std::move(previous));
+    }
+    else
+        _TrashOverlay();
 
     if(!mWidth || !mHeight)
     {
@@ -1079,6 +1098,52 @@ static __forceinline void pixmix_sse2(DWORD* dst, DWORD color, DWORD alpha, MOD_
 // For CPUID usage in Rasterizer::Draw
 #include "../dsutil/vd.h"
 
+template<class Mixer>
+static void BlendOverlay(RasterizerNfo& info, bool body, COverlayGetter* color, COverlayGetter* alpha)
+{
+    if (alpha)
+        COverlayAlphaMixer<Mixer>(&info, color, alpha).Draw(body);
+    else
+        Mixer(&info, color).Draw(body);
+}
+
+void OverlayDraw::Blend(int top, int bottom) const
+{
+    const int first = (std::max)(top, int(bounds.top));
+    const int last = (std::min)(bottom, int(bounds.bottom));
+    if (first >= last)
+        return;
+
+    PROFILE_RENDER_STAGE(Composite);
+    RasterizerNfo band = info;
+    const ptrdiff_t skip = first - bounds.top;
+    band.dst = reinterpret_cast<DWORD*>(reinterpret_cast<BYTE*>(band.dst) + skip * band.pitch);
+    band.src += skip * 2 * band.overlayp;
+    band.s += skip * 2 * band.overlayp;
+    band.h = last - first;
+    // The mixers count down from the bottom of the original clipped draw.
+    band.rowOffset = bounds.bottom - last;
+
+    COverlayColor solid(band.sw[0], band.sw[2]);
+    COverlayGetter* color = &solid;
+#ifdef _VSMOD
+    COverlayGradient shaded(gradient, colorType);
+    if (gradient.mode[colorType] || (colorType == 0 && gradient.mode[1]))
+        color = &shaded;
+    COverlayAlpha mask(maskPosition);
+#else
+    COverlayAlpha mask(alphaMask, maskPitch, info.h);
+#endif
+    auto* alpha = alphaMask ? &mask : nullptr;
+    if (g_cpuid.m_flags & CCpuID::sse2)
+        BlendOverlay<COverlayMixerSSE2>(band, body, color, alpha);
+    else
+        BlendOverlay<COverlayMixer>(band, body, color, alpha);
+#ifndef _M_X64
+    _mm_empty();
+#endif
+}
+
 // Render a subpicture onto a surface.
 // spd is the surface to render on.
 // clipRect is a rectangular clip region to render inside.
@@ -1096,10 +1161,9 @@ CRect Rasterizer::Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int x
                        const DWORD* switchpts, bool fBody, bool fBorder)
 #endif
 {
-    PROFILE_RENDER_STAGE(Composite);
     CRect bbox(0, 0, 0, 0);
 
-    if(!switchpts || !fBody && !fBorder) return(bbox);
+    if(!mpOverlayBuffer || !switchpts || !fBody && !fBorder) return(bbox);
 
     // Limit drawn area to intersection of rendering surface and rectangular clip area
     CRect r(0, 0, spd.w, spd.h);
@@ -1138,148 +1202,79 @@ CRect Rasterizer::Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int x
     bbox.SetRect(x, y, x + w, y + h);
     bbox &= CRect(0, 0, spd.w, spd.h);
 
-    // CPUID from VDub
-    bool fSSE2 = !!(g_cpuid.m_flags & CCpuID::sse2);
-    //bool fSSE2 = false;
-
-#ifdef _VSMOD // patch m006. moveable vector clip
-    mod_vc.hfull = h;
-    mod_vc.curpos = CPoint(x, y);
-    mod_vc.alphamask = pAlphaMask + spd.w * y + x;
-#endif
-
-    // fill rasterize info
-    RasterizerNfo rnfo;
-    // Grab the first colour
-    rnfo.color = switchpts[0];
-    // How would this differ from src?
-    rnfo.dst = (DWORD*)((char *)spd.bits + (spd.pitch * y)) + x;
-    rnfo.sw = switchpts;
-
-    rnfo.w = w;
-    rnfo.h = h;
-    rnfo.xo = xo;
-    rnfo.yo = yo;
-    rnfo.overlayp = mOverlayWidth;
-    rnfo.pitch = spd.pitch;
-    rnfo.spdw = spd.w;
-    // The alpha bitmap of the subtitles?
-    rnfo.src = mpOverlayBuffer + 2 * (mOverlayWidth * yo + xo);
-    // s points to what the "body" to use is
-    // If we're rendering body fill and border, src+1 points to the array of
-    // widened regions which contain both border and fill in one.
-    rnfo.s = fBorder ? (rnfo.src + 1) : rnfo.src;
-#ifdef _VSMOD // patch m006. moveable vector clip
-    rnfo.mod_vc = mod_vc;
-    rnfo.mod_grad = mod_grad;
-    rnfo.mod_grad.width = mOverlayWidth;
-    rnfo.mod_grad.height = mOverlayHeight;
-    rnfo.mod_grad.xoffset = xo;
-    rnfo.mod_grad.yoffset = yo;
-    rnfo.typ = typ;
-    rnfo.mod_blendMode = mod_blendMode; // vpatch v003. blending mode
-    rnfo.mod_grad.clipDiff = clipRect.bottom < yBeforeClip + mOverlayHeight ? yBeforeClip + mOverlayHeight - clipRect.bottom : 0;
+    OverlayDraw draw;
+    draw.bounds = bbox;
+    draw.body = fBody;
+    auto& info = draw.info;
+    info.dst = reinterpret_cast<DWORD*>(spd.bits + ptrdiff_t(spd.pitch) * y) + x;
+    std::copy_n(switchpts, 4, info.sw);
+    info.w = w;
+    info.h = h;
+    info.xo = xo;
+    info.overlayp = mOverlayWidth;
+    info.pitch = spd.pitch;
+    info.src = mpOverlayBuffer + 2 * (ptrdiff_t(mOverlayWidth) * yo + xo);
+    info.s = fBorder ? info.src + 1 : info.src;
+    draw.alphaMask = pAlphaMask ? pAlphaMask + ptrdiff_t(spd.w) * y + x : nullptr;
+#ifdef _VSMOD
+    draw.maskPosition = mod_vc;
+    draw.maskPosition.hfull = h;
+    draw.maskPosition.curpos = CPoint(x, y);
+    draw.maskPosition.alphamask = draw.alphaMask;
+    draw.gradient = mod_grad;
+    draw.gradient.width = mOverlayWidth;
+    draw.gradient.height = mOverlayHeight;
+    draw.gradient.xoffset = xo;
+    draw.gradient.yoffset = yo;
+    draw.gradient.clipDiff = (std::max)(0, yBeforeClip + mOverlayHeight - int(clipRect.bottom));
+    draw.colorType = typ;
+    info.mod_blendMode = mod_blendMode;
 #else
-    // The complex "vector clip mask" I think.
-    rnfo.am = pAlphaMask + spd.w * y + x;
-#endif
-
-    COverlayGetter * Color;
-    
-    // Every remaining line in the bitmap to be rendered...
-    // Basic case of no complex clipping mask
-#ifdef _VSMOD // patch m004. gradient colors
-    if (
-        ((typ == 0) && ((mod_grad.mode[0] == 0) && (mod_grad.mode[1] == 0)))
-        || ((typ != 0) && (mod_grad.mode[typ] == 0))
-        )
-        // No gradient
-    {
-#endif
-        Color = new COverlayColor(switchpts[0], switchpts[2]);
-#ifdef _VSMOD // patch m004. gradient colors
-    }
-    else
-        Color = new COverlayGradient(rnfo.mod_grad, typ);
+    draw.maskPitch = spd.w;
 #endif
 
 #if defined (_VSMOD) && defined(_LUA)
     if (LuaRendererHandler.GetLength() > 0)
     {
-        COverlayGetter* Alpha = (pAlphaMask) ? new COverlayAlpha(mod_vc) : NULL;
-
-        if (fSSE2)
+        // Lua can read and write pixels in this draw. The caller runs the
+        // callback in order, with the full clipped rectangle.
+        ASSERT(!activeOverlayDraws);
+        PROFILE_RENDER_STAGE(Composite);
+        COverlayColor solid(info.sw[0], info.sw[2]);
+        COverlayGradient shaded(draw.gradient, typ);
+        auto* color = (draw.gradient.mode[typ] || (typ == 0 && draw.gradient.mode[1]))
+            ? static_cast<COverlayGetter*>(&shaded) : &solid;
+        COverlayAlpha mask(draw.maskPosition);
+        auto* alpha = draw.alphaMask ? &mask : nullptr;
+        auto runCallback = [&](auto& mix) {
+            mix.L = L;
+            mix.LuaLog = LuaLog;
+            mix.m_entry = m_entry;
+            mix.m_layer = m_layer;
+            mix.Function = LuaRendererHandler;
+            mix.Draw(fBody);
+        };
+        if (g_cpuid.m_flags & CCpuID::sse2)
         {
-            COverlayLuaMixer<COverlayMixerSSE2> Mix(&rnfo, Color, Alpha);
-            Mix.L = L;
-            Mix.LuaLog = LuaLog;
-            Mix.m_entry = m_entry;
-            Mix.m_layer = m_layer;
-            Mix.Function = LuaRendererHandler;
-            Mix.Draw(fBody);
+            COverlayLuaMixer<COverlayMixerSSE2> mix(&info, color, alpha);
+            runCallback(mix);
         }
         else
         {
-            COverlayLuaMixer<COverlayMixer> Mix(&rnfo, Color, Alpha);
-            Mix.L = L;
-            Mix.LuaLog = LuaLog;
-            Mix.m_entry = m_entry;
-            Mix.Function = LuaRendererHandler;
-            Mix.Draw(fBody);
+            COverlayLuaMixer<COverlayMixer> mix(&info, color, alpha);
+            runCallback(mix);
         }
-
-        if (Alpha) delete Alpha;
-    }
-    else
-    {
-#endif
-        if (!pAlphaMask)
-        {
-            if (fSSE2)
-            {
-                COverlayMixerSSE2 Mix(&rnfo, Color);
-                Mix.Draw(fBody);
-            }
-            else
-            {
-                COverlayMixer Mix(&rnfo, Color);
-                Mix.Draw(fBody);
-            }
-        }
-        else
-        {
-            COverlayGetter* Alpha;
-
-#ifdef _VSMOD
-            Alpha = new COverlayAlpha(mod_vc);
-#else
-            Alpha = new COverlayAlpha(pAlphaMask, spd.w, spd.h);
-#endif
-            if (fSSE2)
-            {
-                COverlayAlphaMixer<COverlayMixerSSE2> Mix(&rnfo, Color, Alpha);
-                Mix.Draw(fBody);
-            }
-            else
-            {
-                COverlayAlphaMixer<COverlayMixer> Mix(&rnfo, Color, Alpha);
-                Mix.Draw(fBody);
-            }
-
-            delete Alpha;
-        }
-#if defined (_VSMOD) && defined(_LUA)
-    }
-#endif
-
-    delete Color;
-    // Remember to EMMS!
-    // Rendering fails in funny ways if we don't do this.
-
 #ifndef _M_X64
-    _mm_empty();
+        _mm_empty();
+#endif
+        return bbox;
+    }
 #endif
 
+    if (activeOverlayDraws)
+        activeOverlayDraws->draws.push_back(std::move(draw));
+    else
+        draw.Blend(bbox.top, bbox.bottom);
     return bbox;
 }
 
@@ -1335,7 +1330,7 @@ void MOD_MOVEVC::clear()
     isInverse = false;
 }
 
-byte MOD_MOVEVC::GetAlphaValue(int wx, int wy)
+byte MOD_MOVEVC::GetAlphaValue(int wx, int wy) const
 {
     byte alpham;
     if(!enable)
@@ -1367,30 +1362,3 @@ byte MOD_MOVEVC::GetAlphaValue(int wx, int wy)
     return alpham;
 }
 #endif
-
-RasterizerNfo::RasterizerNfo()
-{
-    /*
-    w = 0;
-    h = 0;
-    spdw = 0;
-    overlayp = 0;
-    typ = 0;
-    pitch = 0;
-    color = 0;
-
-    xo = 0;
-
-    sw = NULL;
-    s = NULL;
-    src = NULL;
-    dst = NULL;
-
-    #ifdef _VSMOD
-    mod_grad.clear();
-    mod_vc.clear();
-    #else
-    am = NULL;
-    #endif
-    */
-}

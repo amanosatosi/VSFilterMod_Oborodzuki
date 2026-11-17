@@ -40,6 +40,8 @@ struct Playback {
     int events;
     size_t inputBytes;
     std::vector<int> captures;
+    int firstFrame = 0;
+    int endFrame = frameCount;
 };
 
 double elapsed_ms(Clock::time_point start)
@@ -97,7 +99,7 @@ void play(const Playback& playback, Render render, double setupMs, int parsedEve
         reset();
     const auto passCpu = cpu_ticks();
     const auto passStart = Clock::now();
-    for (int index = 0; index < frameCount; ++index) {
+    for (int index = playback.firstFrame; index < playback.endFrame; ++index) {
         const int64_t presentationNs = int64_t(index) * 1000000000 / fps;
         const int renderTimestampMs = index * 1000 / fps;
         std::fill(pixels.begin(), pixels.end(), 0);
@@ -115,7 +117,7 @@ void play(const Playback& playback, Render render, double setupMs, int parsedEve
         if (std::binary_search(playback.captures.begin(), playback.captures.end(), index))
             capture_frame(playback.output, index, pixels);
         if ((index + 1) % 600 == 0)
-            std::cout << "Rendered " << index + 1 << '/' << frameCount << " frames" << std::endl;
+            std::cout << "Rendered through frame " << index + 1 << '/' << playback.endFrame << std::endl;
     }
     const auto passMs = elapsed_ms(passStart);
     const auto passCpuMs = (cpu_ticks() - passCpu) / 10000.0;
@@ -128,7 +130,7 @@ void play(const Playback& playback, Render render, double setupMs, int parsedEve
         throw std::runtime_error("GetProcessMemoryInfo failed");
     std::ofstream meta(playback.output / "metrics.json");
     meta << std::fixed << std::setprecision(6)
-        << "{\"frames\":" << frameCount << ",\"setup_ms\":" << setupMs
+        << "{\"frames\":" << playback.endFrame - playback.firstFrame << ",\"setup_ms\":" << setupMs
         << ",\"input_bytes\":" << playback.inputBytes << ",\"parsed_events\":" << parsedEvents
         << ",\"visible_frames\":" << renderedVisibleFrames << ",\"render_cpu_ms\":" << renderCpu / 10000.0
         << ",\"pass_cpu_ms\":" << passCpuMs << ",\"pass_wall_ms\":" << passMs
@@ -176,6 +178,7 @@ void run_csri(HMODULE dll, const std::vector<char>& input, const Playback& playb
         unsigned long long batches, tasks, busyNs, wakeNs, waitNs, dispatchNs;
         unsigned long long preparationNs, tasksByWorker[8], busyByWorkerNs[8];
         unsigned long long idleNs, mutexNs;
+        unsigned long long blendNs, blendBatches;
     } stats{};
     using ReadWorkers = void (*)(WorkerStats*, csri_inst*);
     const auto workers = reinterpret_cast<ReadWorkers>(GetProcAddress(dll, "csri_oborodzuki_worker_stats"));
@@ -187,6 +190,7 @@ void run_csri(HMODULE dll, const std::vector<char>& input, const Playback& playb
             << ",\"completion_wait_ms\":" << stats.waitNs / 1e6
             << ",\"dispatch_ms\":" << stats.dispatchNs / 1e6
             << ",\"preparation_ms\":" << stats.preparationNs / 1e6
+            << ",\"blend_ms\":" << stats.blendNs / 1e6 << ",\"blend_batches\":" << stats.blendBatches
             << ",\"worker_sleep_ms\":" << stats.idleNs / 1e6
             << ",\"mutex_acquisition_ms\":" << stats.mutexNs / 1e6 << ",\"workers\":[";
         for (unsigned i = 0; i < 8; ++i)
@@ -252,6 +256,14 @@ int wmain(int argc, wchar_t** argv)
     try {
         Playback playback{argv[4], std::stoi(argv[5]), size_t(std::stoull(argv[6])), {}};
         for (int i = 7; i < argc; ++i) {
+            if (std::wstring(argv[i]) == L"--window" && i + 2 < argc) {
+                playback.firstFrame = std::stoi(argv[++i]);
+                playback.endFrame = std::stoi(argv[++i]);
+                if (playback.firstFrame < 0 || playback.endFrame > frameCount ||
+                    playback.firstFrame >= playback.endFrame)
+                    throw std::runtime_error("Invalid diagnostic frame window");
+                continue;
+            }
             const int frame = std::stoi(argv[i]);
             if (frame < 0 || frame >= frameCount)
                 throw std::runtime_error("Invalid capture frame index");
