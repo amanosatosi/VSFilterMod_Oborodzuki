@@ -89,10 +89,10 @@
     <OutDir Condition="'$(Configuration)|$(Platform)'=='Debug (MOD)|x64'">$(SolutionDir)bin\$(Platform)\$(ProjectName)\$(Configuration)\</OutDir>
     <IntDir Condition="'$(Configuration)|$(Platform)'=='Release (MOD)|x64'">$(SolutionDir)build\$(Platform)\$(Configuration)\$(ProjectName)\</IntDir>
     <IntDir Condition="'$(Configuration)|$(Platform)'=='Debug (MOD)|x64'">$(SolutionDir)build\$(Platform)\$(Configuration)\$(ProjectName)\</IntDir>
-    <TargetName Condition="'$(Configuration)|$(Platform)'=='Release (MOD)|Win32'">VSFilterMod</TargetName>
-    <TargetName Condition="'$(Configuration)|$(Platform)'=='Debug (MOD)|Win32'">VSFilterMod</TargetName>
-    <TargetName Condition="'$(Configuration)|$(Platform)'=='Release (MOD)|x64'">VSFilterMod</TargetName>
-    <TargetName Condition="'$(Configuration)|$(Platform)'=='Debug (MOD)|x64'">VSFilterMod</TargetName>
+    <TargetName Condition="'$(Configuration)|$(Platform)'=='Release (MOD)|Win32'">VSFilterModOborodzuki</TargetName>
+    <TargetName Condition="'$(Configuration)|$(Platform)'=='Debug (MOD)|Win32'">VSFilterModOborodzuki</TargetName>
+    <TargetName Condition="'$(Configuration)|$(Platform)'=='Release (MOD)|x64'">VSFilterModOborodzuki</TargetName>
+    <TargetName Condition="'$(Configuration)|$(Platform)'=='Debug (MOD)|x64'">VSFilterModOborodzuki</TargetName>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release (MOD)|Win32'">
     <ClCompile>

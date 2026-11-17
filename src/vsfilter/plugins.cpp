@@ -1371,7 +1371,7 @@ namespace VapourSynth {
     // Init
 
     VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc, VSRegisterFunction registerFunc, VSPlugin *plugin) {
-        configFunc("com.holywu.vsfiltermod", "vsfm", "VSFilterMod", VAPOURSYNTH_API_VERSION, 1, plugin);
+        configFunc("com.holywu.vsfiltermod", "vsfm", "vsfiltermod oborodzuki", VAPOURSYNTH_API_VERSION, 1, plugin);
         registerFunc("TextSubMod",
                      "clip:clip;"
                      "file:data;"

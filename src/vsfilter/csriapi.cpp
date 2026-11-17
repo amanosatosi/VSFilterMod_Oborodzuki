@@ -44,7 +44,7 @@ extern "C" struct csri_vsfilter_inst
 typedef struct csri_vsfilter_inst csri_inst;
 #include "csri.h"
 #ifdef _VSMOD
-static csri_rend csri_vsfilter = "vsfiltermod";
+static csri_rend csri_vsfilter = "vsfiltermod_oborodzuki";
 #else
 static csri_rend csri_vsfilter = "vsfilter";
 #endif
@@ -199,14 +199,14 @@ static struct csri_info csri_vsfilter_info =
 {
 #ifdef _DEBUG
 #ifdef _VSMOD
-    "vsfiltermod_textsub_debug", // name
+    csri_vsfilter, // name
 #else
     "vsfilter_textsub_debug", // name
 #endif
     "2.39", // version (assumed version number, svn revision, patchlevel)
 #else
 #ifdef _VSMOD
-    "vsfiltermod_textsub", // name
+    csri_vsfilter, // name
 #else
     "vsfilter_textsub", // name
 #endif
@@ -219,7 +219,7 @@ static struct csri_info csri_vsfilter_info =
     // 2.38-0611-4 fixes be1-dots and ugly-fade bugs and adds xbord/ybord/xshad/yshad/blur tags and extends be
     // 2.39 merges with guliverkli2 fork
 #ifdef _VSMOD
-    "VSFilterMod/TextSub (guliverkli2)", // longname
+    "vsfiltermod oborodzuki", // longname
 #else
     "VSFilter/TextSub (guliverkli2)", // longname
 #endif

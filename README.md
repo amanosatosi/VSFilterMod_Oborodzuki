@@ -1,4 +1,4 @@
-A modification of VSFilterMod by Vmoe Fansub
+VSFilterMod Oborodzuki, based on VSFilterMod by Vmoe Fansub
 
 New override tags: [wiki page](https://github.com/computerfan/VSFilterMod/wiki)
 
@@ -12,7 +12,7 @@ Base branches:
 Usage
 =====
 ## Aegisub
-Decompress VSFilterMod.dll to Aegisub\csri directory. Open Options dialoge in Aegisub, then enter Advanced -> Video option and change Subtitles provider to csri/vsfiltermod_textsub.
+Extract VSFilterModOborodzuki.dll into the csri directory of an Aegisub build with CSRI support. Choose the DLL architecture that matches Aegisub. In the Video section of Advanced Options, select `csri/vsfiltermod_oborodzuki`. The CSRI display name is `vsfiltermod oborodzuki`.
 
 ## Vapousynth
     vsfm.TextSubMod(clip clip, string file[, int charset=1, float fps=-1.0, string vfr='', int accurate=0])
@@ -22,7 +22,8 @@ Decompress VSFilterMod.dll to Aegisub\csri directory. Open Options dialoge in Ae
 * accurate: 1: enable accurate render for 10/16bit (~2x slower). / 0: disable (default)
 
 ## MPC-BE
-1. run `regsvr32.exe VSFilterMod.dll` with administrator privileges
+Oborodzuki uses the same DirectShow class IDs as VSFilterMod. Registering Oborodzuki replaces the existing registration for those classes.
+1. run `regsvr32.exe VSFilterModOborodzuki.dll` with administrator privileges
 2. Select "VSFilter/xy-VSFilter" on the select of Options/Subtitles/Subtitle renderer
 
 Knowing Issues
