@@ -76,17 +76,15 @@ fixtures = {"real": primary, "idle": source, "static": source, "animation": anim
             "seek": animated, "heavy": heavy}
 
 if profiling:
-    stages = ["Frame bookkeeping and effects", "Subtitle parsing and layout",
-              "Font lookup and text measurement", "Glyph path construction", "Transform",
-              "Scan conversion", "Outline widening", "Rasterization", "Blur", "Compositing"]
+    os.environ["OBORODZUKI_WORKERS"] = "1"
     engine = ("Oborodzuki profile", "csri", str(Path("bundle/renderer.dll").resolve(strict=True)))
     profiles = {}
     for workload, fixture in fixtures.items():
         sample = run_engine(engine, fixture, workload, real_span if workload == "real" else ())
         profile = sample.get("profile", [])
-        if len(profile) != len(stages) or not profile[0]["calls"]:
+        if not profile or profile[0]["name"] != "frame_other" or not profile[0]["calls"]:
             raise RuntimeError(f"Missing instrumented render stage data for {workload}")
-        profiles[workload] = dict(zip(stages, profile))
+        profiles[workload] = {stage["name"]: stage for stage in profile}
     (output / "profile.json").write_text(json.dumps({
         "suite": suite, "primary_input": primary.name, "primary_sha256": primary_sha256,
         "timestamp_range_ms": real_span, "stages": profiles

@@ -731,12 +731,19 @@ bool Rasterizer::WidenOutlineByRow(int rx, int ry)
 
     // Packed spans are sorted by subpixel row. Each destination row receives
     // the same source rows in the same order as the whole-outline merge.
-    std::vector<size_t> rowStarts(size_t(mHeight) + 1);
+    struct SourceRow
+    {
+        DWORD firstSpan;
+        int firstIdenticalRow;
+    };
+    std::vector<SourceRow> rows(size_t(mHeight) + 1);
     std::vector<RowSpan> sourceSpans;
     sourceSpans.reserve(mOutline.size());
     for (int y = 0; y < mHeight; ++y)
     {
-        rowStarts[y] = sourceSpans.size();
+        auto& row = rows[y];
+        row.firstSpan = DWORD(sourceSpans.size());
+        row.firstIdenticalRow = y;
         const auto packedY = static_cast<unsigned __int64>(y) + 0x40000000;
         while (sourceSpans.size() < mOutline.size() &&
             (mOutline[sourceSpans.size()].first >> 32) == packedY)
@@ -747,12 +754,16 @@ bool Rasterizer::WidenOutlineByRow(int rx, int ry)
                 return false;
             sourceSpans.emplace_back(left, right);
         }
-        if (sourceSpans.size() - rowStarts[y] > rowCapacity)
+        const size_t count = sourceSpans.size() - row.firstSpan;
+        if (count > rowCapacity)
             return false;
+        if (count == 1 && y && row.firstSpan - rows[y - 1].firstSpan == 1 &&
+            sourceSpans[row.firstSpan - 1] == sourceSpans[row.firstSpan])
+            row.firstIdenticalRow = rows[y - 1].firstIdenticalRow;
     }
     if (sourceSpans.size() != mOutline.size())
         return false;
-    rowStarts[mHeight] = sourceSpans.size();
+    rows[mHeight].firstSpan = DWORD(sourceSpans.size());
 
     RowSpan rowStorage[rowCapacity], scratchStorage[rowCapacity];
     auto row = &rowStorage[0];
@@ -763,14 +774,27 @@ bool Rasterizer::WidenOutlineByRow(int rx, int ry)
         size_t rowCount = 0;
         const int firstSource = min(y + ry, mHeight - 1);
         const int lastSource = max(y - ry, 0);
-        for (int source = firstSource; source >= lastSource; --source)
+        for (int source = firstSource; source >= lastSource;)
         {
-            const size_t begin = rowStarts[source];
-            const size_t end = rowStarts[source + 1];
+            const auto& sourceRow = rows[source];
+            const size_t begin = sourceRow.firstSpan;
+            const size_t end = rows[source + 1].firstSpan;
+            int nearest = source--;
             if (begin != end)
             {
-                const int dy = y - source;
-                const DWORD dx = radius[abs(dy)];
+                // Identical single spans expand into nested intervals. If the
+                // accumulated row has at most one span, the widest interval
+                // gives the same merge without visiting every source row.
+                if (end - begin == 1 && rowCount <= 1 && sourceRow.firstIdenticalRow < nearest)
+                {
+                    const int first = (std::max)(lastSource, sourceRow.firstIdenticalRow);
+                    nearest = (std::max)(first, (std::min)(y, nearest));
+                    source = first - 1;
+                }
+                const DWORD dx = radius[abs(y - nearest)];
+                if (rowCount == 1 && row[0].first <= sourceSpans[begin].first - dx &&
+                    row[0].second >= sourceSpans[end - 1].second + dx)
+                    continue;
                 if (end - begin == 1)
                 {
                     const DWORD left = sourceSpans[begin].first - dx;
@@ -803,16 +827,10 @@ bool Rasterizer::WidenOutlineByRow(int rx, int ry)
                         continue;
                     }
                 }
-                if (rowCount == 1)
-                {
-                    if (row[0].first <= sourceSpans[begin].first - dx &&
-                        row[0].second >= sourceSpans[end - 1].second + dx)
-                        continue;
-                }
                 // A shifted row wholly covered by existing disjoint spans
                 // cannot change the merge. Check neighbours too: overlapping
                 // legacy spans can coalesce even if the new span is contained.
-                else if (rowCount > 1)
+                if (rowCount > 1)
                 {
                     size_t covered = begin, span = 0;
                     for (; covered < end; ++covered)
@@ -862,7 +880,7 @@ bool Rasterizer::CreateWidenedRegion(int rx, int ry)
     // Keep the whole-outline path for dimensions where the packed horizontal
     // offset may carry into the row, or where indexing rows would be costly.
     if (ry > 0 && ry <= 2048 && rx <= 0x20000000 && mHeight > 0 && mHeight <= 0x100000 &&
-        size_t(mHeight / 2) <= mOutline.size() &&
+        size_t(mHeight / 2) <= mOutline.size() && mOutline.size() <= MAXDWORD &&
         mWideOutline.empty() && WidenOutlineByRow(rx, ry))
         return true;
 

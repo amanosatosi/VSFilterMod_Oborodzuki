@@ -106,63 +106,97 @@ for name in (*fixture_names, "kfx-sample"):
             lines.append(f"| {name} | {revision} | {workers} | {median:.4f} | {p95:.4f} | {speedup:.2f}× | {speedup / workers:.1%} |")
 
 if os.environ.get("PARALLEL_FULL") == "true":
-    from importlib.machinery import SourceFileLoader
-    fixture_module = SourceFileLoader("kfx_fixture", ".github/kfx/fixture.py").load_module()
-    plan = fixture_module.inspect_fixture()
-    (ROOT / "input.json").write_text(json.dumps(plan, indent=2))
-    full = {}
-    for workers in WORKERS:
+    import runpy
+
+    plan = runpy.run_path(".github/kfx/fixture.py")["inspect_fixture"]()
+    (ROOT / "input.json").write_text(json.dumps(plan, indent=2), encoding="utf-8")
+    full = []
+    reference = None
+
+    def play_full(revision, dll, workers, trial, captures=()):
         os.environ["OBORODZUKI_WORKERS"] = str(workers)
-        dest = ROOT / f"workers-{workers}"
-        subprocess.run([PLAYBACK, "csri", DLL, str(Path(plan["fixture"]).resolve()), str(dest.resolve()),
-                        str(plan["dialogue_events"]), str(plan["size_bytes"]),
-                        *map(str, plan["capture_frames"])], check=True, timeout=900)
+        prefix = "" if revision == "candidate" else revision + "-"
+        suffix = "" if trial == 1 else f"-trial-{trial}"
+        dest = ROOT / f"{prefix}workers-{workers}{suffix}"
+        label = f"{revision}, workers={workers}, trial={trial}"
+        print(f"Starting complete KFX playback for {label}", flush=True)
+        subprocess.run([PLAYBACK, "csri", dll, str(Path(plan["fixture"]).resolve()), str(dest.resolve()),
+                        str(plan["dialogue_events"]), str(plan["size_bytes"]), *map(str, captures)],
+                       check=True, timeout=900)
         with (dest / "frames.csv").open(newline="") as file:
             rows = list(csv.DictReader(file))
-        if len(rows) != 5400 or [int(r["frame"]) for r in rows] != list(range(5400)):
-            raise RuntimeError("Incomplete KFX coverage")
-        if workers > 1 and [r["rgb_hash"] for r in rows] != full[1]["hashes"]:
-            raise RuntimeError(f"KFX pixel mismatch at workers={workers}")
-        values = sorted(float(r["render_ms"]) for r in rows)
-        metadata = json.loads((dest / "metrics.json").read_text())
-        longest, current = 0, 0
-        for row in rows:
-            current = current + 1 if float(row["render_ms"]) > 16.67 else 0
-            longest = max(longest, current)
-        full[workers] = dict(metadata, hashes=[r["rgb_hash"] for r in rows], average_ms=statistics.mean(values),
-                             median_ms=statistics.median(values), p95_ms=values[5129], p99_ms=values[5345],
-                             maximum_ms=max(values), over_16=sum(v > 16.67 for v in values),
-                             over_33=sum(v > 33.33 for v in values), longest_slow_run=longest,
-                             total_render_ms=sum(values), cpu_percent_of_one_core=100 * metadata["render_cpu_ms"] / sum(values),
-                             render_fps=5400 * 1000 / sum(values))
+        if [int(row["frame"]) for row in rows] != list(range(plan["frames"])):
+            raise RuntimeError(f"Incomplete KFX coverage for {label}")
+        chronological = [float(row["render_ms"]) for row in rows]
+        values = sorted(chronological)
+
+        def slow_frames(threshold):
+            count, longest, consecutive = 0, 0, 0
+            for value in chronological:
+                slow = value > threshold
+                count += slow
+                consecutive = consecutive + 1 if slow else 0
+                longest = max(longest, consecutive)
+            return count, longest
+
+        over_16, longest_16 = slow_frames(16.67)
+        over_33, longest_33 = slow_frames(33.33)
+        total = sum(values)
+        metadata = json.loads((dest / "metrics.json").read_text(encoding="utf-8"))
+        hashes = [row["rgb_hash"] for row in rows]
+        mismatches = 0 if reference is None else sum(actual != expected for actual, expected in zip(hashes, reference))
+        full.append(dict(metadata, revision=revision, workers=workers, trial=trial,
+                         rgb_mismatches=mismatches, total_render_ms=total, average_ms=statistics.mean(values),
+                         median_ms=statistics.median(values), p95_ms=values[math.ceil(len(values) * .95) - 1],
+                         p99_ms=values[math.ceil(len(values) * .99) - 1], maximum_ms=max(values),
+                         over_16=over_16, over_33=over_33, longest_16=longest_16, longest_33=longest_33,
+                         cpu_percent_of_one_core=100 * metadata["render_cpu_ms"] / total,
+                         render_fps=len(values) * 1000 / total))
+        (ROOT / "full.json").write_text(json.dumps(full, indent=2), encoding="utf-8")
+        if mismatches:
+            first = next(i for i, (actual, expected) in enumerate(zip(hashes, reference)) if actual != expected)
+            raise RuntimeError(f"KFX pixel mismatch for {label}: {mismatches} frames, first at frame {first}")
+        return hashes
+
+    full_settings = [(revision, workers) for workers in comparable for revision in dlls]
+    full_settings += [("candidate", workers) for workers in WORKERS if workers not in comparable]
+    for trial in range(2):
+        for revision, workers in trial_order(full_settings, trial):
+            if trial and workers not in comparable:
+                continue
+            hashes = play_full(revision, dlls[revision], workers, trial + 1,
+                               plan["capture_frames"] if trial == 0 else ())
+            if reference is None:
+                reference = hashes
+
     previous_dll = Path("previous-renderer/renderer.dll")
     if previous_dll.exists():
-        os.environ["OBORODZUKI_WORKERS"] = "1"
-        dest = ROOT / "previous-single"
-        subprocess.run([PLAYBACK, "csri", str(previous_dll.resolve()), str(Path(plan["fixture"]).resolve()),
-                        str(dest.resolve()), str(plan["dialogue_events"]), str(plan["size_bytes"])], check=True, timeout=900)
-        with (dest / "frames.csv").open(newline="") as file:
-            rows = list(csv.DictReader(file))
-        if len(rows) != 5400 or [row["rgb_hash"] for row in rows] != full[1]["hashes"]:
-            raise RuntimeError("Current one-worker output differs from the pre-threading renderer")
-        previous_mean = statistics.mean(float(row["render_ms"]) for row in rows)
-        lines += ["", f"Previous optimized one-worker mean on this runner: {previous_mean:.3f} ms. "
-                  f"Current one-worker mean: {full[1]['average_ms']:.3f} ms. All 5,400 hashes match."]
-    (ROOT / "full.json").write_text(json.dumps(full, indent=2))
-    lines += ["", "## Full KFX, 5,400 consecutive frames per setting", "",
-              "| Workers | Avg ms | Median ms | p95 | p99 | Max | FPS | Speedup | Efficiency | >16.67 | >33.33 | Longest slow run | Peak MiB |",
-              "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
-    for workers, m in full.items():
-        speed = full[1]["average_ms"] / m["average_ms"]
-        lines.append(f'| {workers} | {m["average_ms"]:.3f} | {m["median_ms"]:.3f} | {m["p95_ms"]:.3f} | '
-                     f'{m["p99_ms"]:.3f} | {m["maximum_ms"]:.3f} | {m["render_fps"]:.1f} | {speed:.2f}× | '
-                     f'{speed / workers:.1%} | {m["over_16"]} | {m["over_33"]} | {m["longest_slow_run"]} | '
-                     f'{m["peak_working_set_bytes"] / 2**20:.1f} |')
+        play_full("pre-threading", str(previous_dll.resolve()), 1, 1)
+        lines += ["", f"Pre-threading optimized renderer averaged {full[-1]['average_ms']:.3f} ms. "
+                  "All 5,400 hashes match."]
+
+    one = {revision: statistics.mean(m["average_ms"] for m in full if m["revision"] == revision and m["workers"] == 1)
+           for revision in dlls}
+    lines += ["", "## Full KFX, 5,400 consecutive frames per pass", "",
+              "Speedup and efficiency use each revision's two-trial one-worker mean. "
+              "Counts above the runner's logical processor count verify pixels only.",
+              "", "| Renderer | Workers | Trial | Mean ms | Median ms | p95 ms | p99 ms | Max ms | Render s | FPS | "
+              ">16.67 | >33.33 | Longest >16.67 / >33.33 | CPU s | Peak MiB | Speedup | Efficiency | RGB mismatches |",
+              "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for m in sorted(full, key=lambda row: (row["revision"], row["workers"], row["trial"])):
+        revision, workers = m["revision"], m["workers"]
+        speed = one[revision] / m["average_ms"] if revision in one and workers in comparable else None
+        scaling = f"{speed:.2f}× | {speed / workers:.1%}" if speed else "— | —"
+        lines.append(f'| {revision} | {workers} | {m["trial"]} | {m["average_ms"]:.3f} | {m["median_ms"]:.3f} | '
+                     f'{m["p95_ms"]:.3f} | {m["p99_ms"]:.3f} | {m["maximum_ms"]:.3f} | '
+                     f'{m["total_render_ms"] / 1000:.2f} | {m["render_fps"]:.1f} | {m["over_16"]} | {m["over_33"]} | '
+                     f'{m["longest_16"]} / {m["longest_33"]} | {m["render_cpu_ms"] / 1000:.2f} | '
+                     f'{m["peak_working_set_bytes"] / 2**20:.1f} | {scaling} | {m["rgb_mismatches"]} |')
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     figure, ax = plt.subplots(figsize=(16, 6), layout="constrained")
-    for workers in WORKERS:
+    for workers in comparable:
         with (ROOT / f"workers-{workers}/frames.csv").open(newline="") as f:
             rows = list(csv.DictReader(f))
         ax.plot([int(r["frame"]) / 60 for r in rows], [float(r["render_ms"]) for r in rows],

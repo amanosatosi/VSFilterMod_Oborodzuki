@@ -33,11 +33,13 @@ int wmain(int argc, wchar_t** argv)
             const csri_fmt fmt{CSRI_F_BGR_, width, height};
             if (format(instance, &fmt))
                 throw std::runtime_error("Resolution change failed");
-            std::vector<unsigned char> pixels(width * height * 4);
+            const ptrdiff_t stride = ptrdiff_t(width) * 4 + (index % 2 ? 16 : 0);
+            const bool inverted = index % 3 == 1;
+            std::vector<unsigned char> pixels(stride * height);
             csri_frame frame{};
             frame.pixfmt = fmt.pixfmt;
-            frame.planes[0] = pixels.data();
-            frame.strides[0] = width * 4;
+            frame.planes[0] = pixels.data() + (inverted ? stride * (height - 1) : 0);
+            frame.strides[0] = inverted ? -stride : stride;
             render(instance, &frame, times[index]);
             return pixels;
         };
