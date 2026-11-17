@@ -311,7 +311,7 @@ public:
     {
         SYSTEM_INFO system{};
         GetSystemInfo(&system);
-        workers = (std::min)(4u, (std::max)(1u, system.dwNumberOfProcessors));
+        workers = (std::min)(4u, (std::max)(1u, unsigned(system.dwNumberOfProcessors)));
         wchar_t option[16]{};
         const DWORD length = GetEnvironmentVariableW(L"OBORODZUKI_WORKERS", option, 16);
         if (length && length < 16)
