@@ -29,8 +29,25 @@ scenarios = {"idle": (1, ""), "static": (1, ""), "animated": (1, ""), "banner": 
              "random": (16, r"\rnd0.2\rnds42\jitter(1,1,1,1,50,7)"),
              "lua": (16, r"\eventstyle")}
 lua = ROOT / "callbacks.lua"
-lua.write_text("counter = 0\nfunction eventstyle(line)\n counter = counter + 1\n"
-               " return {frz = counter % 7 * 2, fscx = 100 + line.id % 3 * 3}\nend\n", encoding="ascii")
+lua.write_text("""counter = 0
+function eventstyle(line)
+    counter = counter + 1
+    local result = {style = {frz = counter % 7 * 2, fscx = 100 + line.id % 3 * 3}}
+    if line.id % 8 == 0 then
+        result.user = {color = counter % 13 * 0x1000 + 0x4080ff}
+        result.renderer = "eventpixel"
+    end
+    return result
+end
+
+function eventpixel(line, pixels)
+    local y = math.floor(line.height / 2)
+    for x = 0, line.width - 1 do
+        local coverage = pixels:get(x, y)
+        if coverage > 0 then pixels:mix(x, y, line.user.color, 255) end
+    end
+end
+""", encoding="ascii")
 for name, (count, effects) in scenarios.items():
     text = header
     if name == "lua":
@@ -47,6 +64,9 @@ for name, (count, effects) in scenarios.items():
                  f"Worker overlap event {index}"
                  + (" 日本語 မြန်မာ" if name == "mixed" else "") + "\n")
     (ROOT / f"{name}.ass").write_text(text, encoding="utf-8")
+    if name == "lua":
+        (ROOT / "lua-disabled.ass").write_text(
+            text.replace("Lua: " + lua.resolve().as_posix() + "\n", ""), encoding="utf-8")
 if sys.argv[1:] == ["--fixtures-only"]:
     raise SystemExit()
 print("Checking concurrent instances and repeated teardown", flush=True)
@@ -56,7 +76,7 @@ baseline = str(Path("threading-baseline/renderer/renderer.dll").resolve(strict=T
 dlls = {"baseline": baseline, "candidate": DLL}
 comparable = [workers for workers in WORKERS if workers <= cpu]
 quick = os.environ.get("PARALLEL_QUICK") == "true" and os.environ.get("PARALLEL_FULL") != "true"
-fixture_names = ("idle", "static", "animated", "overlap-16", "blend", "mixed") if quick else tuple(scenarios)
+fixture_names = ("idle", "static", "animated", "overlap-16", "blend", "mixed", "lua") if quick else tuple(scenarios)
 settings = [(revision, workers) for workers in (comparable if quick else WORKERS)
             for revision in dlls if revision == "candidate" or workers in comparable]
 
@@ -89,6 +109,13 @@ for name in (*fixture_names, "kfx-sample"):
                 reference = sample["hashes"]
             if sample["hashes"] != reference:
                 raise RuntimeError(f"Pixel mismatch for {label}: {sample['hashes']} vs {reference}")
+    if name == "lua":
+        os.environ["OBORODZUKI_WORKERS"] = "1"
+        control = subprocess.run([HOST, "csri", baseline, str((ROOT / "lua-disabled.ass").resolve()), "animation"],
+                                 text=True, capture_output=True, check=True, timeout=180)
+        if json.loads(control.stdout)["hashes"] == reference:
+            raise RuntimeError("The Lua callbacks did not change the reference pixels")
+        print("Stateful Lua style and pixel callbacks matched at all worker settings", flush=True)
 lines = [f"# Worker scaling on {cpu} logical processors", "",
          "Three alternating-order trials per setting. All synthetic RGB hashes match the previous renderer.",
          "Worker counts above the processor count are used for correctness checks.",
