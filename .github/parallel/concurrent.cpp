@@ -41,14 +41,27 @@ int wmain(int argc, wchar_t** argv)
             render(instance, &frame, times[index]);
             return pixels;
         };
+        std::string changed(data.begin(), data.end());
+        const std::string before = "Worker overlap event";
+        size_t position = 0;
+        while ((position = changed.find(before, position)) != std::string::npos)
+        {
+            const std::string after = "Changed subtitle text";
+            changed.replace(position, before.size(), after);
+            position += after.size();
+        }
+        const std::vector<std::vector<char>> scripts{data, {changed.begin(), changed.end()}};
         SetEnvironmentVariableW(L"OBORODZUKI_WORKERS", L"1");
-        auto reference = open(renderer(), data.data(), data.size(), nullptr);
-        if (!reference)
-            throw std::runtime_error("Failed to open concurrency fixture");
-        std::vector<std::vector<unsigned char>> expected;
-        for (int index = 0; index < 6; ++index)
-            expected.push_back(draw(reference, index));
-        close(reference);
+        std::vector<std::vector<std::vector<unsigned char>>> expected(2);
+        for (size_t variant = 0; variant < scripts.size(); ++variant)
+        {
+            auto reference = open(renderer(), scripts[variant].data(), scripts[variant].size(), nullptr);
+            if (!reference)
+                throw std::runtime_error("Failed to open concurrency fixture");
+            for (int index = 0; index < 6; ++index)
+                expected[variant].push_back(draw(reference, index));
+            close(reference);
+        }
         const DWORD gdiBefore = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
 
         SetEnvironmentVariableW(L"OBORODZUKI_WORKERS", L"4");
@@ -58,12 +71,13 @@ int wmain(int argc, wchar_t** argv)
             threads.emplace_back([&] {
                 try {
                     for (int repeat = 0; repeat < 10; ++repeat) {
-                        auto instance = open(renderer(), data.data(), data.size(), nullptr);
+                        const size_t variant = repeat % scripts.size();
+                        auto instance = open(renderer(), scripts[variant].data(), scripts[variant].size(), nullptr);
                         if (!instance)
                             throw std::runtime_error("Failed to initialize concurrent instance");
                         bool matches = true;
                         for (int index = 0; index < 6; ++index)
-                            matches = matches && draw(instance, index) == expected[index];
+                            matches = matches && draw(instance, index) == expected[variant][index];
                         close(instance);
                         if (!matches)
                             throw std::runtime_error("Concurrent render pixels differ from one worker");

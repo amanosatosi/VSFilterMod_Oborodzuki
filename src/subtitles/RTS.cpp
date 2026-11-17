@@ -34,6 +34,9 @@
 #include <mutex>
 #include <thread>
 #include <stdexcept>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include "RTS.h"
 
 #if defined (_VSMOD) && defined(_LUA)
@@ -62,6 +65,26 @@ struct TextDeviceContext
 };
 
 static thread_local HDC g_hDC = nullptr;
+
+class WorkerFilterScope
+{
+#ifdef _OPENMP
+    int previous = omp_get_max_threads();
+#endif
+public:
+    WorkerFilterScope()
+    {
+#ifdef _OPENMP
+        omp_set_num_threads(1);
+#endif
+    }
+    ~WorkerFilterScope()
+    {
+#ifdef _OPENMP
+        omp_set_num_threads(previous);
+#endif
+    }
+};
 
 class TextDeviceScope
 {
@@ -285,6 +308,7 @@ class EventWorkerPool
 
     void Drain(unsigned worker)
     {
+        const WorkerFilterScope filterThreads;
         for (;;)
         {
             const size_t index = next.fetch_add(1, std::memory_order_relaxed);

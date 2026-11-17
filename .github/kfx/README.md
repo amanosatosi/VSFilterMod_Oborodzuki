@@ -1,5 +1,9 @@
 # KFX Stress Test
 
+The event-worker feature branch accepts the same explicit verification marker.
+Set `OBORODZUKI_WORKERS` before constructing a renderer to select its worker count.
+The separate Parallel renderer validation workflow compares all worker counts.
+
 In GitHub Actions, select **KFX Stress Test**, choose the development branch, and run
 one pass per renderer by default. Set **repetitions** to 2–5 for additional passes.
 The **profile** input adds a separate instrumented Oborodzuki playback. Its result
