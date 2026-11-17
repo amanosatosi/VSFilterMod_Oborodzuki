@@ -84,7 +84,15 @@ static LOGFONT TextLogFont(STSStyle& style)
 {
     LOGFONT lf;
     memset(&lf, 0, sizeof(lf));
-    lf <<= style;
+    // This renderer already expresses font height in its GDI path units.
+    // The generic style conversion queries screen DPI and computes a point
+    // height that would immediately be overwritten here.
+    lf.lfCharSet = style.charSet;
+    _tcsncpy_s(lf.lfFaceName, LF_FACESIZE, CString(style.fontName), _TRUNCATE);
+    lf.lfWeight = style.fontWeight;
+    lf.lfItalic = style.fItalic ? -1 : 0;
+    lf.lfUnderline = style.fUnderline ? -1 : 0;
+    lf.lfStrikeOut = style.fStrikeOut ? -1 : 0;
     lf.lfHeight = (LONG)(style.fontSize + 0.5);
     lf.lfOutPrecision = OUT_TT_PRECIS;
     lf.lfClipPrecision = CLIP_DEFAULT_PRECIS;
