@@ -17,14 +17,17 @@ fixture = Path(".github/ci/shared.ass").read_text(encoding="utf-8")
 header = fixture[:fixture.index("Dialogue:")]
 cpu = os.cpu_count()
 scenarios = {"static": (1, ""), "animated": (1, ""), **{f"overlap-{n}": (n, "") for n in [4, 8, 16, 32, 64]},
-             "blur": (16, r"\bord6\blur6"), "clip": (16, r"\clip(100,100,1800,1000)\frx15\fry20")}
+             "blur": (16, r"\bord6\blur6"), "clip": (16, r"\clip(100,100,1800,1000)\frx15\fry20"),
+             "mixed": (16, r"\1vc(&H00FF00&,&H0000FF&,&HFF0000&,&HFFFFFF&)\alpha&H40&"
+                       r"\iclip(m 800 300 l 1200 300 1200 750 800 750)\fry20")}
 for name, (count, effects) in scenarios.items():
     text = header
     for index in range(count):
         motion = "" if name == "static" else r"\t(0,4000,\frz30\fscx120\fscy85)"
         text += (f"Dialogue: {index},0:00:01.00,0:00:05.00,Default,,0,0,0,,"
                  rf"{{\an5\pos({350 + index % 8 * 160},{180 + index % 6 * 120}){motion}{effects}}}"
-                 f"Worker overlap event {index}\n")
+                 f"Worker overlap event {index}"
+                 + (" 日本語 မြန်မာ" if name == "mixed" else "") + "\n")
     (ROOT / f"{name}.ass").write_text(text, encoding="utf-8")
 subprocess.run(["hosts/concurrent.exe", DLL, str((ROOT / "overlap-32.ass").resolve())], check=True)
 

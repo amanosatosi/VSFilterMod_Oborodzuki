@@ -244,7 +244,7 @@ public:
 class EventWorkerPool
 {
     std::vector<std::thread> threads;
-    std::mutex mutex;
+    mutable std::mutex mutex;
     std::condition_variable ready, finished;
     const std::vector<std::function<void()>>* tasks = nullptr;
     std::atomic<size_t> next{0};
@@ -256,7 +256,7 @@ class EventWorkerPool
 #ifdef OBORODZUKI_PROFILE
     struct alignas(64) Sample
     {
-        unsigned long long tasks = 0, busyNs = 0, wakeNs = 0;
+        unsigned long long tasks = 0, busyNs = 0, wakeNs = 0, idleNs = 0, mutexNs = 0;
         RenderProfile stages;
     };
     Sample samples[8];
@@ -301,8 +301,18 @@ class EventWorkerPool
         for (;;)
         {
             {
+#ifdef OBORODZUKI_PROFILE
+                const auto acquiring = RenderProfile::Clock::now();
+#endif
                 std::unique_lock<std::mutex> lock(mutex);
+#ifdef OBORODZUKI_PROFILE
+                samples[index].mutexNs += Since(acquiring);
+                const auto waiting = RenderProfile::Clock::now();
+#endif
                 ready.wait(lock, [&] { return stopping || generation != observed; });
+#ifdef OBORODZUKI_PROFILE
+                samples[index].idleNs += Since(waiting);
+#endif
                 if (stopping)
                     return;
                 observed = generation;
@@ -327,7 +337,13 @@ class EventWorkerPool
             }
             catch (...) { RecordFailure(); }
             {
+#ifdef OBORODZUKI_PROFILE
+                const auto acquiring = RenderProfile::Clock::now();
+#endif
                 std::lock_guard<std::mutex> lock(mutex);
+#ifdef OBORODZUKI_PROFILE
+                samples[index].mutexNs += Since(acquiring);
+#endif
                 if (--pending == 0)
                     finished.notify_one();
             }
@@ -385,6 +401,9 @@ public:
 #endif
         {
             std::lock_guard<std::mutex> lock(mutex);
+#ifdef OBORODZUKI_PROFILE
+            stats.mutexNs += Since(dispatched);
+#endif
             tasks = &work;
             next.store(0, std::memory_order_relaxed);
             pending = unsigned(threads.size());
@@ -403,6 +422,9 @@ public:
         const auto waiting = RenderProfile::Clock::now();
 #endif
         std::unique_lock<std::mutex> lock(mutex);
+#ifdef OBORODZUKI_PROFILE
+        stats.mutexNs += Since(waiting);
+#endif
         finished.wait(lock, [&] { return pending == 0; });
         tasks = nullptr;
 #ifdef OBORODZUKI_PROFILE
@@ -426,6 +448,7 @@ public:
     EventWorkerStatistics Statistics() const
     {
 #ifdef OBORODZUKI_PROFILE
+        std::lock_guard<std::mutex> lock(mutex);
         auto result = stats;
         for (unsigned index = 0; index < 8; ++index)
         {
@@ -434,6 +457,8 @@ public:
             result.wakeNs += sample.wakeNs;
             result.tasksByWorker[index] = sample.tasks;
             result.busyByWorkerNs[index] = sample.busyNs;
+            result.idleNs += sample.idleNs;
+            result.mutexNs += sample.mutexNs;
         }
         return result;
 #else

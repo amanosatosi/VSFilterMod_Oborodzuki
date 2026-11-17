@@ -49,7 +49,10 @@ typedef struct csri_vsfilter_inst csri_inst;
 CSRIAPI void csri_oborodzuki_worker_stats(EventWorkerStatistics* result, csri_inst* instance)
 {
     if (result && instance)
+    {
+        CAutoLock lock(instance->cs);
         *result = instance->rts->WorkerStatistics();
+    }
 }
 CSRIAPI void csri_oborodzuki_profile_reset()
 {

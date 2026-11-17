@@ -175,6 +175,7 @@ void run_csri(HMODULE dll, const std::vector<char>& input, const Playback& playb
     struct WorkerStats {
         unsigned long long batches, tasks, busyNs, wakeNs, waitNs, dispatchNs;
         unsigned long long preparationNs, tasksByWorker[8], busyByWorkerNs[8];
+        unsigned long long idleNs, mutexNs;
     } stats{};
     using ReadWorkers = void (*)(WorkerStats*, csri_inst*);
     const auto workers = reinterpret_cast<ReadWorkers>(GetProcAddress(dll, "csri_oborodzuki_worker_stats"));
@@ -185,7 +186,9 @@ void run_csri(HMODULE dll, const std::vector<char>& input, const Playback& playb
             << ",\"busy_ms\":" << stats.busyNs / 1e6 << ",\"wake_delay_ms\":" << stats.wakeNs / 1e6
             << ",\"completion_wait_ms\":" << stats.waitNs / 1e6
             << ",\"dispatch_ms\":" << stats.dispatchNs / 1e6
-            << ",\"preparation_ms\":" << stats.preparationNs / 1e6 << ",\"workers\":[";
+            << ",\"preparation_ms\":" << stats.preparationNs / 1e6
+            << ",\"worker_sleep_ms\":" << stats.idleNs / 1e6
+            << ",\"mutex_acquisition_ms\":" << stats.mutexNs / 1e6 << ",\"workers\":[";
         for (unsigned i = 0; i < 8; ++i)
             output << (i ? "," : "") << "{\"tasks\":" << stats.tasksByWorker[i]
                 << ",\"busy_ms\":" << stats.busyByWorkerNs[i] / 1e6 << "}";
