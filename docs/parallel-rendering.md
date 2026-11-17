@@ -3,19 +3,20 @@
 Set `OBORODZUKI_WORKERS` to an integer from 1 through 8 before initializing a
 renderer. The setting counts the calling thread. The default is the smaller of
 four and the detected logical processor count. Each renderer owns its pool.
-Each batch uses up to one worker per two events needing preparation, bounded by
-the configured limit. Four events can use two workers with a higher configured
-limit. Cached geometry and scenes with fewer than four preparation tasks run on
-the caller. Workers above a batch's selected count stay idle. Set 1 for the sequential
-reference using the same binary.
+Preparation uses up to one worker per two tasks, bounded by the configured
+limit. Frames with fewer than four preparation tasks use the caller. For eight
+or more events on a 32-bit surface with independent rows, the pool can also
+prepare complete draws and blend across groups of rows. The blend worker count
+depends on the clipped pixel area and the number of occupied row groups. Set 1
+for the sequential reference using the same binary.
 
 ## Execution and ownership
 
-The caller selects events, evaluates overrides, resolves layout and collisions,
-and creates ordered composition closures. A dynamic queue hands independent
-events to workers. Their expensive work includes glyph paths, transforms, scan
-conversion, outline widening, rasterization and blur. Each word is prepared at
-the exact position, transform origin and subpixel phase of its first paint call.
+The caller selects events, evaluates overrides, and resolves layout and
+collisions. A dynamic queue hands independent events to workers. Their work
+includes glyph paths, transforms, scan conversion, outline widening,
+rasterization and blur. The preparation path uses the exact position, transform
+origin and subpixel phase of the first paint call.
 
 Each renderer has a caller GDI device context and text cache. Each worker has its
 own persistent GDI context and bounded text cache. Scoped thread-local bindings
@@ -23,12 +24,20 @@ restore the previous context on nested calls. Font selection restoration remains
 in the existing text path. The override-token cache belongs to the caller.
 Rasterizer paths, outlines and masks belong to each event's words.
 
-A generation counter and condition variable wake the persistent workers. An
-atomic next-task index balances events as workers finish. The caller also drains
-the queue. The completion barrier publishes prepared geometry before the caller
-composites events in their original layer and read order. Workers never write the
-destination image. Shutdown joins every worker before renderer resources are
-destroyed. Exceptions join the batch and return a rendering error.
+A generation counter and per-worker condition variables wake the selected
+workers. An atomic next-task index balances tasks as workers finish. The
+caller also drains the queue. Shutdown joins every worker before renderer
+resources are destroyed. Exceptions join the batch and return a rendering
+error after resetting the cached layout.
+
+On eligible frames, each event records its shadow, outline and fill draws in
+paint order. Each draw borrows its mask and snapshots its clipped bounds and
+blend parameters. An event retains any mask replaced by a subpixel phase change
+through the end of blending. Each row group visits the intersecting draws in
+original ASS layer, read and paint order and writes directly to its own
+destination rows. The same fixed-point mixers handle serial and parallel
+painting, including destination-dependent blend modes. The original clipped
+row coordinates preserve vector-mask, gradient and PNG sampling.
 
 External Lua files and direct Lua calls from ASS retain sequential execution.
 This preserves Lua state and callback order. Gradients, clipping, custom blend
@@ -95,15 +104,16 @@ was not imported.
 
 The existing Windows workflow continues to produce x86 and x64 DLLs. The
 existing iteration suite checks original-VSFilterMod and baseline frame hashes.
-The parallel validation workflow compares 1, 2, 4, 6 and 8 workers on one runner
-with warmups and three alternating-order trials. It covers static and animated
-text, 4–64 overlaps, borders, blur, clipping, gradients and mixed scripts.
+The parallel validation workflow compares the previous and current renderer on
+one runner with warmups and three alternating-order trials. It covers empty
+frames, static and animated text, 4–64 overlaps, borders, blur, clipping,
+gradients and mixed scripts.
 
 The full opt-in suite renders all 5,400 KFX frames at each worker count with a
-persistent instance, preserves per-frame timings and hashes, and compares the
-current single-worker output with the previous optimized renderer when its
-validated artifact is available. A separate existing KFX run also compares the
-original renderer and Mangetsu on one runner.
+persistent instance, preserves per-frame timings and hashes, and repeats the
+same-runner comparison for the two parallel renderer revisions. Each candidate
+pass must match the original parallel renderer's one-worker RGB hashes. A
+separate existing KFX workflow compares the original renderer and Mangetsu.
 
 Instrumented worker runs record task counts, task execution time, dispatch time,
 wake latency, condition-variable sleep, mutex acquisition and completion-barrier

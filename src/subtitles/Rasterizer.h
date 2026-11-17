@@ -139,11 +139,11 @@ private:
     {
         int next;
         int posandflag;
-    } *mpEdgeBuffer;
+    } *mpEdgeBuffer = nullptr;
     size_t mEdgeHeapSize;
     size_t mEdgeNext;
 
-    size_t* mpScanBuffer;
+    size_t* mpScanBuffer = nullptr;
 
     typedef unsigned char byte;
 
@@ -156,7 +156,8 @@ protected:
 private:
     void _TrashPath();
     void _TrashOverlay();
-    void _ReallocEdgeBuffer(int edges);
+    void _TrashScanBuffers();
+    void _ReallocEdgeBuffer(size_t edges);
     void _EvaluateBezier(int ptbase, bool fBSpline);
     void _EvaluateLine(int pt1idx, int pt2idx);
     void _EvaluateLine(int x0, int y0, int x1, int y1);

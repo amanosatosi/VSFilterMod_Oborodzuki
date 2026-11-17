@@ -1688,6 +1688,7 @@ void CClipper::ParseLuaTable(STSStyle& style, CPoint & pos, CPoint & org)
 #endif
     : CPolygon(STSStyle(), str, 0, 0, 0, scalex, scaley, 0)
 {
+    PROFILE_RENDER_STAGE(Mask);
     m_size.cx = m_size.cy = 0;
     m_pAlphaMask = NULL;
 
@@ -4796,9 +4797,11 @@ struct LSub
 
 static int lscomp(const void* ls1, const void* ls2)
 {
-    int ret = ((LSub*)ls1)->layer - ((LSub*)ls2)->layer;
-    if(!ret) ret = ((LSub*)ls1)->readorder - ((LSub*)ls2)->readorder;
-    return(ret);
+    const auto& a = *static_cast<const LSub*>(ls1);
+    const auto& b = *static_cast<const LSub*>(ls2);
+    if (a.layer != b.layer)
+        return a.layer < b.layer ? -1 : 1;
+    return (a.readorder > b.readorder) - (a.readorder < b.readorder);
 }
 
 struct PreparedWord

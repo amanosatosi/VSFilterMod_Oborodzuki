@@ -21,8 +21,10 @@
 
 #include "stdafx.h"
 #include "RenderProfile.h"
+#include <cstdint>
 #include <string.h>
 #include <math.h>
+#include <new>
 #include <vector>
 #include <algorithm>
 #include "Rasterizer.h"
@@ -67,6 +69,8 @@ Rasterizer::~Rasterizer()
 {
     _TrashPath();
     _TrashOverlay();
+    if (mpEdgeBuffer || mpScanBuffer)
+        _TrashScanBuffers();
 }
 
 void Rasterizer::_TrashPath()
@@ -84,10 +88,23 @@ void Rasterizer::_TrashOverlay()
     mpOverlayBuffer = NULL;
 }
 
-void Rasterizer::_ReallocEdgeBuffer(int edges)
+void Rasterizer::_TrashScanBuffers()
 {
+    free(mpEdgeBuffer);
+    delete[] mpScanBuffer;
+    mpEdgeBuffer = nullptr;
+    mpScanBuffer = nullptr;
+}
+
+void Rasterizer::_ReallocEdgeBuffer(size_t edges)
+{
+    if (edges > SIZE_MAX / sizeof(Edge))
+        throw std::bad_alloc();
+    auto* grown = static_cast<Edge*>(realloc(mpEdgeBuffer, sizeof(Edge) * edges));
+    if (!grown)
+        throw std::bad_alloc();
+    mpEdgeBuffer = grown;
     mEdgeHeapSize = edges;
-    mpEdgeBuffer = (Edge*)realloc(mpEdgeBuffer, sizeof(Edge) * edges);
 }
 
 void Rasterizer::_EvaluateBezier(int ptbase, bool fBSpline)
@@ -466,8 +483,7 @@ bool Rasterizer::ScanConvert()
     // Initialize edge buffer.  We use edge 0 as a sentinel.
 
     mEdgeNext = 1;
-    mEdgeHeapSize = 2048;
-    mpEdgeBuffer = (Edge*)malloc(sizeof(Edge) * mEdgeHeapSize);
+    _ReallocEdgeBuffer(2048);
 
     // Initialize scanline list.
 
@@ -586,8 +602,7 @@ bool Rasterizer::ScanConvert()
 
     // Dump the edge and scan buffers, since we no longer need them.
 
-    free(mpEdgeBuffer);
-    delete [] mpScanBuffer;
+    _TrashScanBuffers();
 
     // All done!
 
