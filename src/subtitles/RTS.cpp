@@ -24,6 +24,8 @@
 #include <cmath>
 #include <math.h>
 #include <time.h>
+#include <map>
+#include <vector>
 #include "RTS.h"
 
 #if defined (_VSMOD) && defined(_LUA)
@@ -2021,6 +2023,23 @@ CRect CScreenLayoutAllocator::AllocRect(CSubtitle* s, int segment, int entry, in
 
 // CRenderedTextSubtitle
 
+struct OverrideTag {
+    CStringW rawCommand;
+    CStringW command;
+    std::vector<CStringW> parameters;
+    int rawCount;
+};
+
+using OverrideTags = std::vector<OverrideTag>;
+
+struct OverrideTagCache {
+    std::map<CStringW, std::shared_ptr<const OverrideTags>> blocks;
+    size_t characters = 0;
+
+    std::shared_ptr<const OverrideTags> Get(const CStringW& text);
+};
+
+
 CRenderedTextSubtitle::CRenderedTextSubtitle(CCritSec* pLock, STSStyle *styleOverride, bool doOverride)
     : ISubPicProviderImpl(pLock), m_doOverrideStyle(doOverride), m_pStyleOverride(styleOverride)
 {
@@ -2099,6 +2118,7 @@ bool CRenderedTextSubtitle::Init(CSize size, CRect vidrect)
 
 void CRenderedTextSubtitle::Deinit()
 {
+    m_overrideTags.reset();
     POSITION pos = m_subtitleCache.GetStartPosition();
     while(pos)
     {
@@ -2422,12 +2442,9 @@ void CRenderedTextSubtitle::ParseLuaTable(CSubtitle* sub, STSStyle& style)
 }
 #endif
 
-bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org, bool fAnimate)
+static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& str)
 {
-    if(!sub) return(false);
-
-    int nTags = 0, nUnrecognizedTags = 0;
-
+    auto result = std::make_shared<OverrideTags>();
     for(int i = 0, j; (j = str.Find('\\', i)) >= 0; i = j)
     {
         CStringW cmd;
@@ -2435,7 +2452,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         cmd.Trim();
         if(cmd.IsEmpty()) continue;
 
-        CAtlArray<CStringW> params;
+        std::vector<CStringW> params;
 
         if(str[j] == '(')
         {
@@ -2457,22 +2474,207 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 if(i >= 0 && (j < 0 || i < j))
                 {
                     CStringW s = param.Left(i).Trim();
-                    if(!s.IsEmpty()) params.Add(s);
+                    if(!s.IsEmpty()) params.push_back(s);
                     param = i + 1 < param.GetLength() ? param.Mid(i + 1) : L"";
                 }
                 else
                 {
                     param.Trim();
-                    if(!param.IsEmpty()) params.Add(param);
+                    if(!param.IsEmpty()) params.push_back(param);
                     param.Empty();
                 }
             }
         }
 
+        const CStringW rawCommand = cmd;
+        const int rawCount = static_cast<int>(params.size());
+        if(!cmd.Find(L"1c") || !cmd.Find(L"2c") || !cmd.Find(L"3c") || !cmd.Find(L"4c"))
+            params.push_back(cmd.Mid(2).Trim(L"&H")), cmd = cmd.Left(2);
+        else if(!cmd.Find(L"1a") || !cmd.Find(L"2a") || !cmd.Find(L"3a") || !cmd.Find(L"4a"))
+            params.push_back(cmd.Mid(2).Trim(L"&H")), cmd = cmd.Left(2);
+#ifdef _VSMOD // patch m010. png background
+        else if(!cmd.Find(L"1img") || !cmd.Find(L"2img") || !cmd.Find(L"3img") || !cmd.Find(L"4img"))
+            ;//params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
+#endif
+#ifdef _VSMOD // patch m004. gradient colors
+        else if(!cmd.Find(L"1vc") || !cmd.Find(L"2vc") || !cmd.Find(L"3vc") || !cmd.Find(L"4vc"))
+            ;//params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+        else if(!cmd.Find(L"1va") || !cmd.Find(L"2va") || !cmd.Find(L"3va") || !cmd.Find(L"4va"))
+            ;//params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+#endif
+        else if(!cmd.Find(L"alpha"))
+            params.push_back(cmd.Mid(5).Trim(L"&H")), cmd = cmd.Left(5);
+        else if(!cmd.Find(L"an"))
+            params.push_back(cmd.Mid(2)), cmd = cmd.Left(2);
+        else if(!cmd.Find(L"a"))
+            params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+        else if(!cmd.Find(L"blur"))
+            params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
+        else if(!cmd.Find(L"bord"))
+            params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
+        else if(!cmd.Find(L"be"))
+            params.push_back(cmd.Mid(2)), cmd = cmd.Left(2);
+#ifdef _VSMOD
+        else if (!cmd.Find(L"blend")) // vpatch v003. blending mode
+            params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
+#endif
+        else if(!cmd.Find(L"b"))
+            params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+        else if(!cmd.Find(L"clip"))
+            ;
+        else if(!cmd.Find(L"c"))
+            params.push_back(cmd.Mid(1).Trim(L"&H")), cmd = cmd.Left(1);
+#ifdef _VSMOD // patch m008. distort
+        else if(!cmd.Find(L"distort"))
+            ;
+#endif
+        else if(!cmd.Find(L"fade"))
+            ;
+        else if(!cmd.Find(L"fe"))
+            params.push_back(cmd.Mid(2)), cmd = cmd.Left(2);
+        else if(!cmd.Find(L"fn"))
+            params.push_back(cmd.Mid(2)), cmd = cmd.Left(2);
+        else if(!cmd.Find(L"frx") || !cmd.Find(L"fry") || !cmd.Find(L"frz"))
+            params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+#ifdef _VSMOD // patch m007. symbol rotating
+        else if(!cmd.Find(L"frs"))
+            params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+#endif
+        else if(!cmd.Find(L"fax") || !cmd.Find(L"fay"))
+            params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+        else if(!cmd.Find(L"fr"))
+            params.push_back(cmd.Mid(2)), cmd = cmd.Left(2);
+        else if(!cmd.Find(L"fscx") || !cmd.Find(L"fscy"))
+            params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
+        else if(!cmd.Find(L"fsc"))
+            params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+        else if(!cmd.Find(L"fsp"))
+            params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+#ifdef _VSMOD// patch m001. Vertical fontspacing
+        else if(!cmd.Find(L"fsvp"))
+            params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
+        else if (!cmd.Find(L"fshp"))// vpatch v002. Horizontal fontspacing
+            params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
+#endif
+        else if(!cmd.Find(L"fs"))
+            params.push_back(cmd.Mid(2)), cmd = cmd.Left(2);
+        else if(!cmd.Find(L"iclip"))
+            ;
+        else if(!cmd.Find(L"i"))
+            params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+#ifdef _VSMOD // patch m011. jitter
+        else if(!cmd.Find(L"jitter"))
+            ;
+#endif
+        else if(!cmd.Find(L"kt") || !cmd.Find(L"kf") || !cmd.Find(L"ko"))
+            params.push_back(cmd.Mid(2)), cmd = cmd.Left(2);
+        else if(!cmd.Find(L"k") || !cmd.Find(L"K"))
+            params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+#ifdef _VSMOD // patch m012. add lua animation
+        else if(!cmd.Find(L"lua"))
+            ;
+#endif
+#ifdef _VSMOD // patch m005. add some move types
+        else if(!cmd.Find(L"mover"))	// radial move
+            ;
+        else if(!cmd.Find(L"moves3"))	// square spline
+            ;
+        else if(!cmd.Find(L"moves4"))	// cubic spline
+            ;
+#endif
+#ifdef _VSMOD // patch m006. moveable vector clip
+        else if(!cmd.Find(L"movevc"))
+            ;
+#endif
+        else if(!cmd.Find(L"move"))
+            ;
+        else if(!cmd.Find(L"org"))
+            ;
+        else if(!cmd.Find(L"pbo"))
+            params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+        else if(!cmd.Find(L"pos"))
+            ;
+        else if(!cmd.Find(L"p"))
+            params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+        else if(!cmd.Find(L"q"))
+            params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+#ifdef _VSMOD // patch m003. random text points
+        else if(!cmd.Find(L"rndx") || !cmd.Find(L"rndy") || !cmd.Find(L"rndz") || !cmd.Find(L"rnds"))
+            params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
+        else if(!cmd.Find(L"rnd"))
+            params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+#endif
+        else if(!cmd.Find(L"r"))
+            params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+        else if(!cmd.Find(L"shad"))
+            params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
+        else if(!cmd.Find(L"s"))
+            params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+        else if(!cmd.Find(L"t"))
+            ;
+        else if(!cmd.Find(L"u"))
+            params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+        else if(!cmd.Find(L"xbord"))
+            params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
+        else if(!cmd.Find(L"xshad"))
+            params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
+        else if(!cmd.Find(L"ybord"))
+            params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
+        else if(!cmd.Find(L"yshad"))
+            params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
+        else if (!cmd.Find(L"xblur"))
+            params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
+        else if (!cmd.Find(L"yblur"))
+            params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
+#ifdef _VSMOD // patch m002. Z-coord
+        else if(!cmd.Find(L"z"))
+            params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+        else if(!cmd.Find(L"ortho")) // vpatch v001. ortho
+            params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
+#endif
+        result->push_back({rawCommand, cmd, std::move(params), rawCount});
+    }
+    return result;
+}
+
+std::shared_ptr<const OverrideTags> OverrideTagCache::Get(const CStringW& text)
+{
+    const size_t length = text.GetLength();
+    if (length > 1024)
+        return TokenizeOverrideTags(text);
+
+    const auto found = blocks.find(text);
+    if (found != blocks.end())
+        return found->second;
+
+    auto tags = TokenizeOverrideTags(text);
+    if (blocks.size() >= 1024 || characters + length > 128 * 1024)
+    {
+        blocks.clear();
+        characters = 0;
+    }
+    blocks.emplace(text, tags);
+    characters += length;
+    return tags;
+}
+
+bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org, bool fAnimate)
+{
+    if (!sub)
+        return false;
+
+    if (!m_overrideTags)
+        m_overrideTags = std::make_unique<OverrideTagCache>();
+    // A nested transform can rotate the cache while this block is being applied.
+    const auto tags = m_overrideTags->Get(str);
+    for (const auto& tag : *tags)
+    {
+        const auto& cmd = tag.command;
+        const auto& params = tag.parameters;
 #ifdef _LUA
         // Direct function call!
-        CStringA Func(cmd);
-        if(LuaHasFunction(L, cmd))
+        CStringA Func(tag.rawCommand);
+        if(LuaHasFunction(L, tag.rawCommand))
         {
             // Find function =D
             lua_getglobal(L, Func);
@@ -2498,12 +2700,12 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     lua_pop(L, 1);
             }
             // Push arguments
-            for(int arg = 0; arg < params.GetCount(); arg++)
+            for(int arg = 0; arg < tag.rawCount; arg++)
             {
                 CStringA Param(params[arg]);
-                lua_pushstring(L, Param); 
+                lua_pushstring(L, Param);
             }
-            if (lua_pcall(L, params.GetCount() + 1, 1, 0) != 0)
+            if (lua_pcall(L, tag.rawCount + 1, 1, 0) != 0)
             {
                 // error
                 CString ErrorText = L"Error: ";
@@ -2525,160 +2727,8 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             }
             continue;
         }
-        else
 #endif
-        if(!cmd.Find(L"1c") || !cmd.Find(L"2c") || !cmd.Find(L"3c") || !cmd.Find(L"4c"))
-            params.Add(cmd.Mid(2).Trim(L"&H")), cmd = cmd.Left(2);
-        else if(!cmd.Find(L"1a") || !cmd.Find(L"2a") || !cmd.Find(L"3a") || !cmd.Find(L"4a"))
-            params.Add(cmd.Mid(2).Trim(L"&H")), cmd = cmd.Left(2);
-#ifdef _VSMOD // patch m010. png background
-        else if(!cmd.Find(L"1img") || !cmd.Find(L"2img") || !cmd.Find(L"3img") || !cmd.Find(L"4img"))
-            ;//params.Add(cmd.Mid(4)), cmd = cmd.Left(4);
-#endif
-#ifdef _VSMOD // patch m004. gradient colors
-        else if(!cmd.Find(L"1vc") || !cmd.Find(L"2vc") || !cmd.Find(L"3vc") || !cmd.Find(L"4vc"))
-            ;//params.Add(cmd.Mid(3)), cmd = cmd.Left(3);
-        else if(!cmd.Find(L"1va") || !cmd.Find(L"2va") || !cmd.Find(L"3va") || !cmd.Find(L"4va"))
-            ;//params.Add(cmd.Mid(3)), cmd = cmd.Left(3);
-#endif
-        else if(!cmd.Find(L"alpha"))
-            params.Add(cmd.Mid(5).Trim(L"&H")), cmd = cmd.Left(5);
-        else if(!cmd.Find(L"an"))
-            params.Add(cmd.Mid(2)), cmd = cmd.Left(2);
-        else if(!cmd.Find(L"a"))
-            params.Add(cmd.Mid(1)), cmd = cmd.Left(1);
-        else if(!cmd.Find(L"blur"))
-            params.Add(cmd.Mid(4)), cmd = cmd.Left(4);
-        else if(!cmd.Find(L"bord"))
-            params.Add(cmd.Mid(4)), cmd = cmd.Left(4);
-        else if(!cmd.Find(L"be"))
-            params.Add(cmd.Mid(2)), cmd = cmd.Left(2);
-#ifdef _VSMOD
-        else if (!cmd.Find(L"blend")) // vpatch v003. blending mode
-            params.Add(cmd.Mid(5)), cmd = cmd.Left(5);
-#endif
-        else if(!cmd.Find(L"b"))
-            params.Add(cmd.Mid(1)), cmd = cmd.Left(1);
-        else if(!cmd.Find(L"clip"))
-            ;
-        else if(!cmd.Find(L"c"))
-            params.Add(cmd.Mid(1).Trim(L"&H")), cmd = cmd.Left(1);
-#ifdef _VSMOD // patch m008. distort
-        else if(!cmd.Find(L"distort"))
-            ;
-#endif
-        else if(!cmd.Find(L"fade"))
-            ;
-        else if(!cmd.Find(L"fe"))
-            params.Add(cmd.Mid(2)), cmd = cmd.Left(2);
-        else if(!cmd.Find(L"fn"))
-            params.Add(cmd.Mid(2)), cmd = cmd.Left(2);
-        else if(!cmd.Find(L"frx") || !cmd.Find(L"fry") || !cmd.Find(L"frz"))
-            params.Add(cmd.Mid(3)), cmd = cmd.Left(3);
-#ifdef _VSMOD // patch m007. symbol rotating
-        else if(!cmd.Find(L"frs"))
-            params.Add(cmd.Mid(3)), cmd = cmd.Left(3);
-#endif
-        else if(!cmd.Find(L"fax") || !cmd.Find(L"fay"))
-            params.Add(cmd.Mid(3)), cmd = cmd.Left(3);
-        else if(!cmd.Find(L"fr"))
-            params.Add(cmd.Mid(2)), cmd = cmd.Left(2);
-        else if(!cmd.Find(L"fscx") || !cmd.Find(L"fscy"))
-            params.Add(cmd.Mid(4)), cmd = cmd.Left(4);
-        else if(!cmd.Find(L"fsc"))
-            params.Add(cmd.Mid(3)), cmd = cmd.Left(3);
-        else if(!cmd.Find(L"fsp"))
-            params.Add(cmd.Mid(3)), cmd = cmd.Left(3);
-#ifdef _VSMOD// patch m001. Vertical fontspacing
-        else if(!cmd.Find(L"fsvp"))
-            params.Add(cmd.Mid(4)), cmd = cmd.Left(4);
-        else if (!cmd.Find(L"fshp"))// vpatch v002. Horizontal fontspacing
-            params.Add(cmd.Mid(4)), cmd = cmd.Left(4);
-#endif
-        else if(!cmd.Find(L"fs"))
-            params.Add(cmd.Mid(2)), cmd = cmd.Left(2);
-        else if(!cmd.Find(L"iclip"))
-            ;
-        else if(!cmd.Find(L"i"))
-            params.Add(cmd.Mid(1)), cmd = cmd.Left(1);
-#ifdef _VSMOD // patch m011. jitter
-        else if(!cmd.Find(L"jitter"))
-            ;
-#endif
-        else if(!cmd.Find(L"kt") || !cmd.Find(L"kf") || !cmd.Find(L"ko"))
-            params.Add(cmd.Mid(2)), cmd = cmd.Left(2);
-        else if(!cmd.Find(L"k") || !cmd.Find(L"K"))
-            params.Add(cmd.Mid(1)), cmd = cmd.Left(1);
-#ifdef _VSMOD // patch m012. add lua animation
-        else if(!cmd.Find(L"lua"))
-            ;
-#endif
-#ifdef _VSMOD // patch m005. add some move types
-        else if(!cmd.Find(L"mover"))	// radial move
-            ;
-        else if(!cmd.Find(L"moves3"))	// square spline
-            ;
-        else if(!cmd.Find(L"moves4"))	// cubic spline
-            ;
-#endif
-#ifdef _VSMOD // patch m006. moveable vector clip
-        else if(!cmd.Find(L"movevc"))
-            ;
-#endif
-        else if(!cmd.Find(L"move"))
-            ;
-        else if(!cmd.Find(L"org"))
-            ;
-        else if(!cmd.Find(L"pbo"))
-            params.Add(cmd.Mid(3)), cmd = cmd.Left(3);
-        else if(!cmd.Find(L"pos"))
-            ;
-        else if(!cmd.Find(L"p"))
-            params.Add(cmd.Mid(1)), cmd = cmd.Left(1);
-        else if(!cmd.Find(L"q"))
-            params.Add(cmd.Mid(1)), cmd = cmd.Left(1);
-#ifdef _VSMOD // patch m003. random text points
-        else if(!cmd.Find(L"rndx") || !cmd.Find(L"rndy") || !cmd.Find(L"rndz") || !cmd.Find(L"rnds"))
-            params.Add(cmd.Mid(4)), cmd = cmd.Left(4);
-        else if(!cmd.Find(L"rnd"))
-            params.Add(cmd.Mid(3)), cmd = cmd.Left(3);
-#endif
-        else if(!cmd.Find(L"r"))
-            params.Add(cmd.Mid(1)), cmd = cmd.Left(1);
-        else if(!cmd.Find(L"shad"))
-            params.Add(cmd.Mid(4)), cmd = cmd.Left(4);
-        else if(!cmd.Find(L"s"))
-            params.Add(cmd.Mid(1)), cmd = cmd.Left(1);
-        else if(!cmd.Find(L"t"))
-            ;
-        else if(!cmd.Find(L"u"))
-            params.Add(cmd.Mid(1)), cmd = cmd.Left(1);
-        else if(!cmd.Find(L"xbord"))
-            params.Add(cmd.Mid(5)), cmd = cmd.Left(5);
-        else if(!cmd.Find(L"xshad"))
-            params.Add(cmd.Mid(5)), cmd = cmd.Left(5);
-        else if(!cmd.Find(L"ybord"))
-            params.Add(cmd.Mid(5)), cmd = cmd.Left(5);
-        else if(!cmd.Find(L"yshad"))
-            params.Add(cmd.Mid(5)), cmd = cmd.Left(5);
-        else if (!cmd.Find(L"xblur"))
-            params.Add(cmd.Mid(5)), cmd = cmd.Left(5);
-        else if (!cmd.Find(L"yblur"))
-            params.Add(cmd.Mid(5)), cmd = cmd.Left(5);
-#ifdef _VSMOD // patch m002. Z-coord
-        else if(!cmd.Find(L"z"))
-            params.Add(cmd.Mid(1)), cmd = cmd.Left(1);
-        else if(!cmd.Find(L"ortho")) // vpatch v001. ortho
-            params.Add(cmd.Mid(5)), cmd = cmd.Left(5);
-#endif
-        else
-            nUnrecognizedTags++;
-
-        nTags++;
-
-        // TODO: call ParseStyleModifier(cmd, params, ..) and move the rest there
-
-        CStringW p = params.GetCount() > 0 ? params[0] : L"";
+        CStringW p = params.size() > 0 ? params[0] : L"";
 
         if(cmd == "1c" || cmd == L"2c" || cmd == L"3c" || cmd == L"4c")
         {
@@ -2752,7 +2802,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         {
             int i = cmd[0] - '1';
 
-            if(params.GetCount() >= 1)// file[,xoffset,yoffset[,angle]]
+            if(params.size() >= 1)// file[,xoffset,yoffset[,angle]]
             {
                 if(!fAnimate)
                 {
@@ -2799,7 +2849,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                         }
                     }
                 }
-                if(params.GetCount() >= 3)
+                if(params.size() >= 3)
                 {
                     style.mod_grad.b_images[i].xoffset = !p.IsEmpty()
                                                          ? CalcAnimation(wcstol(params[1], NULL, 10), style.mod_grad.b_images[i].xoffset, fAnimate)
@@ -2816,12 +2866,12 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         {
             int i = cmd[0] - '1';
 
-            if(params.GetCount() >= 4)
+            if(params.size() >= 4)
             {
                 DWORD c;
                 for(int j = 0; j < 4; j++)
                 {
-                    c = wcstol(params[j].Trim(L"&H"), NULL, 16);
+                    c = wcstol(CStringW(params[j]).Trim(L"&H"), NULL, 16);
                     style.mod_grad.color[i][j] = !p.IsEmpty()
                                                  ? (((int)CalcAnimation((c & 0xff0000) >> 16, style.mod_grad.color[i][j] & 0xff, fAnimate)) & 0xff
                                                     | ((int)CalcAnimation(c & 0xff00, style.mod_grad.color[i][j] & 0xff00, fAnimate)) & 0xff00
@@ -2846,12 +2896,12 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         {
             int i = cmd[0] - '1';
 
-            if(params.GetCount() >= 4)
+            if(params.size() >= 4)
             {
                 int a;
                 for(int j = 0; j < 4; j++)
                 {
-                    a = wcstol(params[j].Trim(L"&H"), NULL, 16);
+                    a = wcstol(CStringW(params[j]).Trim(L"&H"), NULL, 16);
                     style.mod_grad.alpha[i][j] = !p.IsEmpty()
                                                  ? (int)CalcAnimation(a, style.mod_grad.alpha[i][j], fAnimate) : org.mod_grad.alpha[i][j];
                 }
@@ -2960,7 +3010,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         {
             bool invert = (cmd == L"iclip");
 
-            if(params.GetCount() == 1 && !sub->m_pClipper)
+            if(params.size() == 1 && !sub->m_pClipper)
             {
 #if defined (_VSMOD) && defined(_LUA)
                 sub->m_pClipper = DNew CClipper(params[0], CSize(m_size.cx >> 3, m_size.cy >> 3), sub->m_scalex, sub->m_scaley, invert, style.LuaClipStyleHandler, L, LuaLog, m_entry);
@@ -2968,7 +3018,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 sub->m_pClipper = DNew CClipper(params[0], CSize(m_size.cx >> 3, m_size.cy >> 3), sub->m_scalex, sub->m_scaley, invert);
 #endif           
             }
-            else if(params.GetCount() == 2 && !sub->m_pClipper)
+            else if(params.size() == 2 && !sub->m_pClipper)
             {
                 int scale = max(wcstol(p, NULL, 10), 1);
 #if defined (_VSMOD) && defined(_LUA)
@@ -2977,7 +3027,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 sub->m_pClipper = DNew CClipper(params[1], CSize(m_size.cx >> 3, m_size.cy >> 3), sub->m_scalex / (1 << (scale - 1)), sub->m_scaley / (1 << (scale - 1)), invert);
 #endif       
             }
-            else if(params.GetCount() == 4)
+            else if(params.size() == 4)
             {
                 CRect r;
 
@@ -3042,7 +3092,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #ifdef _VSMOD // patch m008. distort
         else if(cmd == L"distort")
         {
-            if(params.GetCount() >= 6)
+            if(params.size() >= 6)
             {
                 DWORD c;
                 for(int j = 0; j < 3; j++)
@@ -3060,7 +3110,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #endif
         else if(cmd == L"fade" || cmd == L"fad")
         {
-            if(params.GetCount() == 7 && !sub->m_effects[EF_FADE])// {\fade(a1=param[0], a2=param[1], a3=param[2], t1=t[0], t2=t[1], t3=t[2], t4=t[3])
+            if(params.size() == 7 && !sub->m_effects[EF_FADE])// {\fade(a1=param[0], a2=param[1], a3=param[2], t1=t[0], t2=t[1], t3=t[2], t4=t[3])
             {
                 if(Effect* e = DNew Effect)
                 {
@@ -3072,7 +3122,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     sub->m_effects[EF_FADE] = e;
                 }
             }
-            else if(params.GetCount() == 2 && !sub->m_effects[EF_FADE]) // {\fad(t1=t[1], t2=t[2])
+            else if(params.size() == 2 && !sub->m_effects[EF_FADE]) // {\fad(t1=t[1], t2=t[2])
             {
                 if(Effect* e = DNew Effect)
                 {
@@ -3221,7 +3271,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #ifdef _VSMOD // patch m011. jitter
         else if(cmd == L"jitter") // {\jitter(left,right,up,down,period,[seed])}
         {
-            if((params.GetCount() >= 4))
+            if((params.size() >= 4))
             {
                 int left = (int)abs(wcstol(params[0], NULL, 10)) * 8;
                 int right = (int)abs(wcstol(params[1], NULL, 10)) * 8;
@@ -3233,11 +3283,11 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 style.mod_jitter.offset.right = CalcAnimation(right, style.mod_jitter.offset.right, fAnimate);
                 style.mod_jitter.enabled = true;
 
-                if(params.GetCount() >= 5)
+                if(params.size() >= 5)
                 {
                     int period = wcstol(params[4], NULL, 10) * 10000;
                     style.mod_jitter.period = CalcAnimation(period, style.mod_jitter.period, fAnimate);
-                    if(params.GetCount() >= 6)
+                    if(params.size() >= 6)
                     {
                         style.mod_jitter.seed = wcstol(params[5], NULL, 10);
                     }
@@ -3280,7 +3330,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #ifdef _LUA
         else if(cmd == L"lua")
         {
-            if(params.GetCount() > 0)
+            if(params.size() > 0)
             {
                 CStringA Func(params[0]);
                 if(LuaHasFunction(L, params[0]))
@@ -3307,12 +3357,12 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                             lua_pop(L, 1);
                     }
                     // Push arguments
-                    for(int arg = 1; arg < params.GetCount(); arg++)
+                    for(int arg = 1; arg < params.size(); arg++)
                     {
                         CStringA Param(params[arg]);
                         lua_pushstring(L, Param); 
                     }
-                    if (lua_pcall(L, params.GetCount(), 1, 0) != 0)
+                    if (lua_pcall(L, params.size(), 1, 0) != 0)
                     {
                         // error
                         CString ErrorText = L"Error: ";
@@ -3340,7 +3390,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #ifdef _VSMOD // patch m005. add some move types
         else if(cmd == L"mover") // {\mover(x1,x2,x2,y2,alp1,alp2,r1,r2,t1,t2)}
         {
-            if((params.GetCount() == 8 || params.GetCount() == 10) && !sub->m_effects[EF_MOVE])
+            if((params.size() == 8 || params.size() == 10) && !sub->m_effects[EF_MOVE])
             {
                 if(Effect* e = new Effect)
                 {
@@ -3356,7 +3406,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 
                     e->t[0] = e->t[1] = -1;
 
-                    if(params.GetCount() == 10)
+                    if(params.size() == 10)
                     {
                         for(int i = 0; i < 2; i++)
                             e->t[i] = wcstol(params[8+i], NULL, 10);
@@ -3367,7 +3417,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         }
         else if(cmd == L"moves3") // {\moves3(x1,x2,x2,y2,x3,y3[,t1,t2])}
         {
-            if((params.GetCount() == 6 || params.GetCount() == 8) && !sub->m_effects[EF_MOVE])
+            if((params.size() == 6 || params.size() == 8) && !sub->m_effects[EF_MOVE])
             {
                 if(Effect* e = new Effect)
                 {
@@ -3380,7 +3430,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     e->param[6] = (int)(sub->m_scaley * wcstod(params[5], NULL) * 8); // y3
                     e->t[0] = e->t[1] = -1;
 
-                    if(params.GetCount() == 8)
+                    if(params.size() == 8)
                     {
                         for(int i = 0; i < 2; i++)
                             e->t[i] = wcstol(params[6+i], NULL, 10);
@@ -3391,7 +3441,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         }
         else if(cmd == L"moves4") // {\moves4(x1,x2,x2,y2,x3,y3,x4,y4[,t1,t2])}
         {
-            if((params.GetCount() == 8 || params.GetCount() == 10) && !sub->m_effects[EF_MOVE])
+            if((params.size() == 8 || params.size() == 10) && !sub->m_effects[EF_MOVE])
             {
                 if(Effect* e = new Effect)
                 {
@@ -3406,7 +3456,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     e->param[8] = (int)(sub->m_scaley * wcstod(params[7], NULL) * 8); // y4
                     e->t[0] = e->t[1] = -1;
 
-                    if(params.GetCount() == 10)
+                    if(params.size() == 10)
                     {
                         for(int i = 0; i < 2; i++)
                             e->t[i] = wcstol(params[8+i], NULL, 10);
@@ -3419,7 +3469,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #ifdef _VSMOD // patch m006. moveable vector clip
         else if(cmd == L"movevc")
         {
-            if((params.GetCount() == 2 || params.GetCount() == 4 || params.GetCount() == 6) && !sub->m_effects[EF_VECTCLP])
+            if((params.size() == 2 || params.size() == 4 || params.size() == 6) && !sub->m_effects[EF_VECTCLP])
             {
                 if(Effect* e = new Effect)
                 {
@@ -3427,12 +3477,12 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     e->param[1] = e->param[3] = (int)(sub->m_scaley * wcstod(params[1], NULL));
                     e->t[0] = e->t[1] = -1;
 
-                    if(params.GetCount() >= 4)
+                    if(params.size() >= 4)
                     {
                         e->param[2] = (int)(sub->m_scalex * wcstod(params[2], NULL));
                         e->param[3] = (int)(sub->m_scaley * wcstod(params[3], NULL));
                     }
-                    if(params.GetCount() == 6)
+                    if(params.size() == 6)
                     {
                         e->t[0] = (int)(sub->m_scalex * wcstod(params[4], NULL));
                         e->t[1] = (int)(sub->m_scaley * wcstod(params[5], NULL));
@@ -3444,7 +3494,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #endif
         else if(cmd == L"move") // {\move(x1=param[0], y1=param[1], x2=param[2], y2=param[3][, t1=t[0], t2=t[1]])}
         {
-            if((params.GetCount() == 4 || params.GetCount() == 6) && !sub->m_effects[EF_MOVE])
+            if((params.size() == 4 || params.size() == 6) && !sub->m_effects[EF_MOVE])
             {
                 if(Effect* e = DNew Effect)
                 {
@@ -3462,7 +3512,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #endif
                     e->t[0] = e->t[1] = -1;
 
-                    if(params.GetCount() == 6)
+                    if(params.size() == 6)
                     {
                         for(ptrdiff_t i = 0; i < 2; i++)
                             e->t[i] = wcstol(params[4+i], NULL, 10);
@@ -3475,7 +3525,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         else if(cmd == L"org") // {\org(x=param[0], y=param[1])}
         {
 #ifdef _VSMOD // patch f003. moving \org for some karaoke effects. part 1
-            if((params.GetCount() == 2 || params.GetCount() == 4 || params.GetCount() == 6) && !sub->m_effects[EF_ORG])
+            if((params.size() == 2 || params.size() == 4 || params.size() == 6) && !sub->m_effects[EF_ORG])
             {
                 if(Effect* e = new Effect)
                 {
@@ -3483,12 +3533,12 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     e->param[1] = e->param[3] = (int)(sub->m_scaley * wcstod(params[1], NULL) * 8);
                     e->t[0] = e->t[1] = -1;
 
-                    if(params.GetCount() >= 4)
+                    if(params.size() >= 4)
                     {
                         e->param[2] = (int)(sub->m_scalex * wcstod(params[2], NULL) * 8);
                         e->param[3] = (int)(sub->m_scaley * wcstod(params[3], NULL) * 8);
                     }
-                    if(params.GetCount() == 6)
+                    if(params.size() == 6)
                     {
                         e->t[0] = (int)(sub->m_scalex * wcstod(params[4], NULL) * 8);
                         e->t[1] = (int)(sub->m_scaley * wcstod(params[5], NULL) * 8);
@@ -3497,7 +3547,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 }
             }
 #else
-            if(params.GetCount() == 2 && !sub->m_effects[EF_ORG])
+            if(params.size() == 2 && !sub->m_effects[EF_ORG])
             {
                 if(Effect* e = DNew Effect)
                 {
@@ -3515,7 +3565,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         }
         else if(cmd == L"pos")
         {
-            if(params.GetCount() == 2 && !sub->m_effects[EF_MOVE])
+            if(params.size() == 2 && !sub->m_effects[EF_MOVE])
             {
                 if(Effect* e = DNew Effect)
                 {
@@ -3533,7 +3583,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 }
             }
 #ifdef _VSMOD // patch m002. Z-coord
-            else if(params.GetCount() == 3 && !sub->m_effects[EF_MOVE])
+            else if(params.size() == 3 && !sub->m_effects[EF_MOVE])
             {
                 if(Effect* e = DNew Effect)
                 {
@@ -3623,22 +3673,22 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             m_animStart = m_animEnd = 0;
             m_animAccel = 1;
 
-            if(params.GetCount() == 1)
+            if(params.size() == 1)
             {
                 p = params[0];
             }
-            else if(params.GetCount() == 2)
+            else if(params.size() == 2)
             {
                 m_animAccel = wcstod(params[0], NULL);
                 p = params[1];
             }
-            else if(params.GetCount() == 3)
+            else if(params.size() == 3)
             {
                 m_animStart = (int)wcstod(params[0], NULL);
                 m_animEnd = (int)wcstod(params[1], NULL);
                 p = params[2];
             }
-            else if(params.GetCount() == 4)
+            else if(params.size() == 4)
             {
                 m_animStart = wcstol(params[0], NULL, 10);
                 m_animEnd = wcstol(params[1], NULL, 10);
@@ -3742,8 +3792,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #endif
     }
 
-//	return(nUnrecognizedTags < nTags);
-    return(true); // there are ppl keeping coments inside {}, lets make them happy now
+    return true; // Preserve comments inside override blocks.
 }
 
 bool CRenderedTextSubtitle::ParseHtmlTag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org)
