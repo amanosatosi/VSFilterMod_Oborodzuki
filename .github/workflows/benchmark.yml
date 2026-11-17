@@ -1,0 +1,62 @@
+name: Renderer benchmarks
+
+on:
+  push:
+    branches: [develop/oborodzuki]
+    paths:
+      - 'src/**'
+      - '.github/ci/**'
+      - '.github/workflows/benchmark.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: Masaiki/VSFilterMod
+          ref: 808f492f2e6feb92c975cbed9faaa7b4272cfec5
+          path: benchmark-build/original
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: b31674c1341487b706712ecc213482562687781a
+          path: benchmark-build/baseline
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: amanosatosi/libassmod
+          ref: 60e06ef0d4535c5403f446fd46b996df4d0d2560
+          path: benchmark-build/mangetsu
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: microsoft/vcpkg
+          ref: f3419f137f1a1e79b33b880ae6845f873d87820b
+          path: benchmark-build/vcpkg
+          persist-credentials: false
+      - uses: actions/cache@v4
+        with:
+          path: vcpkg-binaries
+          key: mangetsu-vcpkg-windows-2022-${{ hashFiles('.github/ci/build-bench.ps1', '.github/workflows/benchmark.yml') }}
+      - name: Build pinned renderers and benchmark sequentially
+        shell: cmd
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+          where nasm >nul 2>&1 || choco install nasm --yes --no-progress || exit /b 1
+          set "PATH=%ProgramFiles%\NASM;%PATH%"
+          pwsh -NoProfile -File .github\ci\build-bench.ps1 || exit /b 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: renderer-benchmarks
+          path: benchmark-results/
+          if-no-files-found: warn
