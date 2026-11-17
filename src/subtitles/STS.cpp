@@ -26,7 +26,15 @@
 #include <atlstr.h>
 
 #include "RealTextParser.h"
+#include <atomic>
 #include <fstream>
+
+static std::atomic<unsigned> subtitleFontRevision{0};
+
+unsigned SubtitleFontRevision()
+{
+    return subtitleFontRevision.load();
+}
 
 static long revcolor(long c)
 {
@@ -1341,8 +1349,11 @@ static bool LoadFont(CString& font)
             }
         }
 
-        AddFontResource(fn);
+        if (AddFontResource(fn) > 0)
+            ++subtitleFontRevision;
     }
+    else if (hFont)
+        ++subtitleFontRevision;
 
     return(true);
 }

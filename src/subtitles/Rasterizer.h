@@ -97,6 +97,7 @@ protected:
     BYTE* mpPathTypes;
     POINT* mpPathPoints;
     size_t mPathPoints;
+    bool CopyPath(const POINT* points, const BYTE* types, size_t count);
 
 private:
     int mWidth, mHeight;

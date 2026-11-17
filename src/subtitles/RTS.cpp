@@ -25,6 +25,7 @@
 #include <math.h>
 #include <time.h>
 #include <map>
+#include <unordered_map>
 #include <vector>
 #include "RTS.h"
 
@@ -45,7 +46,7 @@ static long revcolor(long c)
 
 // CMyFont
 
-CMyFont::CMyFont(STSStyle& style)
+static LOGFONT TextLogFont(STSStyle& style)
 {
     LOGFONT lf;
     memset(&lf, 0, sizeof(lf));
@@ -58,13 +59,153 @@ CMyFont::CMyFont(STSStyle& style)
 #ifdef _VSMOD // patch m007. symbol rotating
     lf.lfOrientation = (LONG)style.mod_fontOrient;
 #endif
+    return lf;
+}
 
+CMyFont::CMyFont(STSStyle& style) : CMyFont(TextLogFont(style))
+{
+}
+
+CMyFont::CMyFont(const LOGFONT& font)
+{
+    LOGFONT lf = font;
     if(!CreateFontIndirect(&lf))
     {
         _tcscpy(lf.lfFaceName, _T("Arial"));
         CreateFontIndirect(&lf);
     }
 }
+
+struct TextGeometryKey
+{
+    LOGFONT font;
+    CStringW text;
+
+    bool operator==(const TextGeometryKey& other) const
+    {
+        return !memcmp(&font, &other.font, sizeof(font)) &&
+            text.GetLength() == other.text.GetLength() &&
+            !memcmp(text.GetString(), other.text.GetString(), text.GetLength() * sizeof(wchar_t));
+    }
+};
+
+struct TextGeometryHash
+{
+    size_t operator()(const TextGeometryKey& key) const
+    {
+        size_t hash = 2166136261u;
+        const auto* font = reinterpret_cast<const unsigned char*>(&key.font);
+        for (size_t i = 0; i < sizeof(key.font); ++i)
+            hash = (hash ^ font[i]) * 16777619u;
+        for (int i = 0; i < key.text.GetLength(); ++i)
+            hash = (hash ^ key.text[i]) * 16777619u;
+        return hash;
+    }
+};
+
+struct TextGeometry
+{
+    bool measured = false;
+    CSize extent;
+    int ascent = 0;
+    int descent = 0;
+    bool hasPath = false;
+    std::vector<POINT> points;
+    std::vector<BYTE> types;
+};
+
+struct TextGeometryCache
+{
+    std::unordered_map<TextGeometryKey, TextGeometry, TextGeometryHash> runs;
+    CRegKey machineFonts, userFonts;
+    FILETIME machineStamp{}, userStamp{};
+    unsigned embeddedRevision = 0;
+    size_t pathBytes = 0;
+    bool saturated = false;
+
+    void Clear()
+    {
+        runs.clear();
+        pathBytes = 0;
+        saturated = false;
+    }
+
+    static bool FontStamp(HKEY root, CRegKey& key, FILETIME& stamp)
+    {
+        if (!key.m_hKey)
+        {
+            const LSTATUS result = key.Open(root,
+                _T("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts"), KEY_QUERY_VALUE);
+            if (result != ERROR_SUCCESS)
+                return result == ERROR_FILE_NOT_FOUND;
+        }
+        const auto result = RegQueryInfoKey(key.m_hKey, nullptr, nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, nullptr, nullptr, nullptr, &stamp);
+        if (result != ERROR_SUCCESS)
+            key.Close();
+        return result == ERROR_SUCCESS;
+    }
+
+    void StartFrame()
+    {
+        const unsigned revision = SubtitleFontRevision();
+        FILETIME currentMachine{}, currentUser{};
+        if (!FontStamp(HKEY_LOCAL_MACHINE, machineFonts, currentMachine) ||
+            !FontStamp(HKEY_CURRENT_USER, userFonts, currentUser) ||
+            revision != embeddedRevision || CompareFileTime(&machineStamp, &currentMachine) ||
+            CompareFileTime(&userStamp, &currentUser) || saturated)
+            Clear();
+        embeddedRevision = revision;
+        machineStamp = currentMachine;
+        userStamp = currentUser;
+    }
+
+    TextGeometry& Get(const LOGFONT& font, const CStringW& text)
+    {
+        TextGeometryKey key{font, text};
+        const auto found = runs.find(key);
+        if (found != runs.end())
+            return found->second;
+        if (runs.size() >= 512)
+            Clear();
+        return runs.emplace(std::move(key), TextGeometry{}).first->second;
+    }
+
+    void SavePath(TextGeometry& run, const POINT* points, const BYTE* types, size_t count)
+    {
+        constexpr size_t maxBytes = 4 * 1024 * 1024;
+        if (count > maxBytes / (sizeof(POINT) + sizeof(BYTE)))
+            return;
+        const size_t bytes = count * (sizeof(POINT) + sizeof(BYTE));
+        if (pathBytes + bytes > maxBytes)
+        {
+            saturated = true;
+            return;
+        }
+        if (count)
+        {
+            run.points.assign(points, points + count);
+            run.types.assign(types, types + count);
+        }
+        run.hasPath = true;
+        pathBytes += bytes;
+    }
+};
+
+// Words are short-lived. Bind the renderer's cache only while that renderer
+// is laying out and painting a frame, including nested calls on this thread.
+static thread_local TextGeometryCache* activeTextGeometry = nullptr;
+
+class TextGeometryScope
+{
+    TextGeometryCache* previous;
+public:
+    explicit TextGeometryScope(TextGeometryCache* cache) : previous(activeTextGeometry)
+    {
+        activeTextGeometry = cache;
+    }
+    ~TextGeometryScope() { activeTextGeometry = previous; }
+};
 
 // CWord
 
@@ -692,58 +833,79 @@ CText::CText(STSStyle& style, CStringW str, int ktype, int kstart, int kend, dou
     : CWord(style, str, ktype, kstart, kend, scalex, scaley)
 {
     PROFILE_RENDER_STAGE(TextMeasure);
-    if(m_str == L" ")
-    {
+    if (m_str == L" ")
         m_fWhiteSpaceChar = true;
+
+    const bool measureCharacters = m_style.fontSpacing || (long)GetVersion() < 0;
+    const auto logFont = TextLogFont(m_style);
+    auto* geometry = !measureCharacters && activeTextGeometry && m_str.GetLength() <= 128
+        ? &activeTextGeometry->Get(logFont, m_str) : nullptr;
+#ifdef _VSMOD
+    const double angle = m_style.mod_fontOrient * 3.1415926 / 1800;
+    const double cosOrientation = abs(cos(angle)), sinOrientation = abs(sin(angle));
+#endif
+    const auto applyMetrics = [&](int ascent, int descent) {
+        m_ascent = int(m_style.fontScaleY / 100 * ascent);
+        m_descent = int(m_style.fontScaleY / 100 * descent);
+    };
+    const auto measureWidth = [&](const CSize& extent) {
+#ifdef _VSMOD
+        return extent.cx * cosOrientation + extent.cy * sinOrientation;
+#else
+        return double(extent.cx);
+#endif
+    };
+    if (geometry && geometry->measured)
+    {
+        applyMetrics(geometry->ascent, geometry->descent);
+        m_width = int(m_style.fontScaleX / 100 * int(measureWidth(geometry->extent)) + 4) >> 3;
+        return;
     }
 
-    CMyFont font(m_style);
-
+    CMyFont font(logFont);
     HFONT hOldFont = SelectFont(g_hDC, font);
-    MeasureSelectedFont();
-
-#ifdef _VSMOD // patch m007. symbol rotating
-    double t = (double)m_style.mod_fontOrient * 3.1415926 / 1800;
-#endif
-    if(m_style.fontSpacing || (long)GetVersion() < 0)
+    TEXTMETRIC metrics{};
+    const bool hasMetrics = !!GetTextMetrics(g_hDC, &metrics);
+    const int ascent = (metrics.tmAscent + 4) >> 3;
+    const int descent = (metrics.tmDescent + 4) >> 3;
+    applyMetrics(ascent, descent);
+    if (measureCharacters)
     {
-        bool bFirstPath = true;
-
-        for(LPCWSTR s = m_str; *s; s++)
+        for (LPCWSTR s = m_str; *s; ++s)
         {
             CSize extent;
-            if(!GetTextExtentPoint32W(g_hDC, s, 1, &extent))
+            if (!GetTextExtentPoint32W(g_hDC, s, 1, &extent))
             {
                 SelectFont(g_hDC, hOldFont);
                 ASSERT(0);
                 return;
             }
-#ifdef _VSMOD // patch m007. symbol rotating
-            m_width += (int)(extent.cx * abs(cos(t)) + extent.cy * abs(sin(t)) + m_style.fontSpacing);
+#ifdef _VSMOD
+            m_width += int(measureWidth(extent) + m_style.fontSpacing);
 #else
-            m_width += extent.cx + (int)m_style.fontSpacing;
+            m_width += extent.cx + int(m_style.fontSpacing);
 #endif
         }
-//			m_width -= (int)m_style.fontSpacing; // TODO: subtract only at the end of the line
     }
     else
     {
         CSize extent;
-        if(!GetTextExtentPoint32W(g_hDC, m_str, wcslen(str), &extent))
+        if (!GetTextExtentPoint32W(g_hDC, m_str, wcslen(str), &extent))
         {
             SelectFont(g_hDC, hOldFont);
             ASSERT(0);
             return;
         }
-#ifdef _VSMOD // patch m007. symbol rotating
-        m_width += (int)(extent.cx * abs(cos(t)) + extent.cy * abs(sin(t)));
-#else
-        m_width += extent.cx;
-#endif
+        m_width = int(measureWidth(extent));
+        if (geometry && hasMetrics && hOldFont && font.GetSafeHandle())
+        {
+            geometry->extent = extent;
+            geometry->ascent = ascent;
+            geometry->descent = descent;
+            geometry->measured = true;
+        }
     }
-
-    m_width = (int)(m_style.fontScaleX / 100 * m_width + 4) >> 3;
-
+    m_width = int(m_style.fontScaleX / 100 * m_width + 4) >> 3;
     SelectFont(g_hDC, hOldFont);
 }
 
@@ -767,13 +929,20 @@ bool CText::Append(CWord* w)
 bool CText::CreatePath()
 {
     PROFILE_RENDER_STAGE(GlyphPath);
-    CMyFont font(m_style);
+    const bool measureCharacters = m_style.fontSpacing || (long)GetVersion() < 0;
+    const auto logFont = TextLogFont(m_style);
+    auto* geometry = !measureCharacters && activeTextGeometry && m_str.GetLength() <= 128
+        ? &activeTextGeometry->Get(logFont, m_str) : nullptr;
+    if (geometry && geometry->hasPath &&
+        CopyPath(geometry->points.data(), geometry->types.data(), geometry->points.size()))
+        return true;
 
+    CMyFont font(logFont);
     HFONT hOldFont = SelectFont(g_hDC, font);
 
     int width = 0;
 
-    if(m_style.fontSpacing || (long)GetVersion() < 0)
+    if(measureCharacters)
     {
         bool bFirstPath = true;
 
@@ -805,9 +974,12 @@ bool CText::CreatePath()
             return(false);
         }
 
-        BeginPath(g_hDC);
-        TextOutW(g_hDC, 0, 0, m_str, m_str.GetLength());
-        EndPath(g_hDC);
+        const bool begun = BeginPath(g_hDC);
+        const bool drawn = !!TextOutW(g_hDC, 0, 0, m_str, m_str.GetLength());
+        const bool ended = EndPath(g_hDC);
+        if (geometry && !geometry->hasPath && begun && drawn && ended && hOldFont &&
+            font.GetSafeHandle() && (!mPathPoints || (mpPathPoints && mpPathTypes)))
+            activeTextGeometry->SavePath(*geometry, mpPathPoints, mpPathTypes, mPathPoints);
     }
 
     SelectFont(g_hDC, hOldFont);
@@ -2089,6 +2261,8 @@ void CRenderedTextSubtitle::Empty()
 void CRenderedTextSubtitle::OnChanged()
 {
     __super::OnChanged();
+    if (m_textGeometry)
+        m_textGeometry->Clear();
 
     POSITION pos = m_subtitleCache.GetStartPosition();
     while(pos)
@@ -2119,6 +2293,7 @@ bool CRenderedTextSubtitle::Init(CSize size, CRect vidrect)
 void CRenderedTextSubtitle::Deinit()
 {
     m_overrideTags.reset();
+    m_textGeometry.reset();
     POSITION pos = m_subtitleCache.GetStartPosition();
     while(pos)
     {
@@ -4206,6 +4381,11 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
     const STSSegment* stss = SearchSubs(t, fps, &segment);
 //    TRACE(_T("search complete: %d"), t);
     if(!stss) return S_FALSE;
+
+    if (!m_textGeometry)
+        m_textGeometry = std::make_unique<TextGeometryCache>();
+    m_textGeometry->StartFrame();
+    const TextGeometryScope geometryScope(m_textGeometry.get());
 
     // clear any cached subs that current position is not in its bounds
     {

@@ -280,6 +280,30 @@ bool Rasterizer::BeginPath(HDC hdc)
     return !!::BeginPath(hdc);
 }
 
+bool Rasterizer::CopyPath(const POINT* points, const BYTE* types, size_t count)
+{
+    if (!count)
+    {
+        _TrashPath();
+        return true;
+    }
+    auto* copyPoints = static_cast<POINT*>(malloc(count * sizeof(POINT)));
+    auto* copyTypes = static_cast<BYTE*>(malloc(count * sizeof(BYTE)));
+    if (!copyPoints || !copyTypes)
+    {
+        free(copyPoints);
+        free(copyTypes);
+        return false;
+    }
+    memcpy(copyPoints, points, count * sizeof(POINT));
+    memcpy(copyTypes, types, count * sizeof(BYTE));
+    _TrashPath();
+    mPathPoints = count;
+    mpPathPoints = copyPoints;
+    mpPathTypes = copyTypes;
+    return true;
+}
+
 bool Rasterizer::EndPath(HDC hdc)
 {
     ::CloseFigure(hdc);

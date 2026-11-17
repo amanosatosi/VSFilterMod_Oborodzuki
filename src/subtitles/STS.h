@@ -26,6 +26,8 @@
 #include "TextFile.h"
 #include "GFN.h"
 
+unsigned SubtitleFontRevision();
+
 #ifdef _VSMOD // path m012. Lua animation
 extern "C"
 {

@@ -30,6 +30,7 @@ class CMyFont : public CFont
 {
 public:
     CMyFont(STSStyle& style);
+    CMyFont(const LOGFONT& font);
 };
 
 class CPolygon;
@@ -241,12 +242,14 @@ public:
 };
 
 struct OverrideTagCache;
+struct TextGeometryCache;
 
 [uuid("537DCACA-2812-4a4f-B2C6-1A34C17ADEB0")]
 class CRenderedTextSubtitle : public CSimpleTextSubtitle, public ISubPicProviderImpl, public ISubStream
 {
     CAtlMap<int, CSubtitle*> m_subtitleCache;
     std::unique_ptr<OverrideTagCache> m_overrideTags;
+    std::unique_ptr<TextGeometryCache> m_textGeometry;
 
     CScreenLayoutAllocator m_sla;
 
