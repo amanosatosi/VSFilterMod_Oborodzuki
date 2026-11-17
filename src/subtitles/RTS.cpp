@@ -3079,6 +3079,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         CStringA Func(tag.rawCommand);
         if(LuaHasFunction(L, tag.rawCommand))
         {
+            hasExternalLua = true;
             // Find function =D
             lua_getglobal(L, Func);
 
@@ -3738,6 +3739,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 CStringA Func(params[0]);
                 if(LuaHasFunction(L, params[0]))
                 {
+                    hasExternalLua = true;
                     CStringA Func(params[0]);
                     lua_getglobal(L, Func);
                     // Create line table
@@ -4750,6 +4752,17 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
 
         CSubtitle* s = GetSubtitle(entry);
         if(!s) continue;
+#if defined(_VSMOD) && defined(_LUA)
+        if (parallel && hasExternalLua)
+        {
+            m_eventWorkers->Run(preparations);
+            for (auto& paint : compositions)
+                paint();
+            preparations.clear();
+            compositions.clear();
+            parallel = false;
+        }
+#endif
 
         CRect clipRect = s->m_clip;
         CRect r = s->m_rect;
