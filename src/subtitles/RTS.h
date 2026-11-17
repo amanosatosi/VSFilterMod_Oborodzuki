@@ -28,8 +28,6 @@
 class CMyFont : public CFont
 {
 public:
-    int m_ascent, m_descent;
-
     CMyFont(STSStyle& style);
 };
 
@@ -52,6 +50,7 @@ protected:
     double m_scalex, m_scaley;
     CStringW m_str;
 
+    void MeasureSelectedFont();
     virtual bool CreatePath() = 0;
 
 public:

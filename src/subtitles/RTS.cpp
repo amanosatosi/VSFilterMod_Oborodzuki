@@ -62,13 +62,6 @@ CMyFont::CMyFont(STSStyle& style)
         _tcscpy(lf.lfFaceName, _T("Arial"));
         CreateFontIndirect(&lf);
     }
-
-    HFONT hOldFont = SelectFont(g_hDC, *this);
-    TEXTMETRIC tm;
-    GetTextMetrics(g_hDC, &tm);
-    m_ascent = ((tm.tmAscent + 4) >> 3);
-    m_descent = ((tm.tmDescent + 4) >> 3);
-    SelectFont(g_hDC, hOldFont);
 }
 
 // CWord
@@ -86,11 +79,14 @@ CWord::CWord(STSStyle& style, CStringW str, int ktype, int kstart, int kend, dou
     {
         m_fWhiteSpaceChar = m_fLineBreak = true;
     }
+}
 
-    CMyFont font(m_style);
-    m_ascent = (int)(m_style.fontScaleY / 100 * font.m_ascent);
-    m_descent = (int)(m_style.fontScaleY / 100 * font.m_descent);
-    m_width = 0;
+void CWord::MeasureSelectedFont()
+{
+    TEXTMETRIC metrics{};
+    GetTextMetrics(g_hDC, &metrics);
+    m_ascent = int(m_style.fontScaleY / 100 * ((metrics.tmAscent + 4) >> 3));
+    m_descent = int(m_style.fontScaleY / 100 * ((metrics.tmDescent + 4) >> 3));
 }
 
 CWord::~CWord()
@@ -702,6 +698,7 @@ CText::CText(STSStyle& style, CStringW str, int ktype, int kstart, int kend, dou
     CMyFont font(m_style);
 
     HFONT hOldFont = SelectFont(g_hDC, font);
+    MeasureSelectedFont();
 
 #ifdef _VSMOD // patch m007. symbol rotating
     double t = (double)m_style.mod_fontOrient * 3.1415926 / 1800;
@@ -822,6 +819,10 @@ CPolygon::CPolygon(STSStyle& style, CStringW str, int ktype, int kstart, int ken
     : CWord(style, str, ktype, kstart, kend, scalex, scaley)
     , m_scalex(scalex), m_scaley(scaley), m_baseline(baseline)
 {
+    CMyFont font(m_style);
+    HFONT oldFont = SelectFont(g_hDC, font);
+    MeasureSelectedFont();
+    SelectFont(g_hDC, oldFont);
     ParseStr();
 }
 
