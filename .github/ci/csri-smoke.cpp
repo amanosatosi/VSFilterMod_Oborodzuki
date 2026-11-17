@@ -68,6 +68,7 @@ void verify_renderer(HMODULE dll)
     if (!info || std::strcmp(info->name, "vsfiltermod_oborodzuki") ||
         std::strcmp(info->longname, "vsfiltermod oborodzuki") ||
         csri_renderer_byname(info->name, info->specific) != renderer ||
+        csri_renderer_byname("vsfiltermod_textsub", info->specific) != renderer ||
         csri_renderer_next(renderer))
         throw std::runtime_error("Unexpected CSRI renderer identity");
 

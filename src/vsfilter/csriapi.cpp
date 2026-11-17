@@ -251,7 +251,18 @@ CSRIAPI struct csri_info *csri_renderer_info(csri_rend *rend)
 // Only one supported, obviously
 CSRIAPI csri_rend *csri_renderer_byname(const char *name, const char *specific)
 {
-    if(strcmp(name, csri_vsfilter_info.name))
+    if(!name)
+        return 0;
+    bool matches = strcmp(name, csri_vsfilter_info.name) == 0;
+#ifdef _VSMOD
+    // Retain lookup for hosts that call this DLL directly by its old name.
+#ifdef _DEBUG
+    matches = matches || strcmp(name, "vsfiltermod_textsub_debug") == 0;
+#else
+    matches = matches || strcmp(name, "vsfiltermod_textsub") == 0;
+#endif
+#endif
+    if(!matches)
         return 0;
     if(specific && strcmp(specific, csri_vsfilter_info.specific))
         return 0;

@@ -9,6 +9,19 @@ Base branches:
 * sorayuki/VSFilterMod: r5.2.6
 * teplofizik/VSFilterMod: @3651264 (Aug 21, 2014)
 
+## GitHub Actions
+
+The **Windows renderer** workflow builds `Release (MOD)` with MSVC v143 for x86 and x64.
+Download the artifact for your host's architecture after the DLL loading and CSRI render checks pass.
+
+The **Renderer benchmarks** workflow builds pinned VSFilterMod r5.2.7, pre-optimization
+Oborodzuki, the candidate, and Mangetsu on the same Windows runner. It uploads per-trial JSON,
+runner and compiler details, fixture hashes, a comparison table, and a separate instrumented profile.
+The public workloads are synthetic. The legacy Mangetsu path includes the harness's scalar
+compositor, while the RGBA path uses Mangetsu's BGRA compositor. Cross-engine pixel output
+can differ because the renderers use different typography and rasterization implementations.
+The visual regression checks compare the VSFilterMod variants separately.
+
 Usage
 =====
 ## Aegisub

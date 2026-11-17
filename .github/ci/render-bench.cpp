@@ -105,12 +105,15 @@ void measure(Render render, const std::wstring& workload, double setup_ms,
         return std::pair<double, uint64_t>{ms, cpu_ticks() - cpu};
     };
     const double first = one_frame(time_at(0)).first;
-    for (int i = 0; i < 30; ++i)
+    const bool regression = workload == L"regression";
+    const int warmup = regression ? 0 : 30;
+    const int count = regression ? 20 : 600;
+    for (int i = 0; i < warmup; ++i)
         one_frame(time_at(i));
     if (reset_profile)
         reset_profile();
     uint64_t cpu = 0;
-    for (int i = 0; i < 600; ++i) {
+    for (int i = 0; i < count; ++i) {
         const auto [ms, ticks] = one_frame(time_at(i));
         timings.push_back(ms);
         cpu += ticks;
@@ -127,6 +130,8 @@ void measure(Render render, const std::wstring& workload, double setup_ms,
     }
     if (hashes[0] == hashes[2])
         throw std::runtime_error("Fixture produced no visible pixels at 1500 ms");
+    if (regression && hashes[2] != hashes.back())
+        throw std::runtime_error("Rendered pixels changed after seeking back to 1500 ms");
 
     std::sort(timings.begin(), timings.end());
     const double total = std::accumulate(timings.begin(), timings.end(), 0.0);
@@ -137,8 +142,8 @@ void measure(Render render, const std::wstring& workload, double setup_ms,
     std::printf("{\"setup_ms\":%.6f,\"first_frame_ms\":%.6f,\"avg_ms\":%.6f,"
         "\"median_ms\":%.6f,\"p95_ms\":%.6f,\"fps\":%.3f,\"cpu_ms\":%.3f,"
         "\"cpu_percent_of_one_core\":%.3f,\"peak_working_set_bytes\":%llu,\"hashes\":[",
-        setup_ms, first, total / timings.size(), (timings[299] + timings[300]) / 2,
-        timings[569], 1000 * timings.size() / total, cpu_ms, 100 * cpu_ms / total,
+        setup_ms, first, total / count, (timings[count / 2 - 1] + timings[count / 2]) / 2,
+        timings[(count * 95 + 99) / 100 - 1], 1000 * count / total, cpu_ms, 100 * cpu_ms / total,
         static_cast<unsigned long long>(memory.PeakWorkingSetSize));
     for (size_t i = 0; i < hashes.size(); ++i)
         std::printf("%s\"%016llx\"", i ? "," : "", static_cast<unsigned long long>(hashes[i]));
