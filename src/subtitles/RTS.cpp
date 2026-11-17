@@ -20,6 +20,7 @@
  */
 
 #include "stdafx.h"
+#include "RenderProfile.h"
 #include <cmath>
 #include <math.h>
 #include <time.h>
@@ -176,6 +177,7 @@ void CWord::Paint(CPoint p, CPoint org)
 #ifdef _LUA
 void CWord::CustomTransform(CPoint org, CString F, int Layer)
 {
+    PROFILE_RENDER_STAGE(Transform);
     CStringA Func(F);
     // Calculate size:
     int minx = INT_MAX, miny = INT_MAX, maxx = -INT_MAX, maxy = -INT_MAX;
@@ -283,6 +285,7 @@ void CWord::CustomTransform(CPoint org, CString F, int Layer)
 
 void CWord::Transform(CPoint org)
 {
+    PROFILE_RENDER_STAGE(Transform);
     double scalex = isOpaqueBox ? 1 : m_style.fontScaleX / 100;
     double scaley = isOpaqueBox ? 1 : m_style.fontScaleY / 100;
     const double xzoomf = m_scalex * 20000.0;
@@ -690,6 +693,7 @@ bool CWord::CreateOpaqueBox()
 CText::CText(STSStyle& style, CStringW str, int ktype, int kstart, int kend, double scalex, double scaley)
     : CWord(style, str, ktype, kstart, kend, scalex, scaley)
 {
+    PROFILE_RENDER_STAGE(TextMeasure);
     if(m_str == L" ")
     {
         m_fWhiteSpaceChar = true;
@@ -763,6 +767,7 @@ bool CText::Append(CWord* w)
 
 bool CText::CreatePath()
 {
+    PROFILE_RENDER_STAGE(GlyphPath);
     CMyFont font(m_style);
 
     HFONT hOldFont = SelectFont(g_hDC, font);
@@ -3878,6 +3883,7 @@ double CRenderedTextSubtitle::CalcAnimation(double dst, double src, bool fAnimat
 
 CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry)
 {
+    PROFILE_RENDER_STAGE(Subtitle);
     CSubtitle* sub;
     if(m_subtitleCache.Lookup(entry, sub))
     {
@@ -4137,6 +4143,7 @@ static int lscomp(const void* ls1, const void* ls2)
 
 STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, double fps, RECT& bbox)
 {
+    PROFILE_RENDER_STAGE(Frame);
     CRect bbox2(0, 0, 0, 0);
 
     if(m_size != CSize(spd.w * 8, spd.h * 8) || m_vidrect != CRect(spd.vidrect.left * 8, spd.vidrect.top * 8, spd.vidrect.right * 8, spd.vidrect.bottom * 8))

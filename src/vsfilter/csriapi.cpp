@@ -27,6 +27,7 @@
 #include "..\subtitles\RTS.h"
 #include "..\subtitles\SSF.h"
 #include "..\SubPic\MemSubPic.h"
+#include "../subtitles/RenderProfile.h"
 
 #define CSRIAPI extern "C" __declspec(dllexport)
 #define CSRI_OWN_HANDLES
@@ -43,6 +44,23 @@ extern "C" struct csri_vsfilter_inst
 };
 typedef struct csri_vsfilter_inst csri_inst;
 #include "csri.h"
+
+#ifdef OBORODZUKI_PROFILE
+CSRIAPI void csri_oborodzuki_profile_reset()
+{
+    render_profile() = RenderProfile{};
+}
+
+CSRIAPI void csri_oborodzuki_profile_read(uint64_t* ns, uint64_t* calls)
+{
+    const auto& profile = render_profile();
+    for (unsigned i = 0; i < static_cast<unsigned>(RenderStage::Count); ++i) {
+        ns[i] = profile.ns[i];
+        calls[i] = profile.calls[i];
+    }
+}
+#endif
+
 #ifdef _VSMOD
 static csri_rend csri_vsfilter = "vsfiltermod_oborodzuki";
 #else

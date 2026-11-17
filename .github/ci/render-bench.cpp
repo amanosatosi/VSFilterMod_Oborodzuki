@@ -14,6 +14,7 @@
 #include <vector>
 #include <ass.h>
 #include "../../src/vsfilter/csri.h"
+#include "../../src/subtitles/RenderProfile.h"
 
 using Clock = std::chrono::steady_clock;
 constexpr int width = 1920;
@@ -79,8 +80,12 @@ uint64_t frame_hash(const std::vector<uint8_t>& pixels)
     return hash;
 }
 
+using ProfileReset = void (*)();
+using ProfileRead = void (*)(uint64_t*, uint64_t*);
+
 template <class Render>
-void measure(Render render, const std::wstring& workload, double setup_ms)
+void measure(Render render, const std::wstring& workload, double setup_ms,
+    ProfileReset reset_profile = nullptr, ProfileRead read_profile = nullptr)
 {
     std::vector<uint8_t> pixels(pitch * height);
     std::vector<double> timings;
@@ -102,12 +107,18 @@ void measure(Render render, const std::wstring& workload, double setup_ms)
     const double first = one_frame(time_at(0)).first;
     for (int i = 0; i < 30; ++i)
         one_frame(time_at(i));
+    if (reset_profile)
+        reset_profile();
     uint64_t cpu = 0;
     for (int i = 0; i < 600; ++i) {
         const auto [ms, ticks] = one_frame(time_at(i));
         timings.push_back(ms);
         cpu += ticks;
     }
+    constexpr auto stages = static_cast<unsigned>(RenderStage::Count);
+    uint64_t ns[stages]{}, calls[stages]{};
+    if (read_profile)
+        read_profile(ns, calls);
 
     // Hash a separate set of frames outside the timed loop.
     for (int t : {0, 1000, 1500, 3200, 2600, 5200, 1500}) {
@@ -131,7 +142,15 @@ void measure(Render render, const std::wstring& workload, double setup_ms)
         static_cast<unsigned long long>(memory.PeakWorkingSetSize));
     for (size_t i = 0; i < hashes.size(); ++i)
         std::printf("%s\"%016llx\"", i ? "," : "", static_cast<unsigned long long>(hashes[i]));
-    std::puts("]}");
+    std::printf("]");
+    if (read_profile) {
+        std::printf(",\"profile\":[");
+        for (unsigned i = 0; i < stages; ++i)
+            std::printf("%s{\"ns\":%llu,\"calls\":%llu}", i ? "," : "",
+                static_cast<unsigned long long>(ns[i]), static_cast<unsigned long long>(calls[i]));
+        std::printf("]");
+    }
+    std::puts("}");
 }
 
 void run_csri(HMODULE dll, const std::vector<char>& script, const std::wstring& workload)
@@ -146,13 +165,15 @@ void run_csri(HMODULE dll, const std::vector<char>& script, const std::wstring& 
     constexpr csri_fmt format{CSRI_F_BGR_, width, height};
     if (!instance || csri_request_fmt(instance, &format))
         throw std::runtime_error("CSRI initialization failed");
+    auto reset = reinterpret_cast<ProfileReset>(GetProcAddress(dll, "csri_oborodzuki_profile_reset"));
+    auto read = reinterpret_cast<ProfileRead>(GetProcAddress(dll, "csri_oborodzuki_profile_read"));
     measure([&](int t, uint8_t* pixels) {
         csri_frame frame{};
         frame.pixfmt = format.pixfmt;
         frame.planes[0] = pixels;
         frame.strides[0] = pitch;
         csri_render(instance, &frame, t / 1000.0);
-    }, workload, elapsed(start));
+    }, workload, elapsed(start), reset, read);
     csri_close(instance);
 }
 

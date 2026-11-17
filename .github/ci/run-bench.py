@@ -65,20 +65,24 @@ summary = [
     "Each result uses 5 fresh processes, 30 warmup frames, and 600 measured frames per process.",
     "Wall timing includes compositing. Render FPS excludes frame clearing and process startup.",
     "The Mangetsu legacy path uses the harness's scalar BGR compositor.",
+    "The first render follows setup in a fresh process. The OS font and file caches may still be warm.",
     "Range is the minimum to maximum of the five per-trial median frame times.",
     "",
     "| Workload | Engine | Mean ms | Median ms | Range ms | p95 ms | FPS | First frame ms | CPU ms | Peak MiB |",
     "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
 ]
 mismatches = []
+comparison = []
 for workload in fixtures:
     baseline_hashes = [s["hashes"] for s in samples
                        if s["workload"] == workload and s["engine"] == engines[1][0]]
+    median_by_engine = {}
     for name, _, _ in engines:
         rows = [s for s in samples if s["engine"] == name and s["workload"] == workload]
         def median(key):
             return statistics.median(r[key] for r in rows)
         medians = [r["median_ms"] for r in rows]
+        median_by_engine[name] = median("median_ms")
         summary.append(
             f'| {workload} | {name} | {median("avg_ms"):.4f} | {median("median_ms"):.4f} | '
             f'{min(medians):.4f}–{max(medians):.4f} | {median("p95_ms"):.4f} | '
@@ -89,6 +93,14 @@ for workload in fixtures:
             r["hashes"] != hashes for r, hashes in zip(rows, baseline_hashes)
         ):
             mismatches.append(workload)
+    candidate_ms = median_by_engine[engines[-1][0]]
+    for name, _, _ in engines[:-1]:
+        reference_ms = median_by_engine[name]
+        if candidate_ms > 0 and reference_ms > 0:
+            comparison.append(f"| {workload} | {name} | {reference_ms / candidate_ms:.2f}× | "
+                              f"{(reference_ms - candidate_ms) / reference_ms:+.1%} |")
+summary += ["", "Candidate latency relative to each reference. Positive savings indicate lower latency.",
+            "", "| Workload | Reference | Speedup | Latency savings |", "|---|---|---:|---:|", *comparison]
 summary += ["", f'Candidate versus pinned Oborodzuki RGB frame hashes: '
                  f'{"mismatch in " + ", ".join(mismatches) if mismatches else "all sampled frames match"}.']
 report = "\n".join(summary) + "\n"

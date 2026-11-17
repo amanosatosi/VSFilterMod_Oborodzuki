@@ -57,3 +57,40 @@ $original = "$build\original\bin\x64\VSFilter\Release (MOD)\VSFilterMod.dll"
 $baseline = "$build\baseline\bin\x64\VSFilter\Release (MOD)\VSFilterMod.dll"
 $candidate = "$root\bin\x64\VSFilter\Release (MOD)\VSFilterModOborodzuki.dll"
 python .github\ci\run-bench.py $results.FullName $original $baseline $candidate $dll[0].FullName
+
+# Profile a separate build after collecting the uninstrumented timings.
+$env:_CL_ = "$env:_CL_ /DOBORODZUKI_PROFILE"
+msbuild VSFilterMod.sln /t:Rebuild /m /p:PlatformToolset=v143 "/p:WindowsTargetPlatformVersion=$($env:WindowsSDKVersion.TrimEnd('\'))" '/p:Configuration=Release (MOD)' /p:Platform=x64
+$profiles = [ordered]@{}
+$stages = @('Frame bookkeeping and effects', 'Subtitle parsing and layout', 'Font lookup and text measurement',
+    'Glyph path construction', 'Transform', 'Scan conversion', 'Outline widening',
+    'Rasterization', 'Blur', 'Compositing')
+foreach ($workload in @('idle', 'static', 'animation', 'seek', 'heavy')) {
+    $fixture = switch ($workload) {
+        { $_ -in 'idle', 'static' } { "$root\.github\ci\shared.ass" }
+        { $_ -in 'animation', 'seek' } { "$($results.FullName)\animated.ass" }
+        'heavy' { "$($results.FullName)\heavy.ass" }
+    }
+    $measurement = .\render-bench.exe csri $candidate $fixture $workload | ConvertFrom-Json
+    if ($measurement.profile.Count -ne $stages.Count -or !$measurement.profile[0].calls) {
+        throw "Missing render stage timings for $workload"
+    }
+    $profiles[$workload] = for ($i = 0; $i -lt $stages.Count; ++$i) {
+        [pscustomobject]@{
+            stage = $stages[$i]
+            exclusive_ms = $measurement.profile[$i].ns / 1e6
+            calls = $measurement.profile[$i].calls
+        }
+    }
+}
+$profiles | ConvertTo-Json -Depth 5 | Set-Content "$($results.FullName)\profile.json"
+$lines = @('', '### Instrumented Oborodzuki profile', '',
+    'Exclusive wall time across 600 warm frames. Timing scopes add overhead.', '',
+    '| Workload | Stage | Exclusive ms | Calls |', '|---|---|---:|---:|')
+foreach ($workload in $profiles.Keys) {
+    foreach ($entry in ($profiles[$workload] | Sort-Object exclusive_ms -Descending)) {
+        $lines += '| {0} | {1} | {2:F3} | {3} |' -f $workload, $entry.stage, $entry.exclusive_ms, $entry.calls
+    }
+}
+$lines | Add-Content $env:GITHUB_STEP_SUMMARY
+$lines | Set-Content "$($results.FullName)\profile.md"

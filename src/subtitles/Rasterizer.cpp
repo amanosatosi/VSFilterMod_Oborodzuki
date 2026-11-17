@@ -20,6 +20,7 @@
  */
 
 #include "stdafx.h"
+#include "RenderProfile.h"
 #include <string.h>
 #include <math.h>
 #include <vector>
@@ -366,6 +367,7 @@ bool Rasterizer::PartialEndPath(HDC hdc, long dx, long dy)
 
 bool Rasterizer::ScanConvert()
 {
+    PROFILE_RENDER_STAGE(ScanConvert);
     size_t lastmoveto = -1;
     size_t i;
 
@@ -682,6 +684,7 @@ void Rasterizer::_OverlapRegion(tSpanBuffer& dst, tSpanBuffer& src, int dx, int 
 
 bool Rasterizer::CreateWidenedRegion(int rx, int ry)
 {
+    PROFILE_RENDER_STAGE(WidenOutline);
     if(rx < 0) rx = 0;
     if(ry < 0) ry = 0;
 
@@ -716,6 +719,7 @@ void Rasterizer::DeleteOutlines()
 
 bool Rasterizer::Rasterize(int xsub, int ysub, int fBlur, double fGaussianBlurX, double fGaussianBlurY)
 {
+    PROFILE_RENDER_STAGE(Rasterize);
     _TrashOverlay();
 
     if(!mWidth || !mHeight)
@@ -810,6 +814,7 @@ bool Rasterizer::Rasterize(int xsub, int ysub, int fBlur, double fGaussianBlurX,
         }
     }
 
+    PROFILE_RENDER_STAGE(Blur);
     // Do some gaussian blur magic
     if(fGaussianBlur > 0)
     {
@@ -926,6 +931,7 @@ CRect Rasterizer::Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int x
                        const DWORD* switchpts, bool fBody, bool fBorder)
 #endif
 {
+    PROFILE_RENDER_STAGE(Composite);
     CRect bbox(0, 0, 0, 0);
 
     if(!switchpts || !fBody && !fBorder) return(bbox);
