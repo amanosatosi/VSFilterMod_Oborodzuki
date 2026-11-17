@@ -1,0 +1,261 @@
+name: KFX Stress Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      repetitions:
+        description: Complete playback passes per renderer (1–5)
+        type: number
+        default: 1
+      profile:
+        description: Also run a separate instrumented Oborodzuki playback
+        type: boolean
+        default: false
+  # An explicit opt-in allows verification while the workflow is only on
+  # the development branch. Ordinary pushes never run playback.
+  push:
+    branches: [develop/oborodzuki]
+    paths:
+      - '.github/workflows/kfx-stress-test.yml'
+      - '.github/kfx/**'
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  MANGETSU_REVISION: 60e06ef0d4535c5403f446fd46b996df4d0d2560
+  VCPKG_REVISION: f3419f137f1a1e79b33b880ae6845f873d87820b
+  KFX_REPETITIONS: "${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.repetitions) || '1' }}"
+
+jobs:
+  prepare:
+    name: Prepare KFX test
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, 'KFX-Stress-Test verification')
+    runs-on: ubuntu-latest
+    outputs:
+      renderers: ${{ steps.prepare.outputs.renderers }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate exact ASS bytes and playback schedule
+        run: python .github/kfx/fixture.py
+      - id: prepare
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:KFX_REPETITIONS -notmatch '^[1-5]$') { throw 'Repetitions must be an integer from 1 to 5' }
+          $renderers = @(
+            @{ kind = 'candidate'; repository = $env:GITHUB_REPOSITORY; ref = $env:GITHUB_SHA },
+            @{ kind = 'original'; repository = 'Masaiki/VSFilterMod'; ref = '808f492f2e6feb92c975cbed9faaa7b4272cfec5' },
+            @{ kind = 'baseline'; repository = $env:GITHUB_REPOSITORY; ref = 'b31674c1341487b706712ecc213482562687781a' },
+            @{ kind = 'mangetsu'; repository = 'amanosatosi/libassmod'; ref = $env:MANGETSU_REVISION }
+          )
+          "renderers=$(ConvertTo-Json -InputObject $renderers -Compress)" >> $env:GITHUB_OUTPUT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kfx-plan-${{ github.sha }}
+          path: kfx-plan.json
+          if-no-files-found: error
+
+  build-renderer:
+    name: Build or reuse ${{ matrix.kind }}
+    needs: prepare
+    runs-on: windows-2022
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.renderers) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Reuse a verified GitHub renderer artifact
+        id: reuse
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMPONENT: ${{ matrix.kind }}
+          REVISION: ${{ matrix.ref }}
+        run: .github/kfx/reuse-renderer.ps1 -Kind $env:COMPONENT -Revision $env:REVISION
+      - uses: actions/checkout@v4
+        if: steps.reuse.outputs.reused != 'true' && matrix.kind != 'candidate'
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.ref }}
+          path: benchmark-source
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        if: steps.reuse.outputs.reused != 'true' && matrix.kind == 'mangetsu'
+        with:
+          repository: microsoft/vcpkg
+          ref: ${{ env.VCPKG_REVISION }}
+          path: benchmark-vcpkg
+          persist-credentials: false
+      - id: image
+        if: steps.reuse.outputs.reused != 'true' && matrix.kind == 'mangetsu'
+        shell: pwsh
+        run: '"version=$env:ImageVersion" >> $env:GITHUB_OUTPUT'
+      - uses: actions/cache@v4
+        if: steps.reuse.outputs.reused != 'true' && matrix.kind == 'mangetsu'
+        with:
+          path: vcpkg-binaries
+          key: mangetsu-vcpkg-${{ env.VCPKG_REVISION }}-${{ steps.image.outputs.version }}
+          restore-keys: mangetsu-vcpkg-${{ env.VCPKG_REVISION }}-
+      - name: Build missing renderer
+        if: steps.reuse.outputs.reused != 'true'
+        shell: cmd
+        env:
+          COMPONENT: ${{ matrix.kind }}
+          REVISION: ${{ matrix.ref }}
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+          if "%COMPONENT%"=="mangetsu" (
+            where nasm >nul 2>&1 || choco install nasm --yes --no-progress || exit /b 1
+            set "PATH=%ProgramFiles%\NASM;%PATH%"
+          )
+          pwsh -NoProfile -File .github\ci\build-bench-component.ps1 -Component "%COMPONENT%" -Revision "%REVISION%" || exit /b 1
+      - name: Verify and seal renderer
+        shell: pwsh
+        env:
+          COMPONENT: ${{ matrix.kind }}
+          REVISION: ${{ matrix.ref }}
+          REUSED: ${{ steps.reuse.outputs.reused }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .github/kfx/bundles.ps1
+          if ($env:REUSED -eq 'true') {
+            $null = Read-KfxBundle bundle $env:COMPONENT $env:REVISION
+          } else {
+            $bundle = Assert-KfxBundle bundle $env:COMPONENT $env:REVISION
+            Write-KfxSeal $bundle bundle @{ kind = 'this-run'; run_id = $env:GITHUB_RUN_ID }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kfx-renderer-${{ matrix.kind }}-${{ matrix.ref }}
+          path: bundle/
+          if-no-files-found: error
+
+  harness:
+    name: Build KFX playback host
+    needs: prepare
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: amanosatosi/libassmod
+          ref: ${{ env.MANGETSU_REVISION }}
+          path: benchmark-source
+          sparse-checkout: libass
+          persist-credentials: false
+      - name: Compile playback host
+        shell: cmd
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+          pwsh -NoProfile -File .github\kfx\build-harness.ps1 -Revision "%GITHUB_SHA%" || exit /b 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kfx-harness-${{ github.sha }}
+          path: bundle/
+          if-no-files-found: error
+
+  stress:
+    name: KFX Stress Test · 5,400 frames per renderer
+    needs: [prepare, build-renderer, harness]
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      KFX_RENDERERS: ${{ needs.prepare.outputs.renderers }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: kfx-plan-${{ github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kfx-renderer-*
+          path: kfx-bundles
+      - uses: actions/download-artifact@v4
+        with:
+          name: kfx-harness-${{ github.sha }}
+          path: kfx-harness
+      - name: Verify bundles and render sequentially on one runner
+        shell: pwsh
+        run: .github/kfx/run-stress.ps1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kfx-raw-${{ github.sha }}
+          path: kfx-raw/
+          if-no-files-found: warn
+
+  report:
+    name: KFX Performance Report
+    needs: stress
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: kfx-raw-${{ github.sha }}
+          path: kfx-raw
+      - name: Generate performance charts and check RGB output
+        run: |
+          python -m pip install matplotlib==3.10.1
+          python .github/kfx/report.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kfx-report-${{ github.sha }}
+          path: kfx-report/
+          if-no-files-found: error
+
+  profile:
+    name: Optional instrumented KFX playback
+    if: github.event_name == 'workflow_dispatch' && inputs.profile
+    needs: [prepare, harness]
+    runs-on: windows-2022
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: kfx-plan-${{ github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: kfx-harness-${{ github.sha }}
+          path: kfx-harness
+      - name: Build instrumented candidate
+        shell: cmd
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+          pwsh -NoProfile -File .github\ci\build-bench-component.ps1 -Component profile -Revision "%GITHUB_SHA%" || exit /b 1
+      - name: Run optional profiling pass
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .github/kfx/bundles.ps1
+          $bundle = Assert-KfxBundle bundle profile $env:GITHUB_SHA
+          Write-KfxSeal $bundle bundle @{ kind = 'this-run'; run_id = $env:GITHUB_RUN_ID }
+          .github/kfx/run-stress.ps1 -Profile
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kfx-profile-${{ github.sha }}
+          path: kfx-profile/
+          if-no-files-found: warn
