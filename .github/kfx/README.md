@@ -3,6 +3,8 @@
 The event-worker feature branch accepts the same explicit verification marker.
 Set `OBORODZUKI_WORKERS` before constructing a renderer to select its worker count.
 The separate Parallel renderer validation workflow compares all worker counts.
+Its `full` dispatch input or explicit `Parallel-KFX full` verification marker
+retains 5,400 frames per worker configuration and a one-worker reference pass.
 
 In GitHub Actions, select **KFX Stress Test**, choose the development branch, and run
 one pass per renderer by default. Set **repetitions** to 2–5 for additional passes.

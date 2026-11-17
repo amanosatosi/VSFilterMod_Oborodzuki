@@ -53,6 +53,11 @@ conversion queried screen DPI to compute a height that the renderer immediately
 overwrote. Removing that query eliminates shared screen-DC operations in a hot
 worker path.
 
+Before user Lua code runs, the tag parser snapshots the actual standard-library
+global function names. Ordinary tags then avoid repeated Lua VM lookups. A direct
+Lua call or loaded user script restores dynamic lookup and sequential callback
+ordering.
+
 ## Historical designs inspected
 
 The local VSFilterMod `CSubPicQueue::ThreadProc` in
