@@ -102,6 +102,9 @@ was not imported.
 
 ## Validation and measurements
 
+The [scaling report](parallel-rendering-scaling.md) records the paired
+full-timeline results, worker profile, and synthetic regression data.
+
 The existing Windows workflow continues to produce x86 and x64 DLLs. The
 existing iteration suite checks original-VSFilterMod and baseline frame hashes.
 The parallel validation workflow compares the previous and current renderer on
