@@ -583,6 +583,59 @@ if ROUND3:
     for workers in (2, 4, 6, 8):
         assert benchmark(CANDIDATE, ruby, workers, "regression")["hashes"] == expected
 
+    vertical_ruby = write("native-vertical-ruby", [
+        (240, 265, rf"\fs54\1c{WHITE}\vert1\vdir1", "<漢字|かんじ>"),
+        (540, 265, rf"\fs54\1c{WHITE}\vert1\vdir2", "<漢字||かんじ>"),
+        (840, 265, rf"\fs54\1c{WHITE}\vert1\vdir2", "<漢字|かんじ|カンジ>"),
+        (1250, 265, rf"\fs48\1c{WHITE}\vert1\furichangepos2\fnMyanmar Text",
+         r"<satou|ဆာတို့|佐藤>\N<san|စံ>"),
+        (240, 740, rf"\fs54\1c{WHITE}\vert1", "漢字"),
+    ])
+    centers = {"normal": (240, 265), "reverse": (540, 265), "both": (840, 265),
+               "mixed": (1250, 265), "base": (240, 740)}
+    playback("csri", CANDIDATE, vertical_ruby, ROOT / "vertical-ruby")
+    playback("rgba", MANG, vertical_ruby, ROOT / "vertical-ruby-reference")
+    for getter in (captures(ROOT / "vertical-ruby", centers), captures(ROOT / "vertical-ruby-reference", centers)):
+        base = ink_bounds(getter, 60, "base", top=-100, bottom=265)
+        normal = ink_bounds(getter, 60, "normal", top=-100, bottom=265)
+        reverse = ink_bounds(getter, 60, "reverse", top=-100, bottom=265)
+        both = ink_bounds(getter, 60, "both", top=-100, bottom=265)
+        assert normal[2] > base[2] + 12 and reverse[0] < base[0] - 12, (base, normal, reverse)
+        assert both[0] < base[0] - 12 and both[2] > base[2] + 12, both
+        ink_bounds(getter, 60, "mixed", top=-125, right=320, bottom=380)
+    expected = benchmark(CANDIDATE, vertical_ruby, 1, "regression")["hashes"]
+    for workers in (2, 4, 6, 8):
+        assert benchmark(CANDIDATE, vertical_ruby, workers, "regression")["hashes"] == expected
+
+    columns = write("semantic-columns", [
+        (220, 200, rf"\fs48\1c{WHITE}\col1",
+         rf"HP|{{\colan5\colsp25\1c{GREEN}\k50}}:|{{\colan6\1c{RED}}}504"
+         rf"\NMP|{{\1c{BLUE}}}:|80\NAttack|:|1200{{\col0}}"),
+        (820, 200, rf"\fs48\1c{WHITE}\fnMyanmar Text\col1", r"HP|။|၅၀၄\NMP|။|၈၀{\col0}"),
+        (220, 590, rf"\fs48\1c{WHITE}\col1\colsp40", r"Name||Status\NA||Ready{\col0}\NA|B"),
+    ])
+    centers = {"table": (220, 200), "myanmar": (820, 200), "empty": (220, 590)}
+    playback("csri", CANDIDATE, columns, ROOT / "columns")
+    playback("rgba", MANG, columns, ROOT / "columns-reference")
+    for getter in (captures(ROOT / "columns", centers), captures(ROOT / "columns-reference", centers)):
+        colored = [[], [], []]
+        for y in range(240):
+            for x in range(390):
+                pixel = getter(60, "table", x, y)
+                for channel in range(3):
+                    if pixel[channel] > 210 and sum(pixel) - pixel[channel] < 55:
+                        colored[channel].append((x, y))
+        red, green, blue = colored
+        assert red and green and blue, tuple(map(len, colored))
+        assert min(y for _, y in green) < min(y for _, y in blue) < max(y for _, y in green)
+        assert abs(min(x for x, _ in green) - min(x for x, _ in blue)) <= 2
+        assert min(x for x, _ in red) > max(x for x, _ in green) + 10
+        ink_bounds(getter, 60, "myanmar", top=-5, right=350, bottom=165)
+        ink_bounds(getter, 60, "empty", top=-5, right=400, bottom=220)
+    expected = benchmark(CANDIDATE, columns, 1, "regression")["hashes"]
+    for workers in (2, 4, 6, 8):
+        assert benchmark(CANDIDATE, columns, workers, "regression")["hashes"] == expected
+
 # Check old corner math against the validated VSFilterMod path rather than
 # requiring its different legacy bitmap geometry to agree with libass.
 playback("csri", Path("threading-baseline/renderer/renderer.dll").resolve(), grid, ROOT / "previous")

@@ -1003,6 +1003,7 @@ CWord::CWord(CWord& word)
     m_wrapAfter = word.m_wrapAfter;
     m_verticalWord = word.m_verticalWord;
     m_rubyGroup = word.m_rubyGroup;
+    m_columnCell = word.m_columnCell;
 #endif
 }
 
@@ -1013,6 +1014,9 @@ CWord::~CWord()
 
 bool CWord::Append(CWord* w)
 {
+#ifdef _VSMOD
+    if (m_columnCell != w->m_columnCell) return false;
+#endif
     if(!(m_style == w->m_style)
        || m_fLineBreak || w->m_fLineBreak
        || w->m_kstart != w->m_kend || m_ktype != w->m_ktype) return(false);
@@ -2757,7 +2761,10 @@ CRect CLine::PaintBody(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoin
             }
         }
         else
+        {
+            sw[3] = DWORD(w->HorizontalRubyPaintSplit(int(sw[3]), t));
             bbox |= w->DrawBodyPaint(spd, clipRect, pAlphaMask, x, y, sw, mod_vc, reversePaint);
+        }
 #else
         bbox |= w->Draw(spd, clipRect, pAlphaMask, x, y, sw, true, false);
 #endif
@@ -2868,6 +2875,7 @@ CLine* CSubtitle::GetNextLine(POSITION& pos, int maxwidth)
     CLine* ret = DNew CLine();
     if(!ret) return(NULL);
 #ifdef _VSMOD
+    if (m_words.GetAt(pos)->m_columnCell) maxwidth = INT_MAX;
     if (!m_lineAlignment.empty())
     {
         const auto number = m_words.GetAt(pos)->m_logicalLine;
@@ -3145,6 +3153,8 @@ void CSubtitle::MakeLines(CSize size, CRect marginRect)
 void CSubtitle::AppendWord(CWord* word)
 {
 #ifdef _VSMOD
+    if (m_columns && !word->m_fLineBreak)
+        word->m_columnCell = (m_columns->number << 16) | m_columns->current;
     word->m_logicalLine = m_logicalLine;
     if (word->m_fLineBreak)
         ++m_logicalLine;
@@ -3441,6 +3451,64 @@ InkBox WordInk(const CWord& word, bool includeStroke)
     }
     return box;
 }
+
+struct VerticalUnit
+{
+    size_t first, last;
+    double left, top, width, height, gap;
+    bool sideways, canBreak;
+};
+
+VerticalUnit MeasureVerticalUnit(const std::vector<ShapedWord*>& words, size_t start, int preferred, double spacing)
+{
+    const auto c = FirstScalar(words[start]->Text());
+    const int profile = preferred ? preferred : CjkVerticalForm(c) ? 1 : Myanmar(c) ? 3 : 2;
+    const bool sideways = profile == 1 && c >= 0x21 && c != 0xa0 && !CjkVerticalForm(c) && !Myanmar(c);
+    size_t end = start + 1;
+    if (Myanmar(c))
+        while (end < words.size() && words[end] && words[end]->m_rubyGroup == words[start]->m_rubyGroup &&
+                MyanmarContinuation(words, end))
+            ++end;
+    InkBox ink;
+    double emX = 1, emY = 1, pen = 0;
+    for (size_t i = start; i < end; ++i)
+    {
+        const auto& word = *words[i];
+        emX = (std::max)(emX, word.m_style.fontSize / 8 * word.m_style.fontScaleX / 100);
+        emY = (std::max)(emY, word.m_style.fontSize / 8 * word.m_style.fontScaleY / 100);
+        word.OutlinePoints([&](RenderGeometry::Point p) {
+            p.x += pen;
+            if (sideways) p = {-p.y, p.x};
+            ink.Add(p.x, p.y);
+        });
+        pen += word.m_width;
+    }
+    const double width = (std::max)(ink.right - ink.left, emX * (profile == 1 ? 1. : profile == 2 ? .4 : .65));
+    double height = (std::max)(ink.bottom - ink.top, emY * (profile == 1 ? 1. : profile == 2 ? .36 : .55));
+    if (!ink.valid && profile != 1) height = (std::max)(height, (std::min)(pen, emY * .6));
+    const double gap = (std::max)(-.9 * height, spacing + emY * (profile == 1 ? 0. : profile == 2 ? .14 : .18));
+    return {start, end, (ink.left + ink.right - width) / 2, (ink.top + ink.bottom - height) / 2,
+        width, height, gap, sideways, profile != 2 || words[end - 1]->m_wrapAfter};
+}
+
+struct VerticalGlyph
+{
+    CWord* word;
+    double x, y;
+    bool sideways;
+    double scaleY = 1;
+};
+
+InkBox VerticalInk(const VerticalGlyph& glyph)
+{
+    auto bounds = WordInk(*glyph.word, true);
+    if (glyph.sideways)
+        bounds = {-bounds.bottom, bounds.left, -bounds.top, bounds.right, bounds.valid};
+    bounds.top *= glyph.scaleY;
+    bounds.bottom *= glyph.scaleY;
+    bounds.Move(glyph.x, glyph.y);
+    return bounds;
+}
 }
 
 void CSubtitle::PlaceHorizontalRuby()
@@ -3671,6 +3739,113 @@ void CSubtitle::PlaceHorizontalRuby()
     }
 }
 
+void CSubtitle::ArrangeColumns()
+{
+    struct Cell
+    {
+        size_t first, last;
+        unsigned block, column;
+        double start, end, left, right;
+    };
+    struct Row
+    {
+        CLine* line;
+        std::vector<CWord*> words;
+        std::vector<Cell> cells;
+        double width = 0;
+    };
+    struct Table
+    {
+        std::vector<double> widths, offsets;
+        double left = 1e9, width = 0;
+    };
+    std::vector<Table> tables(m_columnBlocks.size());
+    for (size_t i = 0; i < tables.size(); ++i) tables[i].widths.resize(m_columnBlocks[i]->columns.size());
+    std::vector<Row> rows;
+    for (auto next = GetHeadPosition(); next;)
+    {
+        auto* line = GetNext(next);
+        rows.push_back({line, {}, {}});
+        auto& row = rows.back();
+        for (auto pos = line->GetHeadPosition(); pos;)
+            row.words.push_back(line->GetNext(pos));
+        for (size_t i = 0; i < row.words.size();)
+        {
+            const auto id = row.words[i]->m_columnCell;
+            if (!id)
+            {
+                row.width += row.words[i++]->m_width;
+                continue;
+            }
+            Cell cell{i, i, (id >> 16) - 1, id & 0xffff, row.width, row.width, row.width, row.width};
+            for (; i < row.words.size() && row.words[i]->m_columnCell == id; ++i)
+            {
+                const auto& word = *row.words[i];
+                const auto ink = WordInk(word, false);
+                if (ink.valid)
+                {
+                    cell.left = (std::min)(cell.left, row.width + ink.left);
+                    cell.right = (std::max)(cell.right, row.width + ink.right);
+                }
+                row.width += word.m_width;
+            }
+            cell.last = i;
+            cell.end = row.width;
+            cell.right = (std::max)(cell.right, row.width);
+            auto& table = tables[cell.block];
+            table.left = (std::min)(table.left, cell.start);
+            table.widths[cell.column] = (std::max)(table.widths[cell.column], cell.right - cell.left);
+            row.cells.push_back(cell);
+        }
+    }
+    for (size_t i = 0; i < tables.size(); ++i)
+    {
+        auto& table = tables[i];
+        const auto& columns = m_columnBlocks[i]->columns;
+        for (size_t column = 0; column < columns.size(); ++column)
+        {
+            table.offsets.push_back(table.width);
+            table.width += table.widths[column];
+            if (column + 1 < columns.size()) table.width += columns[column].spacing * m_scalex * 8;
+        }
+    }
+    const int oldWidth = m_textWidth;
+    m_textWidth = 0;
+    for (auto& row : rows)
+    {
+        double shift = 0, room = 0;
+        size_t i = 0;
+        const auto move = [&](size_t through, double offset) {
+            const auto x = LONG(std::lround(offset));
+            for (; i < through; ++i)
+                if (x) row.words[i]->PlaceLayout(CPoint(x, 0), 1, 0, 0, 0);
+        };
+        for (size_t j = 0; j < row.cells.size(); ++j)
+        {
+            const auto& cell = row.cells[j];
+            const auto& table = tables[cell.block];
+            const auto& column = m_columnBlocks[cell.block]->columns[cell.column];
+            const double fraction = column.alignment == 1 ? 0. : column.alignment == 2 ? .5 : 1.;
+            const double alignment = (table.widths[cell.column] - (cell.right - cell.left)) * fraction;
+            move(cell.first, shift);
+            move(cell.last, table.left + table.offsets[cell.column] + alignment - cell.left);
+            if (j + 1 == row.cells.size() || row.cells[j + 1].block != cell.block)
+            {
+                room = (std::max)(room, table.left + table.width);
+                shift = table.left + table.width - cell.end;
+            }
+        }
+        move(row.words.size(), shift);
+        row.line->m_width = int(std::ceil((std::max)(room, row.width + shift)));
+        m_textWidth = (std::max)(m_textWidth, row.line->m_width);
+    }
+    const int added = m_textWidth - oldWidth;
+    const int align = m_scrAlignment % 3;
+    const int shift = align == 1 ? 0 : align == 2 ? added / 2 : added;
+    m_rect.left -= shift;
+    m_rect.right += added - shift;
+}
+
 bool CSubtitle::MakeVerticalLines(int maxHeight, CSize& bounds)
 {
     if (m_curveShapeFailed || m_words.IsEmpty()) return false;
@@ -3694,14 +3869,8 @@ bool CSubtitle::MakeVerticalLines(int maxHeight, CSize& bounds)
     const bool leftward = m_verticalDirection ? m_verticalDirection == 1 :
         directionScore > 0 || (!directionScore && firstDirection > 0);
 
-    struct Unit
-    {
-        size_t first, last;
-        double left, top, width, height, gap;
-        bool sideways, canBreak;
-    };
     struct Column { size_t first, last; double width, height; int anchor; };
-    std::vector<Unit> units;
+    std::vector<VerticalUnit> units;
     std::vector<Column> columns;
     const auto boundSpacing = [](double value) {
         return (std::max)(-65536., (std::min)(65536., value));
@@ -3719,37 +3888,8 @@ bool CSubtitle::MakeVerticalLines(int maxHeight, CSize& bounds)
             m_verticalAnchor ? m_verticalAnchor : m_scrAlignment;
         for (; start < words.size() && words[start];)
         {
-            const auto c = FirstScalar(words[start]->Text());
-            const int profile = m_verticalProfile ? m_verticalProfile : CjkVerticalForm(c) ? 1 : Myanmar(c) ? 3 : 2;
-            const bool sideways = profile == 1 && c >= 0x21 && c != 0xa0 && !CjkVerticalForm(c) && !Myanmar(c);
-            size_t end = start + 1;
-            if (Myanmar(c))
-                while (end < words.size() && words[end] && MyanmarContinuation(words, end)) ++end;
-            double left = 0, right = 0, top = 0, bottom = 0, emX = 1, emY = 1, pen = 0;
-            bool ink = false;
-            for (size_t i = start; i < end; ++i)
-            {
-                auto& word = *words[i];
-                emX = (std::max)(emX, word.m_style.fontSize / 8 * word.m_style.fontScaleX / 100);
-                emY = (std::max)(emY, word.m_style.fontSize / 8 * word.m_style.fontScaleY / 100);
-                word.OutlinePoints([&](RenderGeometry::Point p) {
-                    p.x += pen;
-                    if (sideways) p = {-p.y, p.x};
-                    left = ink ? (std::min)(left, p.x) : p.x;
-                    right = ink ? (std::max)(right, p.x) : p.x;
-                    top = ink ? (std::min)(top, p.y) : p.y;
-                    bottom = ink ? (std::max)(bottom, p.y) : p.y;
-                    ink = true;
-                });
-                pen += word.m_width;
-            }
-            const double width = (std::max)(right - left, emX * (profile == 1 ? 1. : profile == 2 ? .4 : .65));
-            double height = (std::max)(bottom - top, emY * (profile == 1 ? 1. : profile == 2 ? .36 : .55));
-            if (!ink && profile != 1) height = (std::max)(height, (std::min)(pen, emY * .6));
-            const double gap = (std::max)(-.9 * height, extra + emY * (profile == 1 ? 0. : profile == 2 ? .14 : .18));
-            units.push_back({start, end, (left + right - width) / 2, (top + bottom - height) / 2,
-                width, height, gap, sideways, profile != 2 || words[end - 1]->m_wrapAfter});
-            start = end;
+            units.push_back(MeasureVerticalUnit(words, start, m_verticalProfile, extra));
+            start = units.back().last;
         }
 
         size_t first = begin;
@@ -3760,10 +3900,21 @@ bool CSubtitle::MakeVerticalLines(int maxHeight, CSize& bounds)
             for (; last < units.size(); ++last)
             {
                 const auto candidate = height + units[last].height + (last == first ? 0 : gapAfter(last - 1));
-                if (last > first && m_wrapStyle != 2 && candidate > maxHeight) break;
+                const auto group = words[units[last].first]->m_rubyGroup;
+                if (last > first && m_wrapStyle != 2 &&
+                    (!group || words[units[last - 1].first]->m_rubyGroup != group))
+                {
+                    double occupied = candidate;
+                    if (group)
+                        for (size_t i = last + 1; i < units.size() && words[units[i].first]->m_rubyGroup == group; ++i)
+                            occupied += gapAfter(i - 1) + units[i].height;
+                    if (occupied > maxHeight) break;
+                }
                 height = candidate;
                 width = (std::max)(width, units[last].width);
-                if (units[last].canBreak) legal = last + 1;
+                if ((units[last].canBreak || group) &&
+                    (!group || last + 1 == units.size() || words[units[last + 1].first]->m_rubyGroup != group))
+                    legal = last + 1;
             }
             if (last < units.size() && legal > first && legal < last)
             {
@@ -3788,14 +3939,17 @@ bool CSubtitle::MakeVerticalLines(int maxHeight, CSize& bounds)
         height = (std::max)(height, columns[i].height);
     }
     if (width > 4000000 || height > 4000000) return false;
-    auto line = std::make_unique<CLine>();
-    line->m_width = int(std::ceil(width));
-    line->m_descent = 0;
-    line->m_ascent = int(std::ceil(height));
-    line->m_borderX = line->m_borderY = 0;
+    struct ColumnPlan
+    {
+        std::vector<VerticalGlyph> glyphs;
+        InkBox band;
+    };
+    std::vector<ColumnPlan> plans;
     double columnStart = 0;
     for (const auto& column : columns)
     {
+        plans.emplace_back();
+        auto& plan = plans.back();
         const int horizontal = column.anchor % 3;
         const double fx = horizontal == 1 ? 0 : horizontal == 2 ? .5 : 1;
         const double fy = column.anchor <= 3 ? 1 : column.anchor <= 6 ? .5 : 0;
@@ -3808,21 +3962,166 @@ bool CSubtitle::MakeVerticalLines(int maxHeight, CSize& bounds)
             double pen = 0;
             for (size_t j = unit.first; j < unit.last; ++j)
             {
-                auto word = std::unique_ptr<CWord>(words[j]->Copy());
-                const double targetX = x + (unit.sideways ? 0 : pen);
-                const double targetY = y - unit.top + (unit.sideways ? pen : 0);
-                word->PlaceLayout(CPoint(LONG(std::lround(targetX)),
-                    LONG(std::lround(targetY - line->m_ascent + word->m_ascent))),
-                    unit.sideways ? 0 : 1, unit.sideways ? 1 : 0, 0, 0);
-                pen += word->m_width;
-                word->m_width = 0;
-                word->m_verticalWord = true;
-                line->AddTail(word.get());
-                word.release();
+                plan.glyphs.push_back({words[j], x + (unit.sideways ? 0 : pen),
+                    y - unit.top + (unit.sideways ? pen : 0), unit.sideways});
+                pen += words[j]->m_width;
             }
             y += unit.height + (i + 1 == column.last ? 0 : gapAfter(i));
         }
         columnStart += advanceColumn(column.width);
+    }
+    double columnShift = 0;
+    InkBox block, previous;
+    bool reserve = false;
+    if (!m_rubyGroups.empty())
+        for (auto& plan : plans)
+        {
+            InkBox lastRead[2];
+            const size_t baseCount = plan.glyphs.size();
+            for (size_t start = 0; start < baseCount;)
+            {
+                const auto groupId = plan.glyphs[start].word->m_rubyGroup;
+                size_t end = start + 1;
+                if (groupId)
+                    while (end < baseCount && plan.glyphs[end].word->m_rubyGroup == groupId) ++end;
+                InkBox base;
+                for (size_t i = start; i < end; ++i) base.Add(VerticalInk(plan.glyphs[i]));
+                plan.band.Add(base);
+                const auto* baseWord = plan.glyphs[start].word;
+                start = end;
+                if (!groupId || !base.valid) continue;
+                auto& group = m_rubyGroups[groupId - 1];
+                const auto& options = group.options;
+                reserve |= options.placement == 1;
+                const double em = baseWord->m_style.fontSize * baseWord->m_style.fontScaleX / 800;
+                const double gap = (std::max)(8., em * .04) + (!options.manual && options.autoGap ? em * .04 : 0);
+                const double offsetX = options.manual ? options.offsetX * m_scalex * 8 : 0;
+                const double offsetY = options.manual ? -options.offsetY * m_scaley * 8 : 0;
+                for (size_t side = 0; side < group.annotations.size(); ++side)
+                {
+                    const auto& reading = group.annotations[side];
+                    if (reading.empty()) continue;
+                    std::vector<ShapedWord*> shaped;
+                    for (const auto& source : reading) shaped.push_back(static_cast<ShapedWord*>(source.get()));
+                    const auto readingStart = plan.glyphs.size();
+                    double y = 0, nextGap = 0;
+                    InkBox band;
+                    for (size_t i = 0; i < shaped.size();)
+                    {
+                        const auto unit = MeasureVerticalUnit(shaped, i, m_verticalProfile,
+                            options.spacing * m_scaley * m_curveScale * 8 * options.scaleY / 100);
+                        if (i) y += (std::max)(nextGap, unit.gap);
+                        double pen = 0;
+                        for (; i < unit.last; ++i)
+                        {
+                            VerticalGlyph glyph{shaped[i], -unit.width / 2 - unit.left + (unit.sideways ? 0 : pen),
+                                y - unit.top + (unit.sideways ? pen : 0), unit.sideways};
+                            band.Add(VerticalInk(glyph));
+                            plan.glyphs.push_back(glyph);
+                            pen += shaped[i]->m_width;
+                        }
+                        y += unit.height;
+                        nextGap = unit.gap;
+                    }
+                    if (!band.valid) continue;
+                    const double span = band.bottom - band.top;
+                    const double fit = options.style == 2 && span > 0 ?
+                        (std::min)(1., (base.bottom - base.top) / span) : 1.;
+                    band.top *= fit;
+                    band.bottom *= fit;
+                    const double edgeX = side ? base.left - gap - band.right : base.right + gap - band.left;
+                    const double x = side ? edgeX + (std::min)(0., offsetX) : edgeX + (std::max)(0., offsetX);
+                    y = (base.top + base.bottom - band.top - band.bottom) / 2 + offsetY;
+                    if (lastRead[side].valid) y = (std::max)(y, lastRead[side].bottom + 8 - band.top);
+                    for (size_t i = readingStart; i < plan.glyphs.size(); ++i)
+                    {
+                        auto& glyph = plan.glyphs[i];
+                        glyph.x += x;
+                        glyph.y = glyph.y * fit + y;
+                        glyph.scaleY = fit;
+                    }
+                    band.Move(x, y);
+                    plan.band.Add(band);
+                    lastRead[side] = band;
+                }
+            }
+            if (plan.band.valid)
+            {
+                double extra = 0;
+                if (previous.valid)
+                    extra = leftward ? (std::max)(0., plan.band.right - columnShift - previous.left + 8) :
+                        (std::max)(0., previous.right - plan.band.left - columnShift + 8);
+                columnShift += extra;
+                const double delta = leftward ? -columnShift : columnShift;
+                for (auto& glyph : plan.glyphs) glyph.x += delta;
+                plan.band.Move(delta, 0);
+                previous = plan.band;
+                block.Add(plan.band);
+            }
+        }
+    double xOffset = leftward ? columnShift : 0;
+    width += columnShift;
+    double yOffset = 0;
+    if (reserve && block.valid)
+    {
+        const double left = (std::min)(0., block.left + xOffset);
+        width = (std::max)(width, block.right + xOffset) - left;
+        xOffset -= left;
+        yOffset = (std::max)(0., -block.top);
+        height = (std::max)(height, block.bottom) + yOffset;
+    }
+    if (width > 4000000 || height > 4000000) return false;
+    auto line = std::make_unique<CLine>();
+    line->m_width = int(std::ceil(width));
+    line->m_descent = 0;
+    line->m_ascent = int(std::ceil(height));
+    line->m_borderX = line->m_borderY = 0;
+    for (const auto& plan : plans)
+    {
+        std::map<unsigned, InkBox> baseBands;
+        for (const auto& glyph : plan.glyphs)
+            if (glyph.word->m_rubyGroup && !m_rubyGroups[glyph.word->m_rubyGroup - 1].baseTiming.empty())
+                baseBands[glyph.word->m_rubyGroup].Add(VerticalInk(glyph));
+        for (const auto& glyph : plan.glyphs)
+        {
+            auto word = std::unique_ptr<CWord>(glyph.word->Copy());
+            if (glyph.sideways) word->m_style.fontScaleX *= glyph.scaleY;
+            else word->m_style.fontScaleY *= glyph.scaleY;
+            word->PlaceLayout(CPoint(LONG(std::lround(glyph.x + xOffset)),
+                LONG(std::lround(glyph.y + yOffset - line->m_ascent + word->m_ascent))),
+                glyph.sideways ? 0 : 1, glyph.sideways ? 1 : 0, 0, 0);
+            word->m_width = 0;
+            word->m_verticalWord = true;
+            const auto band = baseBands.find(glyph.word->m_rubyGroup);
+            if (band != baseBands.end() && band->second.bottom > band->second.top)
+            {
+                const auto& timing = m_rubyGroups[band->first - 1].baseTiming;
+                const auto ink = VerticalInk(glyph);
+                double total = 0;
+                for (const auto& part : timing) total += part.width;
+                double top = band->second.top;
+                for (size_t i = 0; i < timing.size(); ++i)
+                {
+                    const auto& part = timing[i];
+                    const double bottom = top + (band->second.bottom - band->second.top) * part.width / total;
+                    if (ink.valid && bottom > ink.top && top < ink.bottom)
+                    {
+                        auto slice = std::unique_ptr<CWord>(word->Copy());
+                        slice->m_ktype = part.type;
+                        slice->m_kstart = part.start;
+                        slice->m_kend = part.end;
+                        slice->ClipRubyCoverage(i == 0 ? INT_MIN : int(std::lround(top - glyph.y)),
+                            i + 1 == timing.size() ? INT_MAX : int(std::lround(bottom - glyph.y)));
+                        line->AddTail(slice.get());
+                        slice.release();
+                    }
+                    top = bottom;
+                }
+                continue;
+            }
+            line->AddTail(word.get());
+            word.release();
+        }
     }
     bounds = CSize(line->m_width, line->m_ascent);
     m_textWidth = line->m_width;
@@ -4309,7 +4608,7 @@ void CRenderedTextSubtitle::ParseString(CSubtitle* sub, CStringW str, STSStyle& 
     PROFILE_RENDER_STAGE(Layout);
     if(!sub) return;
 #ifdef _VSMOD
-    if ((sub->m_curve || sub->m_vertical) && !sub->m_curveShapeFailed)
+    if ((sub->m_curve || sub->m_vertical || sub->m_columns) && !sub->m_curveShapeFailed)
     {
         if (sub->m_words.IsEmpty()) sub->m_curveScale = style.objectScale / 100;
         if (ParseShapedString(sub, str, style, sub->m_vertical && sub->m_verticalProfile <= 1))
@@ -4341,7 +4640,7 @@ void CRenderedTextSubtitle::ParseString(CSubtitle* sub, CStringW str, STSStyle& 
 #endif
                 sub->AppendWord(w);
 #ifdef _VSMOD
-                if (!sub->m_keepRubyKaraoke)
+                if (!sub->m_keepRubyKaraoke && !sub->m_columns)
 #endif
                     m_kstart = m_kend;
             }
@@ -4424,7 +4723,8 @@ bool CRenderedTextSubtitle::ParseShapedString(CSubtitle* sub, const CStringW& te
             const auto endTime = m_ktype == 1 ? karaokeStart + int((m_kend-karaokeStart) *
                 (c.left+c.advance) / (std::max)(.001f, line.second->width)) : m_kend;
             auto* word = new ShapedWord(style, line.first.Mid(c.start, c.length), line.second, i,
-                m_ktype, startTime, endTime, sub->m_scalex, sub->m_scaley);
+                sub->m_columns ? 0 : m_ktype, sub->m_columns ? 0 : startTime,
+                sub->m_columns ? 0 : endTime, sub->m_scalex, sub->m_scaley);
 #if defined(_LUA)
             word->L = L;
             word->LuaLog = LuaLog;
@@ -4433,7 +4733,7 @@ bool CRenderedTextSubtitle::ParseShapedString(CSubtitle* sub, const CStringW& te
 #endif
             sub->AppendWord(word);
         }
-        if (!sub->m_keepRubyKaraoke) m_kstart = m_kend;
+        if (!sub->m_keepRubyKaraoke && !sub->m_columns) m_kstart = m_kend;
     }
     return true;
 }
@@ -4502,7 +4802,7 @@ bool CRenderedTextSubtitle::ParseFurigana(CSubtitle* sub, Furigana::Fields& fiel
         {
             glyphStyle.fontScaleX *= group.options.scaleX / 100;
             glyphStyle.fontScaleY *= group.options.scaleY / 100;
-            glyphStyle.fontSpacing = group.options.spacing * sub->m_scalex * 64;
+            glyphStyle.fontSpacing = sub->m_vertical ? 0 : group.options.spacing * sub->m_scalex * 64;
         }
         for (size_t i = 0; i < run->clusters.size(); ++i)
         {
@@ -5344,6 +5644,10 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
             params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
         else if(!cmd.Find(L"ctx") || !cmd.Find(L"cty"))
             params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+        else if (!cmd.Find(L"colan") || !cmd.Find(L"colsp"))
+            params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
+        else if (!cmd.Find(L"col"))
+            params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
         else if(cmd == L"ct")
         {
             // The event-wide path has been selected before the text pass.
@@ -5707,6 +6011,58 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         CStringW p = params.size() > 0 ? params[0] : L"";
 
 #ifdef _VSMOD
+        if (cmd == L"col" || cmd == L"colan" || cmd == L"colsp")
+        {
+            if (fAnimate || sub->m_vertical) continue;
+            if (cmd == L"col")
+            {
+                if (p == L"1" && !sub->m_columns && sub->m_columnBlocks.size() < 64)
+                {
+                    auto block = std::make_unique<SemanticColumns::Block>(style, unsigned(sub->m_columnBlocks.size() + 1));
+                    sub->m_columns = block.get();
+                    sub->m_columnBlocks.push_back(std::move(block));
+                    sub->m_curve.reset();
+                }
+                else if (p == L"0" && sub->m_columns)
+                {
+                    sub->m_columns->EndCell();
+                    SemanticColumns::CopyFields(style, sub->m_columns->base, SemanticColumns::All);
+                    sub->m_columns = nullptr;
+                }
+            }
+            else if (sub->m_columns)
+            {
+                auto& column = sub->m_columns->Current();
+                if (cmd == L"colan" && !column.closed)
+                {
+                    const wchar_t* number = p;
+                    const int anchor = ReadDecimalDigit(number);
+                    if (anchor >= 1 && anchor <= 9 && !*number)
+                    {
+                        column.alignment = (anchor - 1) % 3 + 1;
+                        column.hasAlignment = true;
+                    }
+                }
+                else if (cmd == L"colsp")
+                {
+                    AssNumeric::Operand spacing;
+                    if (readOperand(p, false, false, spacing))
+                        column.spacing = (std::max)(1., (std::min)(8192., spacing.Resolve(column.spacing)));
+                }
+            }
+            continue;
+        }
+        if (sub->m_columns && (cmd == L"k" || cmd == L"K" || cmd == L"kf" || cmd == L"ko" ||
+            cmd == L"kO" || cmd == L"kt"))
+            continue;
+        const unsigned columnFields = sub->m_columns && !fAnimate ? SemanticColumns::DefaultFields(cmd) : 0;
+        struct DefaultCapture
+        {
+            STSStyle* snapshot;
+            STSStyle& style;
+            unsigned fields;
+            ~DefaultCapture() { if (snapshot) SemanticColumns::CopyFields(*snapshot, style, fields); }
+        } remember{columnFields ? sub->m_columns->SpliceDefault(style, columnFields) : nullptr, style, columnFields};
         if (!cmd.Find(L"furi"))
         {
             auto& ruby = sub->m_rubyOptions;
@@ -5782,7 +6138,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         }
         if (cmd == L"vert" || cmd == L"vtype" || cmd == L"vdir" || cmd == L"vsp" || cmd == L"vcolsp")
         {
-            if (fAnimate || !sub->m_words.IsEmpty()) continue;
+            if (fAnimate || !sub->m_words.IsEmpty() || sub->m_columns) continue;
             if (cmd == L"vsp" || cmd == L"vcolsp")
             {
                 AssNumeric::Operand operand;
@@ -7991,7 +8347,7 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
         int i;
 #ifdef _VSMOD
         Furigana::Fields ruby;
-        if (str[0] == L'<' && !m_nPolygon && sub->m_rubyOptions.enabled && str.Find(L'|') >= 0)
+        if (str[0] == L'<' && !m_nPolygon && !sub->m_columns && sub->m_rubyOptions.enabled && str.Find(L'|') >= 0)
             ruby = Furigana::Read(str);
 #endif
 
@@ -8022,6 +8378,33 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
             if(i < 0) i = str.GetLength() - 1;
             i++;
         }
+
+#ifdef _VSMOD
+        bool columnRow = false;
+        if (sub->m_columns && !m_nPolygon)
+            for (int j = 0; j < i; ++j)
+            {
+                if (str[j] == L'|')
+                {
+                    if (j == 0)
+                    {
+                        sub->m_columns->NextCell(stss, false);
+                        str = str.Mid(1);
+                    }
+                    i = j;
+                    break;
+                }
+                if (str[j] == L'\\' && str[j + 1] == L'|')
+                    ++j;
+                else if (str[j] == L'\\' && str[j + 1] == L'N')
+                {
+                    columnRow = j == 0;
+                    i = columnRow ? 2 : j;
+                    break;
+                }
+            }
+        if (i == 0) continue;
+#endif
 
         STSStyle tmp;
 
@@ -8074,8 +8457,15 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
         }
         else
         {
-            ParseString(sub, str.Left(i), tmp);
+            auto text = str.Left(i);
+#ifdef _VSMOD
+            if (sub->m_columns) text.Replace(L"\\|", L"|");
+#endif
+            ParseString(sub, text, tmp);
         }
+#ifdef _VSMOD
+        if (columnRow) sub->m_columns->NextCell(stss, true);
+#endif
 
         str = str.Mid(i);
     }
@@ -8128,6 +8518,7 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
 #endif
     sub->MakeLines(m_size, marginRect);
 #ifdef _VSMOD
+    if (!sub->m_columnBlocks.empty()) sub->ArrangeColumns();
     if (!sub->m_rubyGroups.empty() && !sub->m_verticalLaidOut)
         sub->PlaceHorizontalRuby();
     sub->CurveLines();

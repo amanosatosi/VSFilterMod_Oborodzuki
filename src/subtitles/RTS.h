@@ -29,6 +29,9 @@
 #include "RenderGeometry.h"
 #include "ShapedText.h"
 #include "Furigana.h"
+#ifdef _VSMOD
+#include "ColumnLayout.h"
+#endif
 #include "..\SubPic\ISubPic.h"
 
 class CMyFont : public CFont
@@ -119,9 +122,24 @@ public:
     CRect RubyClip(const CRect& clip, int x, int y) const;
     bool m_verticalWord = false;
     unsigned m_rubyGroup = 0;
+    unsigned m_columnCell = 0;
     int VerticalPaintSplit(int y, double progress) const
     {
-        return ((y + mOffsetY + 4) >> 3) + int(progress * mOverlayHeight);
+        const int top = m_layoutPlacement && m_layoutPlacement->clipStart != INT_MIN ?
+            m_layoutPlacement->clipStart : mOffsetY;
+        const int bottom = m_layoutPlacement && m_layoutPlacement->clipEnd != INT_MAX ?
+            m_layoutPlacement->clipEnd : mOffsetY + mOverlayHeight * 8;
+        return (y + top + int(progress * (bottom - top)) + 4) >> 3;
+    }
+    int HorizontalRubyPaintSplit(int fallback, double progress) const
+    {
+        if (!m_layoutPlacement || (m_layoutPlacement->clipStart == INT_MIN &&
+                m_layoutPlacement->clipEnd == INT_MAX))
+            return fallback;
+        const int left = m_layoutPlacement->clipStart == INT_MIN ? mOffsetX : m_layoutPlacement->clipStart;
+        const int right = m_layoutPlacement->clipEnd == INT_MAX ?
+            mOffsetX + mOverlayWidth * 8 : m_layoutPlacement->clipEnd;
+        return (left - mOffsetX + int(progress * (right - left))) >> 3;
     }
     bool PrepareProjectedPath(const RenderGeometry::Perspective& projection, CPoint relativeOrigin,
         CPoint position, int64_t& areaBudget);
@@ -306,6 +324,9 @@ public:
     Furigana::Options m_rubyOptions;
     bool m_keepRubyKaraoke = false;
     void PlaceHorizontalRuby();
+    std::vector<std::unique_ptr<SemanticColumns::Block>> m_columnBlocks;
+    SemanticColumns::Block* m_columns = nullptr;
+    void ArrangeColumns();
     double m_clipOffsetX = 0, m_clipOffsetY = 0;
     bool m_hasRectClip = false;
     struct LineAlignment { int first, inherited, full; };
