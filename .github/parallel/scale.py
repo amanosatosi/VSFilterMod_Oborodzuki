@@ -75,7 +75,7 @@ subprocess.run(["hosts/concurrent.exe", DLL, str((ROOT / "overlap-32.ass").resol
 baseline = str(Path("threading-baseline/renderer/renderer.dll").resolve(strict=True))
 dlls = {"baseline": baseline, "candidate": DLL}
 comparable = [workers for workers in WORKERS if workers <= cpu]
-quick = os.environ.get("PARALLEL_QUICK") == "true" and os.environ.get("PARALLEL_FULL") != "true"
+quick = os.environ.get("PARALLEL_QUICK") == "true"
 fixture_names = ("idle", "static", "animated", "overlap-16", "blend", "mixed", "lua") if quick else tuple(scenarios)
 settings = [(revision, workers) for workers in (comparable if quick else WORKERS)
             for revision in dlls if revision == "candidate" or workers in comparable]

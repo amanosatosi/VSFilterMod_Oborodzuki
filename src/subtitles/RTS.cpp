@@ -3680,7 +3680,8 @@ bool ReadOutlineTag(const CStringW& name, OutlineTag& tag)
 {
     const wchar_t* p = name;
     int number = 1;
-    if (wcsncmp(p, L"bb", 2))
+    const bool numbered = wcsncmp(p, L"bb", 2) != 0;
+    if (numbered)
     {
         if ((*p < L'1' || *p > L'9') && *p < 128)
             return false;
@@ -3726,7 +3727,9 @@ bool ReadOutlineTag(const CStringW& name, OutlineTag& tag)
     }
     if (*p++ != L'b')
         return false;
-    tag.box = *p == L'b';
+    // Native bblur and bbe start with the same two letters as box rings.
+    const bool filter = numbered && (!wcsncmp(p, L"blur", 4) || !wcsncmp(p, L"be", 2));
+    tag.box = *p == L'b' && !filter;
     if (tag.box) ++p;
     static constexpr struct { const wchar_t* name; P property; } names[] = {
         {L"pgrds", P::Slide}, {L"grds", P::Slide}, {L"gas", P::AlphaSlide}, {L"vcs", P::Slide}, {L"vas", P::AlphaSlide},
