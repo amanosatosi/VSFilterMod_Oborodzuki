@@ -3131,12 +3131,18 @@ CRect CScreenLayoutAllocator::AllocRect(CSubtitle* s, int segment, int entry, in
 
 // CRenderedTextSubtitle
 
+enum class ExtensionTag : unsigned char { None, Box, Outline, Gradient, Decoration };
+
 struct OverrideTag {
     CStringW rawCommand;
     CStringW command;
     std::vector<CStringW> parameters;
     int rawCount;
     bool parenthesized = false;
+    ExtensionTag extension = ExtensionTag::None;
+    bool unicodeNumber = false;
+    bool extendedScalar = false;
+    bool extendedArguments = false;
 };
 
 using OverrideTags = std::vector<OverrideTag>;
@@ -4022,6 +4028,37 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
         str.Replace(L"\\~", L"~");
 #endif
     auto result = std::make_shared<OverrideTags>();
+    const auto append = [&](OverrideTag tag) {
+#ifdef _VSMOD
+        const auto& cmd = tag.command;
+        PaintTag paint{};
+        OutlineTag outline;
+        bool inverse;
+        CStringW argument;
+        if (EventBoxTag(cmd))
+            tag.extension = ExtensionTag::Box;
+        else if (ReadOutlineTag(cmd, outline))
+            tag.extension = ExtensionTag::Outline;
+        else if (ReadPaintTag(cmd, paint))
+            tag.extension = ExtensionTag::Gradient;
+        else if (ReadDecorationScalar(cmd, inverse, argument))
+            tag.extension = ExtensionTag::Decoration;
+        if (!tag.parameters.empty())
+        {
+            const auto& p = tag.parameters.front();
+            const wchar_t first = p.IsEmpty() ? 0 : p[0];
+            tag.unicodeNumber = (first >= 128 || first == L'+' || first == L'-' ||
+                (first >= L'0' && first <= L'9')) && AssNumeric::HasNonAscii(p);
+            tag.extendedScalar = first == L'~' || tag.unicodeNumber ||
+                (first && tag.parenthesized && ExtendedNumber(p));
+            if (cmd == L"t")
+                tag.extendedArguments = std::any_of(tag.parameters.begin(), tag.parameters.end() - 1, ExtendedNumber);
+            else if (cmd == L"clip" || cmd == L"iclip" || cmd == L"pos" || cmd == L"move" || cmd == L"org")
+                tag.extendedArguments = std::any_of(tag.parameters.begin(), tag.parameters.end(), ExtendedNumber);
+        }
+#endif
+        result->push_back(std::move(tag));
+    };
     for(int i = 0, j; (j = str.Find('\\', i)) >= 0; i = j)
     {
         CStringW cmd;
@@ -4069,7 +4106,7 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
                     if (str[j] == L')')
                     {
                         const int count = int(fields.size());
-                        result->push_back({cmd, cmd, std::move(fields), count, true});
+                        append({cmd, cmd, std::move(fields), count, true});
                     }
                     continue;
                 }
@@ -4102,7 +4139,7 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
         if (EventBoxTag(cmd) || ReadOutlineTag(cmd, outline) ||
             (ReadPaintTag(cmd, paint) && paint.positioned))
         {
-            result->push_back({cmd, cmd, std::move(params), rawCount});
+            append({cmd, cmd, std::move(params), rawCount});
             continue;
         }
 #endif
@@ -4270,7 +4307,7 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
         else if(!cmd.Find(L"ortho")) // vpatch v001. ortho
             params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
 #endif
-        result->push_back({rawCommand, cmd, std::move(params), rawCount, parenthesized});
+        append({rawCommand, cmd, std::move(params), rawCount, parenthesized});
     }
     return result;
 }
@@ -4474,13 +4511,10 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         CStringW p = params.size() > 0 ? params[0] : L"";
 
 #ifdef _VSMOD
-        const wchar_t first = p.IsEmpty() ? 0 : p[0];
-        const bool unicodeNumber = (first >= 128 || first == L'+' || first == L'-' ||
-            (first >= L'0' && first <= L'9')) && AssNumeric::HasNonAscii(p);
-        if (unicodeNumber && (cmd == L"an" || cmd == L"a" || cmd == L"kt" || cmd == L"k" || cmd == L"kO" ||
+        if (tag.unicodeNumber && (cmd == L"an" || cmd == L"a" || cmd == L"kt" || cmd == L"k" || cmd == L"kO" ||
             cmd == L"K" || cmd == L"kf" || cmd == L"ko" || cmd == L"p" || cmd == L"q"))
             p = NormalizeNumericDigits(p);
-        if (first == L'~' || unicodeNumber || (first && tag.parenthesized && ExtendedNumber(p)))
+        if (tag.extendedScalar)
         {
             AssNumeric::Operand operand;
             bool handled = false;
@@ -4564,12 +4598,12 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             }
         }
 
-        bool decorationAlpha;
-        CStringW decorationArgument;
-        if (cmd.GetLength() >= 2 && (cmd[0] == L'5' || cmd[0] >= 128) &&
-            ReadDecorationScalar(cmd, decorationAlpha, decorationArgument))
+        if (tag.extension == ExtensionTag::Decoration)
         {
             using namespace KfxPaint;
+            bool decorationAlpha;
+            CStringW decorationArgument;
+            ReadDecorationScalar(cmd, decorationAlpha, decorationArgument);
             if (params.size() > 1 || (!params.empty() && !decorationArgument.IsEmpty())) continue;
             const auto& argument = params.empty() ? decorationArgument : p;
             const auto progress = paintProgress();
@@ -4591,7 +4625,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             continue;
         }
 
-        if (EventBoxTag(cmd))
+        if (tag.extension == ExtensionTag::Box)
         {
             const wchar_t* name = cmd;
             if (!wcsncmp(name, L"bs", 2))
@@ -4654,11 +4688,12 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             continue;
         }
 
-        OutlineTag outline;
-        if (ReadOutlineTag(cmd, outline))
+        if (tag.extension == ExtensionTag::Outline)
         {
             using P = OutlineProperty;
             using namespace KfxPaint;
+            OutlineTag outline;
+            ReadOutlineTag(cmd, outline);
             const auto property = outline.property;
             const bool base = !outline.box && outline.layer == 0;
             const int channel = outline.box ? 3 : 2;
@@ -4844,9 +4879,10 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             continue;
         }
 
-        PaintTag paint{};
-        if (ReadPaintTag(cmd, paint))
+        if (tag.extension == ExtensionTag::Gradient)
         {
+            PaintTag paint{};
+            ReadPaintTag(cmd, paint);
             if (paint.slide)
             {
                 if (params.size() > 1 || (!params.empty() && !paint.argument.IsEmpty())) continue;
@@ -5331,7 +5367,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 }
 #ifdef _VSMOD
                 sub->m_hasRectClip = true;
-                if (std::any_of(params.begin(), params.end(), ExtendedNumber))
+                if (tag.extendedArguments)
                 {
                     const LONG previous[] = {sub->m_clip.left, sub->m_clip.top, sub->m_clip.right, sub->m_clip.bottom};
                     double resolved[4];
@@ -5852,7 +5888,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             if (sub->m_motion && (sub->m_motion->shifted || sub->m_motion->hasMove))
                 continue;
             if ((params.size() == 4 || params.size() == 6) && !sub->m_effects[EF_MOVE] &&
-                std::any_of(params.begin(), params.end(), ExtendedNumber))
+                tag.extendedArguments)
             {
                 AssMotion::Move move{};
                 AssNumeric::Operand* args[] = {&move.x1, &move.y1, &move.x2, &move.y2};
@@ -5919,7 +5955,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         else if(cmd == L"org") // {\org(x=param[0], y=param[1])}
         {
 #ifdef _VSMOD // patch f003. moving \org for some karaoke effects. part 1
-            if (params.size() == 2 && (ExtendedNumber(params[0]) || ExtendedNumber(params[1])))
+            if (params.size() == 2 && tag.extendedArguments)
             {
                 std::array<AssNumeric::Operand, 2> next;
                 if (!readOperand(params[0], false, false, next[0]) || !readOperand(params[1], false, false, next[1]))
@@ -5981,7 +6017,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         else if(cmd == L"pos")
         {
 #ifdef _VSMOD
-            if (params.size() == 2 && (fAnimate || ExtendedNumber(params[0]) || ExtendedNumber(params[1])))
+            if (params.size() == 2 && (fAnimate || tag.extendedArguments))
             {
                 AssNumeric::Operand x, y;
                 if (!readOperand(params[0], false, false, x) || !readOperand(params[1], false, false, y))
@@ -6177,7 +6213,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 
 #ifdef _VSMOD
             bool valid = true;
-            if (params.size() >= 2 && params.size() <= 4)
+            if (tag.extendedArguments && params.size() >= 2 && params.size() <= 4)
                 for (size_t i = 0; i + 1 < params.size(); ++i)
                 {
                     if (!ExtendedNumber(params[i])) continue;
