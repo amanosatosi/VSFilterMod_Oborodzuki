@@ -37,6 +37,10 @@ jobs:
           move bundle hosts || exit /b 1
           cl /nologo /std:c++17 /O2 /EHsc /MT /Ibenchmark-source\libass .github\ci\render-bench.cpp /Fe:hosts\render-bench.exe || exit /b 1
           cl /nologo /std:c++17 /O2 /EHsc /MT .github\parallel\concurrent.cpp /Fe:hosts\concurrent.exe user32.lib || exit /b 1
+          if "%GITHUB_REF_NAME%"=="codex/kfx-paint-extensions" (
+            cl /nologo /std:c++17 /O2 /EHsc /MT .github\parallel\paint-math.cpp /Fe:hosts\paint-math.exe || exit /b 1
+            hosts\paint-math.exe || exit /b 1
+          )
       - uses: actions/upload-artifact@v4
         with:
           name: parallel-hosts-${{ github.sha }}
@@ -68,6 +72,17 @@ jobs:
              image = $env:ImageVersion
              ram = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
              revision = $env:GITHUB_SHA } | ConvertTo-Json -Depth 4 | Set-Content parallel-results/environment.json
+      - name: Download the pinned Mangetsu paint reference
+        if: github.ref_name == 'codex/kfx-paint-extensions'
+        uses: actions/download-artifact@v4
+        with:
+          name: renderer-mangetsu-60e06ef0d4535c5403f446fd46b996df4d0d2560
+          run-id: 44199501683
+          github-token: ${{ github.token }}
+          path: mangetsu-paint
+      - name: Compare KFX paint pixels, seeks and worker budgets
+        if: github.ref_name == 'codex/kfx-paint-extensions'
+        run: python .github/parallel/paint-check.py
       - name: Reuse pre-threading renderer for a same-runner reference
         if: env.PARALLEL_FULL == 'true'
         shell: pwsh
@@ -121,6 +136,13 @@ jobs:
               Set-Content "worker-profile/mixed-$workers.json"
             if ($LASTEXITCODE) { throw 'Instrumented mixed workload failed' }
           }
+      - name: Profile the KFX paint stages
+        if: github.ref_name == 'codex/kfx-paint-extensions'
+        shell: pwsh
+        run: |
+          python .github/parallel/paint-check.py --profile
+          if ($LASTEXITCODE) { throw 'Instrumented paint workload failed' }
+          Copy-Item parallel-results/paint/paint-profile.json worker-profile/paint-profile.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:

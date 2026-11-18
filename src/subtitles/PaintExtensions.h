@@ -8,6 +8,7 @@
 #include <memory>
 #include <utility>
 #include <vector>
+#include "RenderProfile.h"
 
 namespace KfxPaint
 {
@@ -81,6 +82,7 @@ struct Fade
 
 inline Value SampleStops(const Paint& paint, double t, bool alpha, bool round)
 {
+    PROFILE_RENDER_STAGE(PaintStops);
     const auto& stops = paint.stops;
     if (t <= stops.front().position)
         return stops.front().value;
@@ -100,7 +102,9 @@ inline Paint Interpolate(const Paint* from, const Paint& to, Value solid, double
     if (from)
     {
         const auto delta = std::fmod(to.angle - from->angle, 360.0);
-        result.angle = from->angle + t * (delta > 180 ? delta - 360 : delta < -180 ? delta + 360 : delta);
+        result.angle = std::fmod(from->angle +
+            t * (delta > 180 ? delta - 360 : delta < -180 ? delta + 360 : delta), 360.0);
+        if (result.angle < 0) result.angle += 360;
     }
     auto add = [&](double position) {
         if (!result.stops.empty() && std::abs(result.stops.back().position - position) < 0.000001)
@@ -110,9 +114,7 @@ inline Paint Interpolate(const Paint* from, const Paint& to, Value solid, double
             result.stops.back().position = 1;
             return;
         }
-        const Value first = from ? SampleStops(*from, position, alpha, false) : solid;
-        const Value last = SampleStops(to, position, alpha, false);
-        result.stops.push_back({position, Mix(first, last, t, alpha, false)});
+        result.stops.push_back({position, 0});
     };
     size_t i = 0, j = 0;
     while ((from && i < from->stops.size()) || j < to.stops.size())
@@ -124,6 +126,12 @@ inline Paint Interpolate(const Paint* from, const Paint& to, Value solid, double
             add(to.stops[j++].position);
     }
     add(1);
+    for (auto& stop : result.stops)
+    {
+        const Value first = from ? SampleStops(*from, stop.position, alpha, false) : solid;
+        const Value last = SampleStops(to, stop.position, alpha, false);
+        stop.value = Mix(first, last, t, alpha, false);
+    }
     return result;
 }
 
@@ -178,7 +186,12 @@ class Sampler
                 }
                 return value;
             }
-            return SampleStops(*paint, Unit(axis.At(x, y) * axis.inverseSpan), alpha, true);
+            double t;
+            {
+                PROFILE_RENDER_STAGE(PaintProjection);
+                t = Unit(axis.At(x, y) * axis.inverseSpan);
+            }
+            return SampleStops(*paint, t, alpha, true);
         }
     };
     struct Wipe
@@ -190,10 +203,12 @@ class Sampler
     Endpoint start;
     std::vector<Wipe> wipes;
     bool alpha = false;
+    bool corners = false;
 
 public:
     void Prepare(const Paint* paint, Rect bounds, double sx, double sy, bool inverseAlpha)
     {
+        PROFILE_RENDER_STAGE(PaintProjection);
         alpha = inverseAlpha;
         for (; paint->kind == Paint::Kind::Slide; paint = paint->from.get())
         {
@@ -202,25 +217,33 @@ public:
                 1 / std::hypot(axis.dx / sx, axis.dy / sy) : 0);
             const double limit = (std::numeric_limits<double>::max)() / 2;
             const double width = (std::min)(limit, paint->width * scale);
+            corners |= paint->to->kind == Paint::Kind::Corners;
             wipes.push_back({Endpoint(paint->to.get(), bounds), axis, width,
                 paint->progress * axis.span + paint->progress * width});
         }
         start = Endpoint(paint, bounds);
+        corners |= paint->kind == Paint::Kind::Corners;
     }
 
     bool Active() const { return start.paint != nullptr; }
+    bool UsesCorners() const { return corners; }
 
     Value At(double x, double y, double u, double v) const
     {
+        if (wipes.empty())
+            return start.At(x, y, u, v, alpha);
         std::array<double, MaxSlides> weights;
         size_t first = 0;
-        for (; first < wipes.size(); ++first)
         {
-            const auto& wipe = wipes[first];
-            const double distance = wipe.edge - wipe.axis.At(x, y);
-            weights[first] = distance <= 0 ? 0 : distance >= wipe.width ? 1 : distance / wipe.width;
-            if (weights[first] == 1)
-                break;
+            PROFILE_RENDER_STAGE(PaintProjection);
+            for (; first < wipes.size(); ++first)
+            {
+                const auto& wipe = wipes[first];
+                const double distance = wipe.edge - wipe.axis.At(x, y);
+                weights[first] = distance <= 0 ? 0 : distance >= wipe.width ? 1 : distance / wipe.width;
+                if (weights[first] == 1)
+                    break;
+            }
         }
         const auto& base = first < wipes.size() ? wipes[first].target : start;
         Value value = base.At(x, y, u, v, alpha);

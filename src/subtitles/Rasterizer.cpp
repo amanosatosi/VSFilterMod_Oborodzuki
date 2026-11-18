@@ -1176,20 +1176,26 @@ class COverlayKfxPaint : public COverlayGetter
         const auto& alpha = samplers[slice][1];
         const int channel = Channel(slice);
         const DWORD solid = draw.info.sw[slice * 2];
-        const bool useLegacy = gradient.paint ? gradient.mode[channel] != 0 :
-            gradient.mode[draw.colorType] || (draw.colorType == 0 && gradient.mode[1]);
-        const DWORD legacy = useLegacy ? gradient.getmixcolor(x, y, channel) : solid;
         const unsigned bits = gradient.legacyParts >> (2 * channel);
         const bool image = gradient.mode[channel] == 2;
-        const bool combinedLegacy = !gradient.paint;
-        DWORD color = (combinedLegacy || image || (bits & 1) ? legacy : solid) & 0xFFFFFF;
-        DWORD opacity = (combinedLegacy || image || (bits & 2) ? legacy : solid) >> 24;
+        const bool previousShader = !gradient.paint &&
+            (gradient.mode[draw.colorType] || (draw.colorType == 0 && gradient.mode[1]));
+        const bool legacyRgb = !rgb.Active() && (previousShader || image || (bits & 1));
+        const bool legacyAlpha = !alpha.Active() && (previousShader || image || (bits & 2));
+        const DWORD legacy = (legacyRgb || legacyAlpha) && (gradient.mode[channel] || previousShader) ?
+            gradient.getmixcolor(x, y, channel) : solid;
+        DWORD color = (legacyRgb ? legacy : solid) & 0xFFFFFF;
+        DWORD opacity = (legacyAlpha ? legacy : solid) >> 24;
         if (rgb.Active() || alpha.Active())
         {
             const double px = draw.bounds.left + x + 0.5;
             const double py = draw.bounds.bottom - y - 0.5;
-            const double u = KfxPaint::Unit(double(gradient.xoffset + x) / gradient.width);
-            const double v = KfxPaint::Unit(1.0 - double(y) / gradient.height);
+            double u = 0, v = 0;
+            if (rgb.UsesCorners() || alpha.UsesCorners())
+            {
+                u = KfxPaint::Unit(double(gradient.xoffset + x) / gradient.width);
+                v = KfxPaint::Unit(1.0 - double(y) / gradient.height);
+            }
             if (rgb.Active()) color = rgb.At(px, py, u, v);
             if (alpha.Active())
                 opacity = ((255 - alpha.At(px, py, u, v)) * (255 - gradient.fadalpha) + 127) / 255;
@@ -1333,6 +1339,7 @@ CRect Rasterizer::Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int x
             hasField = hasField || bool(parts[part]);
         if (hasField)
         {
+            PROFILE_RENDER_STAGE(PaintBounds);
             int left = w, right = 0, top = h, bottom = 0;
             const int offset = fBorder ? 1 : 0;
             for (int row = 0; row < h; ++row)
@@ -1528,6 +1535,7 @@ void MOD_MOVEVC::clear()
 
 byte MOD_MOVEVC::GetAlphaValue(int wx, int wy) const
 {
+    PROFILE_RENDER_STAGE(PaintClip);
     byte alpham;
     if(!enable)
     {

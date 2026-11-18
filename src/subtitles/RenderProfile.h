@@ -24,6 +24,10 @@ enum class RenderStage {
     GlyphPathHit,
     EventPaint,
     BandPlan,
+    PaintBounds,
+    PaintProjection,
+    PaintStops,
+    PaintClip,
     Count
 };
 
@@ -31,7 +35,8 @@ constexpr const char* RenderStageNames[] = {
     "frame_other", "subtitle_other", "text_measure_other", "glyph_path_other",
     "transform", "scan_convert", "widen_outline", "rasterize", "blur", "composite",
     "active_events", "overrides", "animation", "layout", "collision", "mask", "cache",
-    "gdi_metrics", "gdi_path", "text_measure_hit", "glyph_path_hit", "event_paint", "band_plan"
+    "gdi_metrics", "gdi_path", "text_measure_hit", "glyph_path_hit", "event_paint", "band_plan",
+    "paint_bounds", "paint_projection", "paint_stops", "sample_clip"
 };
 static_assert(sizeof(RenderStageNames) / sizeof(*RenderStageNames) == static_cast<unsigned>(RenderStage::Count),
     "Missing render stage name");
