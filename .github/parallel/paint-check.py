@@ -283,6 +283,18 @@ if ROUND2:
         close(moving(frame, "moving", x), rgb)
         close(fixed_reference(frame, "moving", x), rgb)
 
+    numeric = write("numeric-overrides", [
+        (120, 90, r"\1c$white\bord($height/20)\3c&H0000FF&\3a$0\2bs~+3"
+                  r"\2bc&H00FF00&\t(0,25%,\2bs~+4)\p1", BOX),
+    ])
+    playback("csri", CANDIDATE, numeric, ROOT / "numeric")
+    evaluated = captures(ROOT / "numeric", {"numbers": (120, 90)})
+    for frame, x, color in [
+        (60, -3, (255, 0, 0)), (60, -6, (0, 255, 0)), (60, -10, (0, 0, 0)),
+        (90, -9, (0, 255, 0)), (120, -11, (0, 255, 0)),
+    ]:
+        close(evaluated(frame, "numbers", x, 50), color)
+
 for frame, color in [(60, 2), (120, 0)]:
     assert sum(new(frame, "karaoke", x, y)[color] > 200
                for x in range(250) for y in range(85)) > 100, "karaoke channel unavailable"

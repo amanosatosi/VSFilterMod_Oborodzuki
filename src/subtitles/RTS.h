@@ -24,6 +24,7 @@
 #include <memory>
 #include "STS.h"
 #include "Rasterizer.h"
+#include "NumericExpression.h"
 #include "..\SubPic\ISubPic.h"
 
 class CMyFont : public CFont
@@ -227,6 +228,8 @@ public:
     int m_boxMode = -1;
     bool m_revealKaraoke = false;
     std::vector<std::unique_ptr<CWord>> m_eventBox;
+    std::unique_ptr<AssNumeric::Context> m_layoutVariables;
+    bool m_measuringLayout = false;
     void CreateEventBox(int borderStyle, int time, bool scaledBorder);
 #endif
     int m_scrAlignment;
@@ -303,6 +306,7 @@ class CRenderedTextSubtitle : public CSimpleTextSubtitle, public ISubPicProvider
     // temp variables, used when parsing the script
     int m_time, m_delay;
     int m_animStart, m_animEnd;
+    bool m_exactAnimationEnd = false;
     double m_animAccel;
     int m_ktype, m_kstart, m_kend;
     int m_nPolygon;
@@ -323,7 +327,7 @@ class CRenderedTextSubtitle : public CSimpleTextSubtitle, public ISubPicProvider
 
     double CalcAnimation(double dst, double src, bool fAnimate);
 
-    CSubtitle* GetSubtitle(int entry);
+    CSubtitle* GetSubtitle(int entry, bool measuringLayout = false);
 
 protected:
     virtual void OnChanged();
