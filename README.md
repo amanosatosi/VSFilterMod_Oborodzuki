@@ -2,6 +2,9 @@ VSFilterMod Oborodzuki, based on VSFilterMod by Vmoe Fansub
 
 New override tags: [wiki page](https://github.com/computerfan/VSFilterMod/wiki)
 
+The [KFX paint extensions guide](docs/kfx-paint-extensions.md) covers attached color and alpha
+gradients, sliding transforms, and extended color fades.
+
 Important note: **DO NOT use mod tags in a softsub (ASS file) distribution**, because most players just ignore them, and they may not efficient enough for real-time rendering.
 
 Base branches:

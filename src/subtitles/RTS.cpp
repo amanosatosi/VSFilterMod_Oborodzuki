@@ -1974,8 +1974,9 @@ CRect CLine::PaintShadow(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPo
             if(w->m_style.borderStyle == 0)
             {
 #ifdef _VSMOD // patch m004. gradient colors
+                const auto& paint = w->m_style.mod_grad.paint;
                 bbox |= w->Draw(spd, clipRect, pAlphaMask, x, y, sw,
-                                w->m_ktype > 0 || w->m_style.alpha[0] < 0xff,
+                                w->m_ktype > 0 || w->m_style.alpha[0] < 0xff || (paint && paint->parts[1]),
                                 (w->m_style.outlineWidthX + w->m_style.outlineWidthY > 0) && !(w->m_ktype == 2 && time < w->m_kstart), 3, w->m_style.mod_grad, mod_vc, w->m_style.mod_blendMode);
 #else
                 bbox |= w->Draw(spd, clipRect, pAlphaMask, x, y, sw,

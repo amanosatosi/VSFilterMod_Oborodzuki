@@ -44,14 +44,15 @@ heavy = write("animated-scenes", [
      t(gd(-30, BLUE, "65%", WHITE, RED), "2,") +
      rf"\t(200,1600,\1gra(0,&H10&,&H30&))\fad(400,300,{BLACK}+a,{WHITE})"
      r"\3grd(0,$white,$black)\4grd(90,$black,$white)\bord3\shad5"
-     r"\clip(160,80,1700,940)\blendadd\kf100",
+     r"\clip(m 160 80 l 1700 80 1700 940 160 940)\blendadd\kf100",
      "Paint scenes across workers")
     for i in range(20)
 ])
 legacy = write("animated-scenes-solid", [
     (100 + (i % 4) * 375, 65 + (i % 5) * 165,
      rf"\1c{RED}\t(0,1000,2,\1c{BLUE})\fad(400,300)"
-     r"\bord3\shad5\clip(160,80,1700,940)\blendadd\kf100", "Paint scenes across workers")
+     r"\bord3\shad5\clip(m 160 80 l 1700 80 1700 940 160 940)\blendadd\kf100",
+     "Paint scenes across workers")
     for i in range(20)
 ])
 
@@ -98,6 +99,8 @@ cases = {
     "outline-shadow": (gd(0, RED, BLUE) + r"\3grd(90,$white,$black)"
                        r"\4grd(0,&H00FF00&,&H00FF00&)\bord8\shad16\4a&H00&"),
     "alpha-slide": r"\1c&HFFFFFF&\1gra(0,&H00&,&H00&)\1gras0" + t(r"\1gra(0,&HC0&,&HC0&)"),
+    "raised-fill-alpha": (r"\1c&HFFFFFF&\1a&HFF&\1gra(0,&H00&,&H30&)"
+                          r"\4c&H00FF00&\4a&H00&\shad16"),
 }
 coords = {}
 entries = []
@@ -200,6 +203,7 @@ for case in ("union", "fade-gradient", "overlap"):
 
 close(new(90, "gradient-solid-ordinary", 25, 50), (111, 127, 16))
 close(new(120, "gradient-solid-ordinary"), (0, 255, 0))
+close(new(60, "raised-fill-alpha", 208, 108), (0, 255, 0))
 
 for frame, color in [(60, 2), (120, 0)]:
     assert sum(new(frame, "karaoke", x, y)[color] > 200
@@ -213,6 +217,7 @@ for x in (25, 100, 175):
     for y in (25, 50, 75):
         assert new(90, "legacy", x, y) == previous(90, "legacy", x, y)
 
+print("Analytic and Mangetsu pixel checks passed.", flush=True)
 expected_hashes = None
 for n in (1, 2, 4, 6, 8):
     hashes = benchmark(CANDIDATE, heavy, n, "regression")["hashes"]
@@ -220,6 +225,7 @@ for n in (1, 2, 4, 6, 8):
         expected_hashes = hashes
     assert hashes == expected_hashes, f"gradient seek/frame hashes differ at {n} workers"
 
+print("Backward seeks and five worker budgets produced identical hashes.", flush=True)
 results = []
 settings = [(scene, n) for n in (1, 2, 4) for scene in (legacy, heavy)]
 for trial in range(3):
