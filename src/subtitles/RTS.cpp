@@ -3069,10 +3069,43 @@ struct PaintTag
     CStringW argument;
 };
 
+int ReadDecimalDigit(const wchar_t*& p)
+{
+    unsigned codepoint = *p++;
+    if (codepoint >= 0xD800 && codepoint <= 0xDBFF && *p >= 0xDC00 && *p <= 0xDFFF)
+        codepoint = 0x10000 + ((codepoint - 0xD800) << 10) + (*p++ - 0xDC00);
+    // Unicode 17 Decimal_Number zero code points in ascending order.
+    static constexpr unsigned zeroes[] = {
+        0x30, 0x660, 0x6F0, 0x7C0, 0x966, 0x9E6, 0xA66, 0xAE6, 0xB66,
+        0xBE6, 0xC66, 0xCE6, 0xD66, 0xDE6, 0xE50, 0xED0, 0xF20, 0x1040,
+        0x1090, 0x17E0, 0x1810, 0x1946, 0x19D0, 0x1A80, 0x1A90, 0x1B50, 0x1BB0,
+        0x1C40, 0x1C50, 0xA620, 0xA8D0, 0xA900, 0xA9D0, 0xA9F0, 0xAA50, 0xABF0,
+        0xFF10, 0x104A0, 0x10D30, 0x10D40, 0x11066, 0x110F0, 0x11136, 0x111D0, 0x112F0,
+        0x11450, 0x114D0, 0x11650, 0x116C0, 0x116D0, 0x116DA, 0x11730, 0x118E0, 0x11950,
+        0x11BF0, 0x11C50, 0x11D50, 0x11DA0, 0x11DE0, 0x11F50, 0x16130, 0x16A60, 0x16AC0,
+        0x16B50, 0x16D70, 0x1CCF0, 0x1D7CE, 0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6, 0x1E140,
+        0x1E2F0, 0x1E4F0, 0x1E5F1, 0x1E950, 0x1FBF0,
+    };
+    const auto* after = std::upper_bound(zeroes, zeroes + sizeof(zeroes) / sizeof(*zeroes), codepoint);
+    if (after == zeroes || codepoint - after[-1] > 9)
+        return -1;
+    return int(codepoint - after[-1]);
+}
+
 bool ReadPaintTag(const CStringW& name, PaintTag& tag)
 {
     const wchar_t* p = name;
-    const int channel = *p >= L'1' && *p <= L'4' ? *p++ - L'0' : 0;
+    int channel = *p >= L'1' && *p <= L'4' ? *p++ - L'0' : 0;
+    if (*p >= 128 && channel == 0)
+    {
+        const auto* next = p;
+        const int digit = ReadDecimalDigit(next);
+        if (digit >= 1 && digit <= 4)
+        {
+            channel = digit;
+            p = next;
+        }
+    }
     if (*p != L'g' && *p != L'v') return false;
     const bool color = !wcsncmp(p, L"grd", 3);
     const bool alpha = !wcsncmp(p, L"gra", 3);
@@ -3146,13 +3179,23 @@ bool ReadPaintValue(const CStringW& text, bool alpha, KfxPaint::Value& result)
     const auto* first = p;
     unsigned value = 0;
     const unsigned limit = alpha ? 255 : 0xFFFFFF;
-    for (; *p && *p != L'&'; ++p)
+    while (*p && *p != L'&')
     {
         unsigned digit;
-        if (*p >= L'0' && *p <= L'9') digit = *p - L'0';
-        else if (!decimal && *p >= L'A' && *p <= L'F') digit = 10 + *p - L'A';
-        else if (!decimal && *p >= L'a' && *p <= L'f') digit = 10 + *p - L'a';
-        else return false;
+        if (decimal)
+        {
+            const int decoded = ReadDecimalDigit(p);
+            if (decoded < 0) return false;
+            digit = decoded;
+        }
+        else
+        {
+            const auto c = *p++;
+            if (c >= L'0' && c <= L'9') digit = c - L'0';
+            else if (c >= L'A' && c <= L'F') digit = 10 + c - L'A';
+            else if (c >= L'a' && c <= L'f') digit = 10 + c - L'a';
+            else return false;
+        }
         value = value * (decimal ? 10 : 16) + digit;
         if (value > limit) return false;
     }
@@ -5258,6 +5301,22 @@ struct FramePaint
     int entry;
 };
 
+#if defined(_VSMOD) && defined(_LUA)
+static bool HasLuaPixelHandler(CSubtitle& subtitle)
+{
+    POSITION line = subtitle.GetHeadPosition();
+    while (line)
+    {
+        auto* words = subtitle.GetNext(line);
+        POSITION word = words->GetHeadPosition();
+        while (word)
+            if (!words->GetNext(word)->LuaRendererHandler.IsEmpty())
+                return true;
+    }
+    return false;
+}
+#endif
+
 static CRect PaintFrameBands(EventWorkerPool& pool, const std::vector<FramePaint>& events, int height)
 {
     std::vector<OverlayDrawList> overlays(events.size());
@@ -5983,8 +6042,8 @@ try
             bool collectSegments = s->m_paintSegments != 0;
 #ifdef _LUA
             // A Lua pixel callback can read the destination during the draw.
-            collectSegments = collectSegments && !hasExternalLua &&
-                !(m_doOverrideStyle && m_pStyleOverride && !m_pStyleOverride->LuaRendererHandler.IsEmpty());
+            if (collectSegments && (hasExternalLua || m_doOverrideStyle))
+                collectSegments = !HasLuaPixelHandler(*s);
 #endif
             auto paintExtended = [=]() mutable {
                 const OverlayPaintScope context(paintFade, s->m_scalex, s->m_scaley);

@@ -31,7 +31,7 @@ def write(name, entries):
     for index, (x, y, tags, body) in enumerate(entries):
         ass += f"Dialogue: {index % 3},0:00:01.00,0:00:05.00,Default,,0,0,0,,"
         ass += rf"{{\an7\pos({x},{y})\bord0\shad0{tags}}}" + body + "\n"
-    path.write_text(ass, encoding="utf-8")
+    path.write_text(ass, encoding="utf-8-sig")
     return path.resolve(), len(entries)
 
 
@@ -73,7 +73,7 @@ if sys.argv[1:] == ["--profile"]:
 cases = {
     "linear": linear,
     "repeat": gd(0, RED, "45%", GREEN, "45%", BLUE, WHITE),
-    "alpha": r"\1c&HFFFFFF&\1gra(0,$0,&HFF&)",
+    "alpha": r"\1c&HFFFFFF&\１gra(0,$０,$၂၅၅)",
     "reset": linear + r"\1c&H00FF00&\1gra(0,&H40&,&HC0&)\1gra()",
     "malformed": linear + r"\grd(0,$white,45,,$black)\grd(90,$white,$black",
     "angle": gd(350, RED, BLUE) + t(gd(10, RED, BLUE)),
@@ -85,6 +85,7 @@ cases = {
     "overlap": slide + r"\t(250,1250,\1grd(90,&H00FF00&,&H00FF00&))",
     "solid-slide": rf"\1c{RED}\grds0" + t(gd(0, BLUE, BLUE)),
     "gradient-solid": gd(0, RED, RED) + r"\grds0" + t(rf"\1c{BLUE}"),
+    "gradient-solid-ordinary": gd(0, RED, BLUE) + t(rf"\1c{GREEN}"),
     "fade": fade,
     "fade-alpha": fade.replace(WHITE, WHITE + "+a"),
     "fade-bad": fade.replace(WHITE, "invalid"),
@@ -92,26 +93,29 @@ cases = {
     "fade-gradient": linear + rf"\fad(1000,1000,{WHITE},{BLACK})" + t(gd(90, BLUE, RED)),
     "legacy": r"\1vc(&H0000FF&,&H00FF00&,&HFF0000&,&HFFFFFF&)\1va(0,30,60,90)",
     "clip": linear,
+    "vector-clip": linear,
     "names": gd(0, "$SHIRO", "$kuro"),
     "outline-shadow": (gd(0, RED, BLUE) + r"\3grd(90,$white,$black)"
-                       r"\4grd(0,&H00FF00&,&H00FF00&)\bord8\shad16"),
+                       r"\4grd(0,&H00FF00&,&H00FF00&)\bord8\shad16\4a&H00&"),
     "alpha-slide": r"\1c&HFFFFFF&\1gra(0,&H00&,&H00&)\1gras0" + t(r"\1gra(0,&HC0&,&HC0&)"),
 }
 coords = {}
 entries = []
 for i, (case, tags) in enumerate(cases.items()):
-    x, y = 75 + (i % 5) * 340, 60 + (i // 5) * 190
+    x, y = 75 + (i % 5) * 340, 60 + (i // 5) * 163
     coords[case] = (x, y)
     if case == "clip":
         tags += rf"\clip({x+80},{y},{x+200},{y+100})"
+    if case == "vector-clip":
+        tags += rf"\clip(m {x+80} {y} l {x+200} {y} {x+200} {y+100} {x+80} {y+100})"
     if case == "malformed":
         # Keep the unclosed tag at the end of the override block.
         tags = r"\p1" + tags
     else:
         tags += r"\p1"
     entries.append((x, y, tags, BOX))
-coords["karaoke"] = (1400, 845)
-entries.append((1400, 845, r"\fs64\kf100\1grd(0,&H0000FF&,&H0000FF&)\2grd(0,&HFF0000&,&HFF0000&)", "MMMM"))
+coords["karaoke"] = (1350, 960)
+entries.append((1350, 960, r"\fs64\kf100\1grd(0,&H0000FF&,&H0000FF&)\2grd(0,&HFF0000&,&HFF0000&)", "MMMM"))
 grid = write("pixel-grid", entries)
 frames = [60, 75, 90, 120, 270]
 
@@ -162,6 +166,9 @@ probes = [
     (90, "inherit", 25, 50, (0, 0, 255)),
     (90, "solid-slide", 25, 50, (0, 0, 255)),
     (90, "gradient-solid", 25, 50, (0, 0, 255)),
+    (90, "overlap", 25, 20, (0, 255, 0)),
+    (90, "overlap", 25, 70, (0, 0, 255)),
+    (90, "overlap", 175, 70, (255, 0, 0)),
     (60, "fade", 100, 50, (255, 255, 255)),
     (90, "fade", 100, 50, (255, 127, 127)),
     (270, "fade", 100, 50, (127, 0, 0)),
@@ -170,9 +177,13 @@ probes = [
     (60, "fade-empty", 100, 50, (0, 0, 0)),
     (60, "clip", 25, 50, (0, 0, 0)),
     (60, "clip", 100, 50, (127, 0, 128)),
+    (60, "vector-clip", 25, 50, (0, 0, 0)),
+    (60, "vector-clip", 100, 50, (127, 0, 128)),
     (60, "names", 25, 50, (223, 223, 223)),
     (90, "alpha-slide", 25, 50, (63, 63, 63)),
     (90, "alpha-slide", 175, 50, (255, 255, 255)),
+    (60, "outline-shadow", -4, 50, (127, 127, 127)),
+    (60, "outline-shadow", 213, 108, (0, 255, 0)),
 ]
 for frame, case, x, y, expected in probes:
     try:
@@ -185,7 +196,10 @@ for frame, case, x, y, expected in probes:
 for case in ("union", "fade-gradient", "overlap"):
     for x, y in [(25,20), (155,45), (80,78)]:
         close(new(90, case, x, y), reference(90, case, x, y), tolerance=14)
-    assert new(60, case, 100, 50) != new(90, case, 100, 50), case
+    assert new(60, case, 25, 20) != new(90, case, 25, 20), case
+
+close(new(90, "gradient-solid-ordinary", 25, 50), (111, 127, 16))
+close(new(120, "gradient-solid-ordinary"), (0, 255, 0))
 
 for frame, color in [(60, 2), (120, 0)]:
     assert sum(new(frame, "karaoke", x, y)[color] > 200

@@ -1249,19 +1249,26 @@ void OverlayDraw::Blend(int top, int bottom) const
     // The mixers count down from the bottom of the original clipped draw.
     band.rowOffset = bounds.bottom - last;
 
-    COverlayColor solid(band.sw[0], band.sw[2]);
-    COverlayGetter* color = &solid;
 #ifdef _VSMOD
+    const bool legacyShading = gradient.mode[colorType] || (colorType == 0 && gradient.mode[1]);
+    auto fadeSolid = [&](DWORD source) {
+        return (source & 0xFF000000u) |
+            KfxPaint::Mix(source & 0xFFFFFF, paintFade.color, paintFade.amount, false, false);
+    };
+    COverlayColor solid(fadeSolid(band.sw[0]), fadeSolid(band.sw[2]));
+    COverlayGetter* color = &solid;
     COverlayGradient shaded(gradient, colorType);
-    if (gradient.mode[colorType] || (colorType == 0 && gradient.mode[1]))
+    if (legacyShading)
         color = &shaded;
     COverlayAlpha mask(maskPosition);
 #else
+    COverlayColor solid(band.sw[0], band.sw[2]);
+    COverlayGetter* color = &solid;
     COverlayAlpha mask(alphaMask, maskPitch, info.h);
 #endif
     auto* alpha = alphaMask ? &mask : nullptr;
 #ifdef _VSMOD
-    if (gradient.paint || paintFade.amount > 0)
+    if (gradient.paint || (legacyShading && paintFade.amount > 0))
     {
         if (gradient.paint && band.sw[1] != 0xffffffff)
         {

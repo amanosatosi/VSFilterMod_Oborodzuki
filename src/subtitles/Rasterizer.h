@@ -116,6 +116,8 @@ public:
     const double scaleX, scaleY;
     OverlayPaintScope(KfxPaint::Fade fade, double sx, double sy);
     ~OverlayPaintScope();
+    OverlayPaintScope(const OverlayPaintScope&) = delete;
+    OverlayPaintScope& operator=(const OverlayPaintScope&) = delete;
 };
 
 bool IsCapturingOverlays();
