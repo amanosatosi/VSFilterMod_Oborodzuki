@@ -15,6 +15,7 @@ HOST = Path("hosts/kfx-playback.exe").resolve()
 BENCH = Path("hosts/render-bench.exe").resolve()
 CANDIDATE = Path("renderer/renderer.dll").resolve()
 MANG = Path("mangetsu-paint/renderer.dll").resolve()
+ROUND2 = os.environ.get("KFX_ROUND2") == "true"
 
 
 def gd(angle, *stops):
@@ -109,6 +110,15 @@ cases = {
     "raised-fill-alpha": (r"\1c&HFFFFFF&\1a&HFF&\1gra(0,&H00&,&H30&)"
                           r"\4c&H00FF00&\4a&H00&\shad16"),
 }
+if ROUND2:
+    cases.update({
+        "rings": (r"\bord5\3c&H0000FF&\3a&H00&\2bs3\2bc&H00FF00&\3bs2\3bc&HFF0000&"),
+        "ring-axes": r"\1bs0\2bsx8\2bsy0\2bc&HFF0000&",
+        "ring-alpha": r"\bord4\3c&H0000FF&\2bs4\2bc&H00FF00&\3a&H80&\1ba&H00&",
+        "ring-motion": r"\2bs2\2bc&HFF0000&\t(0,1000,\2bs10)",
+        "ring-gradient": r"\bord2\2bs8\2bgrd(0,&H0000FF&,&HFF0000&)\2bga(90,&H00&,&H00&)",
+        "ring-wait": r"\2bs8\2bc&H00FF00&\2bsc&HFF0000&\kt25\k25",
+    })
 coords = {}
 entries = []
 for i, (case, tags) in enumerate(cases.items()):
@@ -124,8 +134,8 @@ for i, (case, tags) in enumerate(cases.items()):
     else:
         tags += r"\p1"
     entries.append((x, y, tags, BOX))
-coords["karaoke"] = (1350, 960)
-entries.append((1350, 960, r"\fs64\kf100\1grd(0,&H0000FF&,&H0000FF&)\2grd(0,&HFF0000&,&HFF0000&)", "MMMM"))
+coords["karaoke"] = (1350, 986 if ROUND2 else 960)
+entries.append((*coords["karaoke"], r"\fs64\kf100\1grd(0,&H0000FF&,&H0000FF&)\2grd(0,&HFF0000&,&HFF0000&)", "MMMM"))
 grid = write("pixel-grid", entries)
 frames = [60, 75, 90, 120, 270]
 
@@ -195,6 +205,23 @@ probes = [
     (60, "outline-shadow", -4, 50, (127, 127, 127)),
     (60, "outline-shadow", 213, 108, (0, 255, 0)),
 ]
+if ROUND2:
+    probes.extend([
+        (60, "rings", -3, 50, (255, 0, 0)),
+        (60, "rings", -7, 50, (0, 255, 0)),
+        (60, "rings", -9, 50, (0, 0, 255)),
+        (60, "rings", -15, 50, (0, 0, 0)),
+        (60, "ring-axes", -5, 50, (0, 0, 255)),
+        (60, "ring-axes", 100, -5, (0, 0, 0)),
+        (60, "ring-alpha", -2, 50, (255, 0, 0)),
+        (60, "ring-alpha", -6, 50, (0, 127, 0)),
+        (60, "ring-motion", -5, 50, (0, 0, 0)),
+        (90, "ring-motion", -5, 50, (0, 0, 255)),
+        (60, "ring-gradient", 25, -6, (214, 0, 41)),
+        (60, "ring-gradient", 175, -6, (41, 0, 214)),
+        (60, "ring-wait", -5, 50, (0, 0, 255)),
+        (90, "ring-wait", -5, 50, (0, 255, 0)),
+    ])
 for frame, case, x, y, expected in probes:
     try:
         close(new(frame, case, x, y), expected)

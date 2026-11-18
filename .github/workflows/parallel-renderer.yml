@@ -7,7 +7,7 @@ on:
         type: boolean
         default: true
   push:
-    branches: [feature/parallel-event-rendering, codex/kfx-paint-extensions]
+    branches: [feature/parallel-event-rendering, codex/kfx-paint-extensions, codex/mangetsu-extensions-round-2]
     paths: ['src/**', '.github/parallel/**', '.github/workflows/parallel-renderer.yml']
 permissions:
   contents: read
@@ -15,6 +15,7 @@ permissions:
 env:
   PARALLEL_FULL: "${{ inputs.full || contains(github.event.head_commit.message, 'Parallel-KFX full') }}"
   PARALLEL_QUICK: "${{ contains(github.event.head_commit.message, 'Parallel-KFX quick') }}"
+  KFX_ROUND2: "${{ github.ref_name == 'codex/mangetsu-extensions-round-2' }}"
 jobs:
   build:
     runs-on: windows-2022
@@ -37,7 +38,7 @@ jobs:
           move bundle hosts || exit /b 1
           cl /nologo /std:c++17 /O2 /EHsc /MT /Ibenchmark-source\libass .github\ci\render-bench.cpp /Fe:hosts\render-bench.exe || exit /b 1
           cl /nologo /std:c++17 /O2 /EHsc /MT .github\parallel\concurrent.cpp /Fe:hosts\concurrent.exe user32.lib || exit /b 1
-          if "%GITHUB_REF_NAME%"=="codex/kfx-paint-extensions" (
+          if not "%GITHUB_REF_NAME%"=="feature/parallel-event-rendering" (
             cl /nologo /std:c++17 /O2 /EHsc /MT .github\parallel\paint-math.cpp /Fe:hosts\paint-math.exe || exit /b 1
             hosts\paint-math.exe || exit /b 1
           )
@@ -60,8 +61,8 @@ jobs:
       - name: Download the previous parallel renderer
         uses: actions/download-artifact@v4
         with:
-          name: parallel-hosts-${{ github.ref_name == 'codex/kfx-paint-extensions' && '20c6174b9cc15292f77ea99605f22df39faf539c' || 'b110ccac5d1b9b55410b1d50df46dfaf29468503' }}
-          run-id: ${{ github.ref_name == 'codex/kfx-paint-extensions' && '44199501549' || '44151605518' }}
+          name: parallel-hosts-${{ env.KFX_ROUND2 == 'true' && 'f81f31adac460894914aeab362b9906ce50d603a' || (github.ref_name == 'codex/kfx-paint-extensions' && '20c6174b9cc15292f77ea99605f22df39faf539c' || 'b110ccac5d1b9b55410b1d50df46dfaf29468503') }}
+          run-id: ${{ env.KFX_ROUND2 == 'true' && '44218421620' || (github.ref_name == 'codex/kfx-paint-extensions' && '44199501549' || '44151605518') }}
           github-token: ${{ github.token }}
           path: threading-baseline
       - name: Record actual runner hardware
@@ -73,7 +74,7 @@ jobs:
              ram = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
              revision = $env:GITHUB_SHA } | ConvertTo-Json -Depth 4 | Set-Content parallel-results/environment.json
       - name: Download the pinned Mangetsu paint reference
-        if: github.ref_name == 'codex/kfx-paint-extensions'
+        if: github.ref_name != 'feature/parallel-event-rendering'
         uses: actions/download-artifact@v4
         with:
           name: renderer-mangetsu-60e06ef0d4535c5403f446fd46b996df4d0d2560
@@ -81,7 +82,7 @@ jobs:
           github-token: ${{ github.token }}
           path: mangetsu-paint
       - name: Compare KFX paint pixels, seeks and worker budgets
-        if: github.ref_name == 'codex/kfx-paint-extensions'
+        if: github.ref_name != 'feature/parallel-event-rendering'
         run: python .github/parallel/paint-check.py
       - name: Reuse pre-threading renderer for a same-runner reference
         if: env.PARALLEL_FULL == 'true'
@@ -137,7 +138,7 @@ jobs:
             if ($LASTEXITCODE) { throw 'Instrumented mixed workload failed' }
           }
       - name: Profile the KFX paint stages
-        if: github.ref_name == 'codex/kfx-paint-extensions'
+        if: github.ref_name != 'feature/parallel-event-rendering'
         shell: pwsh
         run: |
           python .github/parallel/paint-check.py --profile

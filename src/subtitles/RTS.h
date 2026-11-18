@@ -47,6 +47,12 @@ class CWord : public Rasterizer
     void Transform(CPoint org);
 
     bool CreateOpaqueBox();
+#ifdef _VSMOD
+    struct NativeOutlineMasks;
+    std::unique_ptr<NativeOutlineMasks> m_nativeMasks;
+    bool CreateNativeOutline();
+    bool RasterizeNativeOutline(CPoint p);
+#endif
 
 protected:
     double m_scalex, m_scaley;
@@ -77,6 +83,14 @@ public:
     {
         return !m_fDrawn || (m_p.x & 7) != (p.x & 7) || (m_p.y & 7) != (p.y & 7);
     }
+
+#ifdef _VSMOD
+    bool HasNativeOutline() const;
+    CRect DrawNativeOutline(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int y, int time, int fade,
+        MOD_MOVEVC& vectorClip);
+    CRect DrawNativeShadow(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int y, DWORD* colors,
+        MOD_MOVEVC& vectorClip);
+#endif
 
 #if defined (_VSMOD) && defined(_LUA)
     void Paint(CPoint p, CPoint org, int Layer);

@@ -62,14 +62,35 @@ struct Sources
     std::array<Source, 8> parts{};
 };
 
+constexpr unsigned MaxOutlineLayers = 10;
+
+struct OutlineLayer
+{
+    unsigned number = 0;
+    double x = 0, y = 0;
+    double blur = -1;
+    int edgeBlur = -1;
+    int color = -1, inverseAlpha = -1;
+    int waitingColor = -1;
+    std::array<Source, 2> paint;
+};
+
+struct OutlineStyle
+{
+    std::vector<OutlineLayer> layers;
+    double scaleX = 1, scaleY = 1;
+};
+
 struct SlideSettings
 {
     std::array<double, 8> channels{};
+    std::array<double, 2 * (MaxOutlineLayers - 1)> outline{};
     double global = 0;
 
     double Width(int part) const
     {
-        const double setting = channels[part] ? channels[part] : global;
+        const double channel = part < int(channels.size()) ? channels[part] : outline[part - channels.size()];
+        const double setting = channel ? channel : global;
         return setting == -1 ? 0 : setting > 0 ? setting : -1;
     }
 };

@@ -938,13 +938,63 @@ bool Rasterizer::CreateWidenedRegion(int rx, int ry)
     return true;
 }
 
+#ifdef _VSMOD
+bool Rasterizer::CreateOutlineRings(const std::vector<OutlineTarget>& layers, Rasterizer* shadow)
+{
+    const tSpanBuffer* inner = &mOutline;
+    tSpanBuffer previous;
+    auto initMask = [this](Rasterizer& target) {
+        target.mWidth = mWidth;
+        target.mHeight = mHeight;
+        target.mPathOffsetX = mPathOffsetX;
+        target.mPathOffsetY = mPathOffsetY;
+        target.mWideBorder = mWideBorder;
+    };
+    for (const auto& layer : layers)
+    {
+        mWideOutline.clear();
+        if (!CreateWidenedRegion(layer.x, layer.y))
+            return false;
+        initMask(*layer.mask);
+        auto& ring = layer.mask->mOutline;
+        auto cut = inner->begin();
+        for (const auto& outer : mWideOutline)
+        {
+            auto start = outer.first;
+            while (cut != inner->end() && cut->second <= start) ++cut;
+            while (cut != inner->end() && cut->first < outer.second)
+            {
+                if (cut->first > start)
+                    ring.emplace_back(start, cut->first);
+                start = (std::max)(start, cut->second);
+                if (start >= outer.second) break;
+                ++cut;
+            }
+            if (start < outer.second)
+                ring.emplace_back(start, outer.second);
+        }
+        mWideOutline.swap(previous);
+        inner = &previous;
+    }
+    if (shadow)
+    {
+        initMask(*shadow);
+        shadow->mOutline.swap(previous);
+    }
+    mWideOutline.clear();
+    mWideBorder = 0;
+    return true;
+}
+#endif
+
 void Rasterizer::DeleteOutlines()
 {
     mWideOutline.clear();
     mOutline.clear();
 }
 
-bool Rasterizer::Rasterize(int xsub, int ysub, int fBlur, double fGaussianBlurX, double fGaussianBlurY)
+bool Rasterizer::Rasterize(int xsub, int ysub, int fBlur, double fGaussianBlurX, double fGaussianBlurY,
+    bool separateMask)
 {
     PROFILE_RENDER_STAGE(Rasterize);
     if (activeOverlayDraws && mpOverlayBuffer)
@@ -981,7 +1031,7 @@ bool Rasterizer::Rasterize(int xsub, int ysub, int fBlur, double fGaussianBlurX,
     else if (fGaussianBlurX == 0 && fGaussianBlurY != 0)
         direction = 2;
 
-    if(!mWideOutline.empty() || fBlur || fGaussianBlur > 0)
+    if(!mWideOutline.empty() || separateMask || fBlur || fGaussianBlur > 0)
     {
         int bluradjust = 0;
         if(fGaussianBlur > 0)

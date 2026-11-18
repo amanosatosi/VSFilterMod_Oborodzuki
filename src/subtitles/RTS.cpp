@@ -583,6 +583,165 @@ EventWorkerStatistics CRenderedTextSubtitle::WorkerStatistics() const
 
 // CWord
 
+#ifdef _VSMOD
+struct CWord::NativeOutlineMasks
+{
+    struct Ring
+    {
+        const KfxPaint::OutlineLayer* layer;
+        std::unique_ptr<Rasterizer> mask;
+        std::shared_ptr<const KfxPaint::Sources> paint;
+    };
+    std::vector<Ring> rings;
+    std::unique_ptr<Rasterizer> shadow;
+};
+
+bool CWord::HasNativeOutline() const
+{
+    if (!m_style.nativeOutline || m_style.borderStyle != 0)
+        return false;
+    for (const auto& layer : m_style.nativeOutline->layers)
+    {
+        if (layer.number ? layer.x > 0 || layer.y > 0 :
+            (layer.blur >= 0 || layer.edgeBlur >= 0 || layer.waitingColor >= 0) &&
+                m_style.outlineWidthX + m_style.outlineWidthY > 0)
+            return true;
+    }
+    return false;
+}
+
+bool CWord::CreateNativeOutline()
+{
+    const auto& style = *m_style.nativeOutline;
+    auto masks = std::make_unique<NativeOutlineMasks>();
+    std::vector<OutlineTarget> targets;
+    // Keep the additional masks bounded even for pathological tag values.
+    constexpr double maxRadius = 2048; // subpixels
+    double rx = 0, ry = 0;
+    int previousX = 0, previousY = 0;
+    auto add = [&](double x, double y, const KfxPaint::OutlineLayer* layer) {
+        rx = (std::min)(maxRadius, rx + x);
+        ry = (std::min)(maxRadius, ry + y);
+        const int roundedX = int(rx + 0.5);
+        const int roundedY = int(ry + 0.5);
+        if (roundedX == previousX && roundedY == previousY)
+            return;
+        previousX = roundedX;
+        previousY = roundedY;
+        auto mask = std::make_unique<Rasterizer>();
+        targets.push_back({roundedX, roundedY, mask.get()});
+        std::shared_ptr<const KfxPaint::Sources> paint;
+        if (layer && layer->number && (layer->paint[0] || layer->paint[1]))
+        {
+            auto parts = std::make_shared<KfxPaint::Sources>();
+            parts->parts[4] = layer->paint[0];
+            parts->parts[5] = layer->paint[1];
+            paint = std::move(parts);
+        }
+        masks->rings.push_back({layer, std::move(mask), std::move(paint)});
+    };
+    const auto* first = !style.layers.empty() && style.layers.front().number == 0 ? &style.layers.front() : nullptr;
+    add(m_style.outlineWidthX, m_style.outlineWidthY, first);
+    for (const auto& layer : style.layers)
+        if (layer.number)
+            add(layer.x * style.scaleX, layer.y * style.scaleY, &layer);
+    if (targets.empty())
+        return true;
+    if (m_style.shadowDepthX != 0 || m_style.shadowDepthY != 0)
+        masks->shadow = std::make_unique<Rasterizer>();
+    if (!CreateOutlineRings(targets, masks->shadow.get()))
+        return false;
+    m_nativeMasks = std::move(masks);
+    return true;
+}
+
+bool CWord::RasterizeNativeOutline(CPoint p)
+{
+    if (!m_nativeMasks)
+        return true;
+    for (const auto& ring : m_nativeMasks->rings)
+    {
+        const auto* layer = ring.layer;
+        const double blur = layer ? layer->blur : -1;
+        const int edge = layer && layer->edgeBlur >= 0 ? layer->edgeBlur : m_style.fBlur;
+        if (!ring.mask->Rasterize(p.x, p.y, edge,
+                blur >= 0 ? blur : m_style.fGaussianBlurX, blur >= 0 ? blur : m_style.fGaussianBlurY, true))
+            return false;
+    }
+    return !m_nativeMasks->shadow || m_nativeMasks->shadow->Rasterize(p.x, p.y, m_style.fBlur,
+        m_style.fGaussianBlurX, m_style.fGaussianBlurY, true);
+}
+
+CRect CWord::DrawNativeOutline(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int y, int time, int fade,
+    MOD_MOVEVC& vectorClip)
+{
+    CRect bounds(0, 0, 0, 0);
+    if (!m_nativeMasks)
+        return bounds;
+    // Each mask contains only its own ring. Traverse exterior to interior,
+    // which also defines compositing order where independent blurs overlap.
+    for (auto r = m_nativeMasks->rings.rbegin(); r != m_nativeMasks->rings.rend(); ++r)
+    {
+        const auto* layer = r->layer;
+        const DWORD rgb = layer && layer->color >= 0 ? DWORD(layer->color) : revcolor(m_style.colors[2]);
+        const int alpha = layer && layer->inverseAlpha >= 0 ? layer->inverseAlpha : m_style.alpha[2];
+        const DWORD opacity = MulDiv(255 - alpha, 255 - fade, 255);
+        MOD_GRADIENT extra;
+        extra.paint = r->paint;
+        extra.fadalpha = fade;
+        MOD_GRADIENT& paint = layer && layer->number ? extra : m_style.mod_grad;
+        const auto draw = [&](CRect region, DWORD color, MOD_GRADIENT& shading) {
+            if (region.IsRectEmpty()) return;
+            const DWORD colors[4] = {color | (opacity << 24), DWORD(-1), 0, 0};
+            bounds |= r->mask->Draw(spd, region, mask, x, y, colors, true, false, 2,
+                shading, vectorClip, m_style.mod_blendMode);
+        };
+        const bool waiting = layer && layer->waitingColor >= 0 && m_ktype != 2 && m_ktype != 3 &&
+            time < (m_ktype == 1 ? m_kend : m_kstart);
+        if (!waiting)
+        {
+            draw(clip, rgb, paint);
+            continue;
+        }
+        CRect active(clip), inactive(clip);
+        if (m_ktype == 1 && m_kstart < time)
+        {
+            const double progress = double(time - m_kstart) / (m_kend - m_kstart);
+            const double angle = std::remainder(m_style.fontAngleZ, 360.0);
+            const bool reversed = std::abs(angle) > 90;
+            const int edge = (x + int((reversed ? 1 - progress : progress) * m_width)) >> 3;
+            if (reversed)
+            {
+                active.left = (std::max)(LONG(edge), active.left);
+                inactive.right = (std::min)(LONG(edge), inactive.right);
+            }
+            else
+            {
+                active.right = (std::min)(LONG(edge), active.right);
+                inactive.left = (std::max)(LONG(edge), inactive.left);
+            }
+            draw(active, rgb, paint);
+        }
+        auto waitingPaint = paint;
+        auto parts = paint.paint ? std::make_shared<KfxPaint::Sources>(*paint.paint) :
+            std::make_shared<KfxPaint::Sources>();
+        parts->parts[4].reset();
+        waitingPaint.paint = std::move(parts);
+        waitingPaint.legacyParts &= ~(1u << 4);
+        draw(inactive, layer->waitingColor, waitingPaint);
+    }
+    return bounds;
+}
+
+CRect CWord::DrawNativeShadow(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int y, DWORD* colors,
+    MOD_MOVEVC& vectorClip)
+{
+    auto* rasterizer = m_nativeMasks && m_nativeMasks->shadow ? m_nativeMasks->shadow.get() : this;
+    return rasterizer->Draw(spd, clip, mask, x, y, colors, true, false, 3, m_style.mod_grad,
+        vectorClip, m_style.mod_blendMode);
+}
+#endif
+
 CWord::CWord(STSStyle& style, CStringW str, int ktype, int kstart, int kend, double scalex, double scaley)
     : m_style(style), m_str(str)
     , m_width(0), m_ascent(0), m_descent(0)
@@ -656,6 +815,14 @@ void CWord::Paint(CPoint p, CPoint org)
 
         if(!ScanConvert()) return;
 
+#ifdef _VSMOD
+        m_nativeMasks.reset();
+        if (HasNativeOutline())
+        {
+            if (!CreateNativeOutline()) return;
+        }
+        else
+#endif
         if(m_style.borderStyle == 0 && (m_style.outlineWidthX + m_style.outlineWidthY > 0))
         {
             if(!CreateWidenedRegion((int)(m_style.outlineWidthX + 0.5), (int)(m_style.outlineWidthY + 0.5))) return;
@@ -665,13 +832,18 @@ void CWord::Paint(CPoint p, CPoint org)
             if(!CreateOpaqueBox()) return;
         }
 
-        m_fDrawn = true;
-
         if(!Rasterize(p.x & 7, p.y & 7, m_style.fBlur, m_style.fGaussianBlurX, m_style.fGaussianBlurY)) return;
+#ifdef _VSMOD
+        if (!RasterizeNativeOutline(p)) return;
+#endif
+        m_fDrawn = true;
     }
     else if((m_p.x & 7) != (p.x & 7) || (m_p.y & 7) != (p.y & 7))
     {
         Rasterize(p.x & 7, p.y & 7, m_style.fBlur, m_style.fGaussianBlurX, m_style.fGaussianBlurY);
+#ifdef _VSMOD
+        if (!RasterizeNativeOutline(p)) return;
+#endif
     }
 
     m_p = p;
@@ -1940,7 +2112,8 @@ CRect CLine::PaintShadow(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPo
 
         if(w->m_fLineBreak) return(bbox); // should not happen since this class is just a line of text without any breaks
 
-        if(w->m_style.shadowDepthX != 0 || w->m_style.shadowDepthY != 0)
+        if((w->m_style.shadowDepthX != 0 || w->m_style.shadowDepthY != 0) &&
+            (w->m_ktype != 3 || time >= w->m_kstart))
         {
 #ifdef _VSMOD
             // vpatch v002. Horizontal fontspacing
@@ -1974,10 +2147,15 @@ CRect CLine::PaintShadow(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPo
             if(w->m_style.borderStyle == 0)
             {
 #ifdef _VSMOD // patch m004. gradient colors
+                if (w->HasNativeOutline() && !(w->m_ktype == 2 && time < w->m_kstart))
+                    bbox |= w->DrawNativeShadow(spd, clipRect, pAlphaMask, x, y, sw, mod_vc);
+                else
+                {
                 const auto& paint = w->m_style.mod_grad.paint;
                 bbox |= w->Draw(spd, clipRect, pAlphaMask, x, y, sw,
                                 w->m_ktype > 0 || w->m_style.alpha[0] < 0xff || (paint && paint->parts[1]),
                                 (w->m_style.outlineWidthX + w->m_style.outlineWidthY > 0) && !(w->m_ktype == 2 && time < w->m_kstart), 3, w->m_style.mod_grad, mod_vc, w->m_style.mod_blendMode);
+                }
 #else
                 bbox |= w->Draw(spd, clipRect, pAlphaMask, x, y, sw,
                                 w->m_ktype > 0 || w->m_style.alpha[0] < 0xff,
@@ -2015,7 +2193,11 @@ CRect CLine::PaintOutline(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CP
 
         if(w->m_fLineBreak) return(bbox); // should not happen since this class is just a line of text without any breaks
 
-        if(w->m_style.outlineWidthX + w->m_style.outlineWidthY > 0 && !(w->m_ktype == 2 && time < w->m_kstart))
+        if((w->m_style.outlineWidthX + w->m_style.outlineWidthY > 0
+#ifdef _VSMOD
+            || w->HasNativeOutline()
+#endif
+            ) && !((w->m_ktype == 2 || w->m_ktype == 3) && time < w->m_kstart))
         {
 #ifdef _VSMOD // vpatch v002. Horizontal fontspacing
             int x = p.x - w->m_style.mod_horizontalSpace;
@@ -2050,10 +2232,15 @@ CRect CLine::PaintOutline(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CP
             if(w->m_style.borderStyle == 0)
             {
 #ifdef _VSMOD // patch m004. gradient colors
+                if (w->HasNativeOutline())
+                    bbox |= w->DrawNativeOutline(spd, clipRect, pAlphaMask, x, y, time, alpha, mod_vc);
+                else
+                {
                 const auto& paint = w->m_style.mod_grad.paint;
                 const bool opaqueFill = !w->m_style.alpha[0] && !w->m_style.alpha[1] && !alpha &&
                     !w->m_style.mod_grad.bodyIsGradAlpha && !(paint && (paint->parts[1] || paint->parts[3]));
                 bbox |= w->Draw(spd, clipRect, pAlphaMask, x, y, sw, opaqueFill, true, 2, w->m_style.mod_grad, mod_vc, w->m_style.mod_blendMode);
+                }
 #else
                 bbox |= w->Draw(spd, clipRect, pAlphaMask, x, y, sw, !w->m_style.alpha[0] && !w->m_style.alpha[1] && !alpha, true);
 #endif
@@ -2097,6 +2284,13 @@ CRect CLine::PaintBody(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoin
         int x = p.x;
         int y = p.y + m_ascent - w->m_ascent;
 #endif
+#ifdef _VSMOD
+        if (w->m_ktype == 3 && time < w->m_kstart)
+        {
+            p.x += w->m_width;
+            continue;
+        }
+#endif
         // colors
 
         DWORD aprimary = w->m_style.alpha[0];
@@ -2114,7 +2308,7 @@ CRect CLine::PaintBody(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoin
 
         double t;
 
-        if(w->m_ktype == 0 || w->m_ktype == 2)
+        if(w->m_ktype == 0 || w->m_ktype == 2 || w->m_ktype == 3)
         {
             t = time < w->m_kstart ? 0 : 1;
         }
@@ -3070,6 +3264,16 @@ struct PaintTag
     CStringW argument;
 };
 
+enum class OutlineProperty { Width, WidthX, WidthY, Color, Alpha, Blur, EdgeBlur, Corners,
+    AlphaCorners, Gradient, AlphaGradient, Slide, AlphaSlide, Waiting };
+
+struct OutlineTag
+{
+    unsigned layer = 0;
+    OutlineProperty property = OutlineProperty::Width;
+    CStringW argument;
+};
+
 int ReadDecimalDigit(const wchar_t*& p)
 {
     unsigned codepoint = *p++;
@@ -3127,6 +3331,47 @@ bool ReadPaintTag(const CStringW& name, PaintTag& tag)
     tag.argument = p;
     tag.argument.Trim();
     return true;
+}
+
+bool ReadOutlineTag(const CStringW& name, OutlineTag& tag)
+{
+    const wchar_t* p = name;
+    if ((*p < L'1' || *p > L'9') && *p < 128)
+        return false;
+    const int first = ReadDecimalDigit(p);
+    if (first < 1 || first > 9)
+        return false;
+    int number = first;
+    const auto* next = p;
+    if (first == 1 && ReadDecimalDigit(next) == 0)
+    {
+        number = 10;
+        p = next;
+    }
+    if (*p++ != L'b')
+        return false;
+    using P = OutlineProperty;
+    static constexpr struct { const wchar_t* name; P property; } names[] = {
+        {L"grds", P::Slide}, {L"gas", P::AlphaSlide}, {L"vcs", P::Slide}, {L"vas", P::AlphaSlide},
+        {L"grd", P::Gradient}, {L"ga", P::AlphaGradient}, {L"blur", P::Blur},
+        {L"be", P::EdgeBlur}, {L"vc", P::Corners}, {L"va", P::AlphaCorners}, {L"sc", P::Waiting},
+        {L"sx", P::WidthX}, {L"sy", P::WidthY}, {L"s", P::Width}, {L"c", P::Color}, {L"a", P::Alpha},
+    };
+    for (const auto& entry : names)
+    {
+        const auto length = wcslen(entry.name);
+        if (wcsncmp(p, entry.name, length))
+            continue;
+        const auto* argument = p + length;
+        if (*argument >= L'a' && *argument <= L'z' && wcscmp(argument, L"off"))
+            return false;
+        tag.layer = number - 1;
+        tag.property = entry.property;
+        tag.argument = argument;
+        tag.argument.Trim();
+        return true;
+    }
+    return false;
 }
 
 std::vector<CStringW> PaintArguments(const CStringW& text)
@@ -3252,17 +3497,12 @@ void SetPaintPart(STSStyle& style, int part, KfxPaint::Source source)
     style.mod_grad.paint = std::move(state);
 }
 
-void ApplyPaintPart(CSubtitle& subtitle, STSStyle& style, int part, KfxPaint::Paint target,
-                    double progress, double width)
+KfxPaint::Source ResolvePaintSource(CSubtitle& subtitle, KfxPaint::Source old, KfxPaint::Paint target,
+    KfxPaint::Value solid, bool alpha, double progress, double width, bool keepCorners = false)
 {
     using namespace KfxPaint;
-    const bool alpha = (part & 1) != 0;
-    const int channel = part / 2;
-    Source old = style.mod_grad.paint ? style.mod_grad.paint->parts[part] : Source{};
-    const Value solid = alpha ? Value(style.alpha[channel]) : Value(revcolor(style.colors[channel]));
-    const bool legacy = (style.mod_grad.legacyParts & (1u << part)) != 0;
     if (progress <= 0)
-        return;
+        return old;
 
     if (progress < 1 && width >= 0)
     {
@@ -3270,10 +3510,9 @@ void ApplyPaintPart(CSubtitle& subtitle, STSStyle& style, int part, KfxPaint::Pa
         {
             Paint fallback;
             fallback.solid = solid;
-            if (legacy) fallback = PaintCorners(style, channel, alpha);
             old = std::make_shared<const Paint>(std::move(fallback));
         }
-        if (old->depth == MaxSlides) return;
+        if (old->depth == MaxSlides) return old;
         Paint slide;
         slide.kind = Paint::Kind::Slide;
         slide.angle = target.kind == Paint::Kind::Field ? target.angle : old->angle;
@@ -3300,14 +3539,38 @@ void ApplyPaintPart(CSubtitle& subtitle, STSStyle& style, int part, KfxPaint::Pa
         }
     }
 
-    if (target.kind == Paint::Kind::Solid || target.kind == Paint::Kind::Corners)
-        SetPaintPart(style, part, {});
-    else
-    {
-        target.segment = target.kind == Paint::Kind::Field && old && old->segment &&
-            progress < 1 ? old->segment : ++subtitle.m_paintSegments;
-        SetPaintPart(style, part, std::make_shared<const Paint>(std::move(target)));
-    }
+    if (target.kind == Paint::Kind::Solid || (target.kind == Paint::Kind::Corners && !keepCorners))
+        return {};
+    target.segment = target.kind == Paint::Kind::Field && old && old->segment &&
+        progress < 1 ? old->segment : ++subtitle.m_paintSegments;
+    return std::make_shared<const Paint>(std::move(target));
+}
+
+void ApplyPaintPart(CSubtitle& subtitle, STSStyle& style, int part, KfxPaint::Paint target,
+                    double progress, double width)
+{
+    using namespace KfxPaint;
+    if (progress <= 0)
+        return;
+    const bool alpha = (part & 1) != 0;
+    const int channel = part / 2;
+    Source old = style.mod_grad.paint ? style.mod_grad.paint->parts[part] : Source{};
+    const Value solid = alpha ? Value(style.alpha[channel]) : Value(revcolor(style.colors[channel]));
+    if (!old && progress < 1 && width >= 0 && (style.mod_grad.legacyParts & (1u << part)))
+        old = std::make_shared<const Paint>(PaintCorners(style, channel, alpha));
+    SetPaintPart(style, part, ResolvePaintSource(subtitle, std::move(old), std::move(target),
+        solid, alpha, progress, width));
+}
+
+KfxPaint::OutlineLayer& EditOutlineLayer(KfxPaint::OutlineStyle& state, unsigned number)
+{
+    const auto pos = std::lower_bound(state.layers.begin(), state.layers.end(), number,
+        [](const KfxPaint::OutlineLayer& layer, unsigned n) { return layer.number < n; });
+    if (pos != state.layers.end() && pos->number == number)
+        return *pos;
+    KfxPaint::OutlineLayer layer;
+    layer.number = number;
+    return *state.layers.insert(pos, std::move(layer));
 }
 }
 #endif
@@ -3339,7 +3602,8 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
 
 #ifdef _VSMOD
             PaintTag paint{};
-            if (ReadPaintTag(cmd, paint) || cmd == L"fad")
+            OutlineTag outline;
+            if (ReadPaintTag(cmd, paint) || ReadOutlineTag(cmd, outline) || cmd == L"fad")
             {
                 auto fields = PaintArguments(param);
                 if (cmd == L"fad" && fields.size() != 4)
@@ -3454,7 +3718,11 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
         else if(!cmd.Find(L"jitter"))
             ;
 #endif
-        else if(!cmd.Find(L"kt") || !cmd.Find(L"kf") || !cmd.Find(L"ko"))
+        else if(!cmd.Find(L"kt") || !cmd.Find(L"kf") || !cmd.Find(L"ko")
+#ifdef _VSMOD
+                || !cmd.Find(L"kO")
+#endif
+                )
             params.push_back(cmd.Mid(2)), cmd = cmd.Left(2);
         else if(!cmd.Find(L"k") || !cmd.Find(L"K"))
             params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
@@ -3573,6 +3841,30 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         return *owner;
     };
     const auto paintProgress = [&]() { return fAnimate ? KfxPaint::Unit(CalcAnimation(1, 0, true)) : 1.0; };
+    const auto copyOutline = [&]() {
+        auto state = style.nativeOutline ? std::make_shared<KfxPaint::OutlineStyle>(*style.nativeOutline) :
+            std::make_shared<KfxPaint::OutlineStyle>();
+        state->scaleX = (m_fScaledBAS ? sub->m_scalex : 1) * 8;
+        state->scaleY = (m_fScaledBAS ? sub->m_scaley : 1) * 8;
+        return state;
+    };
+    const auto editOutlineAlpha = [&](unsigned alpha, double progress) {
+        if (!style.nativeOutline || progress <= 0)
+            return;
+        auto state = copyOutline();
+        for (auto& layer : state->layers)
+        {
+            if (!layer.number) continue;
+            const auto from = layer.inverseAlpha >= 0 ? unsigned(layer.inverseAlpha) : unsigned(style.alpha[2]);
+            KfxPaint::Paint solid;
+            solid.solid = alpha;
+            const int part = 8 + int(layer.number - 1) * 2 + 1;
+            layer.paint[1] = ResolvePaintSource(*sub, layer.paint[1], std::move(solid), from,
+                true, progress, fAnimate && slides() && layer.paint[1] ? slides()->Width(part) : -1, true);
+            layer.inverseAlpha = KfxPaint::Mix(from, alpha, progress, true, false);
+        }
+        style.nativeOutline = std::move(state);
+    };
 #endif
     for (const auto& tag : *tags)
     {
@@ -3639,6 +3931,156 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         CStringW p = params.size() > 0 ? params[0] : L"";
 
 #ifdef _VSMOD
+        OutlineTag outline;
+        if (ReadOutlineTag(cmd, outline))
+        {
+            using P = OutlineProperty;
+            using namespace KfxPaint;
+            const auto property = outline.property;
+            const bool base = outline.layer == 0;
+            const bool inverse = property == P::Alpha || property == P::AlphaCorners ||
+                property == P::AlphaGradient || property == P::AlphaSlide;
+            const int part = (base ? 4 : 8 + int(outline.layer - 1) * 2) + int(inverse);
+            const double progress = paintProgress();
+            if (progress <= 0 || (!params.empty() && !outline.argument.IsEmpty()))
+                continue;
+            const auto& argument = params.empty() ? outline.argument : p;
+            if (property == P::Slide || property == P::AlphaSlide)
+            {
+                if (params.size() > 1) continue;
+                double value = 0;
+                if (argument == L"off") value = -2;
+                else if (!argument.IsEmpty())
+                {
+                    if (!ReadPaintNumber(argument, value) || value < 0) continue;
+                    if (!value) value = -1;
+                }
+                auto& state = editSlides();
+                (base ? state.channels[part] : state.outline[part - 8]) = value;
+                continue;
+            }
+            const bool gradient = property == P::Gradient || property == P::AlphaGradient;
+            const bool corners = property == P::Corners || property == P::AlphaCorners;
+            const double width = fAnimate && slides() ? slides()->Width(part) : -1;
+            if (gradient || corners)
+            {
+                Paint target;
+                const bool reset = params.empty() && (argument.IsEmpty() || argument == L"0");
+                if (!reset && gradient && !ReadPaintField(params, inverse, target))
+                    continue;
+                if (!reset && corners)
+                {
+                    if (params.size() != 4) continue;
+                    target.kind = Paint::Kind::Corners;
+                    for (const auto& a : params)
+                    {
+                        Value value;
+                        if (!ReadPaintValue(a, inverse, value)) break;
+                        target.stops.push_back({0, value});
+                    }
+                    if (target.stops.size() != 4) continue;
+                }
+                if (base)
+                {
+                    const Value solid = inverse ? style.alpha[2] : revcolor(style.colors[2]);
+                    Source old = style.mod_grad.paint ? style.mod_grad.paint->parts[part] : Source{};
+                    if (!old && width >= 0 && (style.mod_grad.legacyParts & (1u << part)))
+                        old = std::make_shared<const Paint>(PaintCorners(style, 2, inverse));
+                    SetPaintPart(style, part, reset ? Source{} : ResolvePaintSource(*sub,
+                        std::move(old), std::move(target), solid, inverse, progress, width, true));
+                    style.mod_grad.legacyParts &= ~(1u << part);
+                }
+                else
+                {
+                    auto state = copyOutline();
+                    auto& layer = EditOutlineLayer(*state, outline.layer);
+                    const int component = int(inverse);
+                    const int fallback = inverse ? layer.inverseAlpha : layer.color;
+                    const Value solid = fallback >= 0 ? Value(fallback) :
+                        inverse ? style.alpha[2] : revcolor(style.colors[2]);
+                    layer.paint[component] = reset ? Source{} : ResolvePaintSource(*sub,
+                        layer.paint[component], std::move(target), solid, inverse, progress, width, true);
+                    style.nativeOutline = std::move(state);
+                }
+                continue;
+            }
+            if (params.size() > 1) continue;
+            if (property == P::Color || property == P::Alpha || property == P::Waiting)
+            {
+                const bool reset = argument.IsEmpty();
+                Value value = inverse ? org.alpha[2] : revcolor(org.colors[2]);
+                if (!reset && !ReadPaintValue(argument, inverse, value)) continue;
+                if (base && property != P::Waiting)
+                {
+                    const Value from = inverse ? style.alpha[2] : revcolor(style.colors[2]);
+                    Paint target;
+                    target.solid = value;
+                    ApplyPaintPart(*sub, style, part, std::move(target), progress, width);
+                    style.mod_grad.legacyParts &= ~(1u << part);
+                    const Value mixed = Mix(from, value, progress, inverse, false);
+                    if (inverse) style.alpha[2] = BYTE(mixed);
+                    else style.colors[2] = revcolor(mixed);
+                }
+                else
+                {
+                    auto state = copyOutline();
+                    auto& layer = EditOutlineLayer(*state, outline.layer);
+                    auto& dest = property == P::Waiting ? layer.waitingColor : inverse ? layer.inverseAlpha : layer.color;
+                    const Value from = dest >= 0 ? Value(dest) : inverse ? style.alpha[2] : revcolor(style.colors[2]);
+                    if (property != P::Waiting)
+                    {
+                        Paint target;
+                        target.solid = value;
+                        auto& source = layer.paint[int(inverse)];
+                        source = reset ? Source{} : ResolvePaintSource(*sub, source, std::move(target),
+                            from, inverse, progress, source ? width : -1, true);
+                    }
+                    dest = reset ? -1 : int(Mix(from, value, progress, inverse, false));
+                    style.nativeOutline = std::move(state);
+                }
+                continue;
+            }
+
+            const bool reset = argument.IsEmpty();
+            double value = 0;
+            if (!reset && !ReadPaintNumber(argument, value)) continue;
+            if (property == P::Blur || property == P::EdgeBlur)
+            {
+                auto state = copyOutline();
+                auto& layer = EditOutlineLayer(*state, outline.layer);
+                if (property == P::Blur)
+                    layer.blur = reset ? -1 : CalcAnimation((std::clamp)(value, 0., 100.),
+                        layer.blur >= 0 ? layer.blur : style.fGaussianBlurX, fAnimate);
+                else
+                    layer.edgeBlur = reset ? -1 : int(CalcAnimation((std::clamp)(value, 0., 127.),
+                        layer.edgeBlur >= 0 ? layer.edgeBlur : style.fBlur, fAnimate) + 0.5);
+                style.nativeOutline = std::move(state);
+                continue;
+            }
+            const bool applyX = property != P::WidthY;
+            const bool applyY = property != P::WidthX;
+            value = (std::max)(0., value);
+            if (base)
+            {
+                if (applyX) style.outlineWidthX = CalcAnimation(reset ? org.outlineWidthX : value, style.outlineWidthX, fAnimate);
+                if (applyY) style.outlineWidthY = CalcAnimation(reset ? org.outlineWidthY : value, style.outlineWidthY, fAnimate);
+            }
+            else
+            {
+                auto state = copyOutline();
+                auto& layer = EditOutlineLayer(*state, outline.layer);
+                if (applyX) layer.x = CalcAnimation(value, layer.x, fAnimate);
+                if (applyY) layer.y = CalcAnimation(value, layer.y, fAnimate);
+                if (layer.x > 0 || layer.y > 0)
+                {
+                    if (layer.color < 0) layer.color = revcolor(style.colors[2]);
+                    if (layer.inverseAlpha < 0) layer.inverseAlpha = style.alpha[2];
+                }
+                style.nativeOutline = std::move(state);
+            }
+            continue;
+        }
+
         PaintTag paint{};
         if (ReadPaintTag(cmd, paint))
         {
@@ -3781,6 +4223,10 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         {
             DWORD al = wcstol(p, NULL, 16) & 0xff;
             int i = cmd[0] - '1';
+#ifdef _VSMOD
+            if (i == 2 && style.nativeOutline)
+                editOutlineAlpha(p.IsEmpty() ? org.alpha[2] : al, paintProgress());
+#endif
 
             style.alpha[i] = !p.IsEmpty()
                              ? (BYTE)CalcAnimation(al, style.alpha[i], fAnimate)
@@ -3939,6 +4385,10 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #endif
         else if(cmd == L"alpha")
         {
+#ifdef _VSMOD
+            if (style.nativeOutline)
+                editOutlineAlpha(p.IsEmpty() ? org.alpha[2] : wcstol(p, nullptr, 16) & 255, paintProgress());
+#endif
             for(ptrdiff_t i = 0; i < 4; i++)
             {
                 DWORD al = wcstol(p, NULL, 16) & 0xff;
@@ -4346,6 +4796,14 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                       ? wcstol(p, NULL, 10) * 10
                       : 1000;
         }
+#ifdef _VSMOD
+        else if(cmd == L"kO")
+        {
+            m_ktype = 3;
+            m_kstart = m_kend;
+            m_kend += !p.IsEmpty() ? wcstol(p, NULL, 10) * 10 : 1000;
+        }
+#endif
         else if(cmd == L"ko")
         {
             m_ktype = 2;

@@ -246,6 +246,7 @@ public:
     MOD_RANDOM mod_rand;
     // patch m004. gradient colors
     MOD_GRADIENT mod_grad;
+    std::shared_ptr<const KfxPaint::OutlineStyle> nativeOutline;
     // patch m007. symbol rotating
     int mod_fontOrient;
     // patch m008. distort

@@ -3582,6 +3582,7 @@ void STSStyle::SetDefault()
     mod_rand.clear();
     // patch m004. gradient colors
     mod_grad.clear();
+    nativeOutline.reset();
     // patch m007. symbol rotating
     mod_fontOrient = 0;
     // vpatch v001. Orthogonal 2D projection
@@ -3631,6 +3632,7 @@ bool STSStyle::operator == (STSStyle& s)
            && mod_rand == s.mod_rand
            // patch m004. gradient colors
            && mod_grad == s.mod_grad
+           && nativeOutline == s.nativeOutline
            // patch m007. symbol rotating
            && mod_fontOrient == s.mod_fontOrient
            // patch m008. distort
@@ -3707,6 +3709,7 @@ void STSStyle::mod_CopyStyleFrom(STSStyle& s)
     mod_rand = s.mod_rand;
     //patch m004. gradient colors
     mod_grad = s.mod_grad;
+    nativeOutline = s.nativeOutline;
     // patch m007. symbol rotating
     mod_fontOrient = s.mod_fontOrient;
     // patch m008. distort

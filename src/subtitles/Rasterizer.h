@@ -204,8 +204,17 @@ public:
     bool PartialEndPath(HDC hdc, long dx, long dy);
     bool ScanConvert();
     bool CreateWidenedRegion(int borderX, int borderY);
+#ifdef _VSMOD
+    struct OutlineTarget
+    {
+        int x, y;
+        Rasterizer* mask;
+    };
+    bool CreateOutlineRings(const std::vector<OutlineTarget>& layers, Rasterizer* shadow);
+#endif
     void DeleteOutlines();
-    bool Rasterize(int xsub, int ysub, int fBlur, double fGaussianBlurX, double fGaussianBlurY);
+    bool Rasterize(int xsub, int ysub, int fBlur, double fGaussianBlurX, double fGaussianBlurY,
+        bool separateMask = false);
     int getOverlayWidth();
 #ifdef _VSMOD // patch m004. gradient colors
     CRect Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int xsub, int ysub, const DWORD* switchpts, bool fBody, bool fBorder, int typ, MOD_GRADIENT& mod_grad, MOD_MOVEVC& mod_vc, MOD_BLEND mod_blendMode, bool reversePaint = false);
