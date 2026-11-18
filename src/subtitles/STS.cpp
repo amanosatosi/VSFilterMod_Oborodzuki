@@ -1912,7 +1912,11 @@ static bool OpenSubStationAlpha(CTextFile* file, CSimpleTextSubtitle& ret, int C
                 if(sver >= 5)	style->fontSpacing = max(style->fontSpacing, 0);
 #endif
                 style->fontAngleX = style->fontAngleY = 0;
-                style->borderStyle = style->borderStyle == 1 ? 0 : style->borderStyle == 3 ? 1 : 0;
+                style->borderStyle = style->borderStyle == 3 ? 1 :
+#ifdef _VSMOD
+                    style->borderStyle == 4 ? 2 :
+#endif
+                    0;
                 style->outlineWidthX = max(style->outlineWidthX, 0);
                 style->outlineWidthY = max(style->outlineWidthY, 0);
                 style->shadowDepthX = max(style->shadowDepthX, 0);
@@ -2133,7 +2137,11 @@ static bool OpenXombieSub(CTextFile* file, CSimpleTextSubtitle& ret, int CharSet
                 style->fontScaleX = max(style->fontScaleX, 0);
                 style->fontScaleY = max(style->fontScaleY, 0);
                 style->fontSpacing = max(style->fontSpacing, 0);
-                style->borderStyle = style->borderStyle == 1 ? 0 : style->borderStyle == 3 ? 1 : 0;
+                style->borderStyle = style->borderStyle == 3 ? 1 :
+#ifdef _VSMOD
+                    style->borderStyle == 4 ? 2 :
+#endif
+                    0;
                 style->outlineWidthX = max(style->outlineWidthX, 0);
                 style->outlineWidthY = max(style->outlineWidthY, 0);
                 style->shadowDepthX = max(style->shadowDepthX, 0);
@@ -3583,6 +3591,8 @@ void STSStyle::SetDefault()
     // patch m004. gradient colors
     mod_grad.clear();
     nativeOutline.reset();
+    boxRings.reset();
+    boxShape.reset();
     // patch m007. symbol rotating
     mod_fontOrient = 0;
     // vpatch v001. Orthogonal 2D projection
@@ -3633,6 +3643,8 @@ bool STSStyle::operator == (STSStyle& s)
            // patch m004. gradient colors
            && mod_grad == s.mod_grad
            && nativeOutline == s.nativeOutline
+           && boxRings == s.boxRings
+           && boxShape == s.boxShape
            // patch m007. symbol rotating
            && mod_fontOrient == s.mod_fontOrient
            // patch m008. distort
@@ -3710,6 +3722,8 @@ void STSStyle::mod_CopyStyleFrom(STSStyle& s)
     //patch m004. gradient colors
     mod_grad = s.mod_grad;
     nativeOutline = s.nativeOutline;
+    boxRings = s.boxRings;
+    boxShape = s.boxShape;
     // patch m007. symbol rotating
     mod_fontOrient = s.mod_fontOrient;
     // patch m008. distort

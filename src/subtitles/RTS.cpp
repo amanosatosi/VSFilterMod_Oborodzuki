@@ -598,7 +598,7 @@ struct CWord::NativeOutlineMasks
 
 bool CWord::HasNativeOutline() const
 {
-    if (!m_style.nativeOutline || m_style.borderStyle != 0)
+    if (!m_style.nativeOutline || m_style.borderStyle == 1)
         return false;
     for (const auto& layer : m_style.nativeOutline->layers)
     {
@@ -765,6 +765,17 @@ void CWord::MeasureSelectedFont()
     m_descent = int(m_style.fontScaleY / 100 * ((metrics.tmDescent + 4) >> 3));
 }
 
+CWord::CWord(CWord& word)
+    : CWord(word.m_style, word.m_str, word.m_ktype, word.m_kstart, word.m_kend, word.m_scalex, word.m_scaley)
+{
+    m_width = word.m_width;
+    m_ascent = word.m_ascent;
+    m_descent = word.m_descent;
+    m_fLineBreak = word.m_fLineBreak;
+    m_fWhiteSpaceChar = word.m_fWhiteSpaceChar;
+    isOpaqueBox = word.isOpaqueBox;
+}
+
 CWord::~CWord()
 {
     if(m_pOpaqueBox) delete m_pOpaqueBox;
@@ -823,7 +834,7 @@ void CWord::Paint(CPoint p, CPoint org)
         }
         else
 #endif
-        if(m_style.borderStyle == 0 && (m_style.outlineWidthX + m_style.outlineWidthY > 0))
+        if(m_style.borderStyle != 1 && (m_style.outlineWidthX + m_style.outlineWidthY > 0))
         {
             if(!CreateWidenedRegion((int)(m_style.outlineWidthX + 0.5), (int)(m_style.outlineWidthY + 0.5))) return;
         }
@@ -2229,7 +2240,7 @@ CRect CLine::PaintOutline(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CP
             w->Paint(CPoint(x, y), org);
 #endif
 
-            if(w->m_style.borderStyle == 0)
+            if(w->m_style.borderStyle != 1)
             {
 #ifdef _VSMOD // patch m004. gradient colors
                 if (w->HasNativeOutline())
@@ -2719,6 +2730,151 @@ void CSubtitle::MakeLines(CSize size, CRect marginRect)
                         : marginRect.top),
                  spaceNeeded);
 }
+
+#ifdef _VSMOD
+namespace
+{
+class EventBoxPath : public CWord
+{
+    std::vector<POINT> points;
+    std::vector<BYTE> types;
+
+    bool CreatePath() override
+    {
+        return CopyPath(points.data(), types.data(), points.size());
+    }
+
+public:
+    EventBoxPath(STSStyle& style, double sx, double sy) : CWord(style, L".", 0, 0, 0, sx, sy)
+    {
+        isOpaqueBox = true;
+        m_style.outlineWidthX = m_style.outlineWidthY = 0;
+        m_style.shadowDepthX = m_style.shadowDepthY = 0;
+        m_style.borderStyle = 0;
+        m_style.nativeOutline.reset();
+        m_style.mod_rand.clear();
+        m_style.fBlur = 0;
+        m_style.fGaussianBlurX = m_style.fGaussianBlurY = 0;
+#ifdef _LUA
+        m_style.LuaBeforeTransformHandler.Empty();
+        m_style.LuaCustomTransformHandler.Empty();
+        m_style.LuaAfterTransformHandler.Empty();
+#endif
+    }
+
+    CWord* Copy() override { return new EventBoxPath(*this); }
+
+    void AddContour(KfxPaint::Rect rect, double rx, double ry, bool hole)
+    {
+        const auto start = points.size();
+        const auto push = [&](double x, double y) {
+            points.push_back({LONG(std::lround(x * 8)), LONG(std::lround(y * 8))});
+            types.push_back(PT_LINETO);
+        };
+        rx = (std::min)(rx, (rect.right - rect.left) / 2);
+        ry = (std::min)(ry, (rect.bottom - rect.top) / 2);
+        if (rx <= 0 || ry <= 0)
+        {
+            push(rect.left, rect.top);
+            push(rect.right, rect.top);
+            push(rect.right, rect.bottom);
+            push(rect.left, rect.bottom);
+        }
+        else
+        {
+            const double cx[] = {rect.right-rx, rect.right-rx, rect.left+rx, rect.left+rx};
+            const double cy[] = {rect.top+ry, rect.bottom-ry, rect.bottom-ry, rect.top+ry};
+            const int segments = (std::min)(32, 8 + int(std::sqrt((std::max)(rx, ry) / 8)));
+            constexpr double quarter = 1.57079632679489661923;
+            for (int corner = 0; corner < 4; ++corner)
+                for (int step = 0; step <= segments; ++step)
+                {
+                    const double angle = (corner - 1 + double(step) / segments) * quarter;
+                    push(cx[corner] + rx * std::cos(angle), cy[corner] + ry * std::sin(angle));
+                }
+        }
+        if (hole)
+            std::reverse(points.begin() + start, points.end());
+        types[start] = PT_MOVETO;
+    }
+};
+}
+
+void CSubtitle::CreateEventBox(int borderStyle, int time, bool scaledBorder)
+{
+    m_eventBox.clear();
+    if ((m_boxMode < 0 ? borderStyle != 2 : m_boxMode == 0) || IsEmpty())
+        return;
+
+    CWord* canonical = nullptr;
+    double left = 0, right = 0;
+    POSITION lines = GetHeadPosition();
+    while (lines)
+    {
+        auto* line = GetNext(lines);
+        const double x = m_scrAlignment % 3 == 1 ? 0 : m_scrAlignment % 3 == 2 ?
+            -line->m_width / 2.0 : -line->m_width;
+        left = (std::min)(left, x);
+        right = (std::max)(right, x + line->m_width);
+        if (canonical) continue;
+        POSITION words = line->GetHeadPosition();
+        while (words && !canonical)
+        {
+            auto* word = line->GetNext(words);
+            if (!word->m_fWhiteSpaceChar && !word->m_fLineBreak && (word->m_ktype != 3 || time >= word->m_kstart))
+                canonical = word;
+        }
+    }
+    if (!canonical || right <= left || m_rect.Height() <= 0)
+        return;
+
+    auto& style = canonical->m_style;
+    const double sx = std::abs(style.fontScaleX) / 100 * (scaledBorder ? m_scalex : 1) * 8;
+    const double sy = std::abs(style.fontScaleY) / 100 * (scaledBorder ? m_scaley : 1) * 8;
+    const KfxPaint::BoxShape defaults;
+    const auto& box = style.boxShape ? *style.boxShape : defaults;
+    const auto bounded = [](double pixels) { return (std::min)(pixels, 8192.0); };
+    const double edgeX = (std::max)(0., style.shadowDepthX) + style.outlineWidthX;
+    const double edgeTop = (std::max)(0., style.shadowDepthY) + m_topborder;
+    const double edgeBottom = (std::max)(0., style.shadowDepthY) + m_bottomborder;
+    const KfxPaint::Rect rect{left - edgeX - bounded(box.padding[0] * sx), -edgeTop - bounded(box.padding[2] * sy),
+        right + edgeX + bounded(box.padding[1] * sx), m_rect.Height() + edgeBottom + bounded(box.padding[3] * sy)};
+    const double radiusX = (std::min)(bounded(box.radius * sx), (rect.right - rect.left) / 2);
+    const double radiusY = (std::min)(bounded(box.radius * sy), (rect.bottom - rect.top) / 2);
+    const auto expand = [&](double x, double y) {
+        return KfxPaint::Rect{rect.left-x, rect.top-y, rect.right+x, rect.bottom+y};
+    };
+    auto fill = std::make_unique<EventBoxPath>(style, m_scalex, m_scaley);
+    fill->AddContour(rect, radiusX, radiusY, false);
+    m_eventBox.push_back(std::move(fill));
+    double x = 0, y = 0;
+    if (style.boxRings)
+        for (const auto& layer : style.boxRings->layers)
+        {
+            if (layer.x <= 0) continue;
+            const double outerX = bounded(x + layer.x * sx);
+            const double outerY = bounded(y + layer.x * sy);
+            if (outerX == x && outerY == y) continue;
+            auto ring = std::make_unique<EventBoxPath>(style, m_scalex, m_scaley);
+            ring->AddContour(expand(outerX, outerY), radiusX + outerX, radiusY + outerY, false);
+            ring->AddContour(expand(x, y), radiusX + x, radiusY + y, true);
+            auto& paint = ring->m_style;
+            paint.mod_grad.clear();
+            if (layer.color >= 0) paint.colors[3] = revcolor(layer.color);
+            if (layer.inverseAlpha >= 0) paint.alpha[3] = BYTE(layer.inverseAlpha);
+            if (layer.paint[0] || layer.paint[1])
+            {
+                auto sources = std::make_shared<KfxPaint::Sources>();
+                sources->parts[6] = layer.paint[0];
+                sources->parts[7] = layer.paint[1];
+                paint.mod_grad.paint = std::move(sources);
+            }
+            m_eventBox.push_back(std::move(ring));
+            x = outerX;
+            y = outerY;
+        }
+}
+#endif
 
 // CScreenLayoutAllocator
 
@@ -3270,6 +3426,7 @@ enum class OutlineProperty { Width, WidthX, WidthY, Color, Alpha, Blur, EdgeBlur
 struct OutlineTag
 {
     unsigned layer = 0;
+    bool box = false;
     OutlineProperty property = OutlineProperty::Width;
     CStringW argument;
 };
@@ -3336,20 +3493,26 @@ bool ReadPaintTag(const CStringW& name, PaintTag& tag)
 bool ReadOutlineTag(const CStringW& name, OutlineTag& tag)
 {
     const wchar_t* p = name;
-    if ((*p < L'1' || *p > L'9') && *p < 128)
-        return false;
-    const int first = ReadDecimalDigit(p);
-    if (first < 1 || first > 9)
-        return false;
-    int number = first;
-    const auto* next = p;
-    if (first == 1 && ReadDecimalDigit(next) == 0)
+    int number = 1;
+    if (wcsncmp(p, L"bb", 2))
     {
-        number = 10;
-        p = next;
+        if ((*p < L'1' || *p > L'9') && *p < 128)
+            return false;
+        const int first = ReadDecimalDigit(p);
+        if (first < 1 || first > 9)
+            return false;
+        number = first;
+        const auto* next = p;
+        if (first == 1 && ReadDecimalDigit(next) == 0)
+        {
+            number = 10;
+            p = next;
+        }
     }
     if (*p++ != L'b')
         return false;
+    tag.box = *p == L'b';
+    if (tag.box) ++p;
     using P = OutlineProperty;
     static constexpr struct { const wchar_t* name; P property; } names[] = {
         {L"grds", P::Slide}, {L"gas", P::AlphaSlide}, {L"vcs", P::Slide}, {L"vas", P::AlphaSlide},
@@ -3365,6 +3528,9 @@ bool ReadOutlineTag(const CStringW& name, OutlineTag& tag)
         const auto* argument = p + length;
         if (*argument >= L'a' && *argument <= L'z' && wcscmp(argument, L"off"))
             return false;
+        if (tag.box && (entry.property == P::WidthX || entry.property == P::WidthY ||
+            entry.property == P::Blur || entry.property == P::EdgeBlur || entry.property == P::Waiting))
+            return false;
         tag.layer = number - 1;
         tag.property = entry.property;
         tag.argument = argument;
@@ -3372,6 +3538,12 @@ bool ReadOutlineTag(const CStringW& name, OutlineTag& tag)
         return true;
     }
     return false;
+}
+
+bool EventBoxTag(const CStringW& name)
+{
+    const wchar_t* p = name;
+    return !wcsncmp(p, L"box", 3) || !wcsncmp(p, L"bs", 2);
 }
 
 std::vector<CStringW> PaintArguments(const CStringW& text)
@@ -3603,7 +3775,7 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
 #ifdef _VSMOD
             PaintTag paint{};
             OutlineTag outline;
-            if (ReadPaintTag(cmd, paint) || ReadOutlineTag(cmd, outline) || cmd == L"fad")
+            if (ReadPaintTag(cmd, paint) || ReadOutlineTag(cmd, outline) || EventBoxTag(cmd) || cmd == L"fad")
             {
                 auto fields = PaintArguments(param);
                 if (cmd == L"fad" && fields.size() != 4)
@@ -3640,6 +3812,14 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
 
         const CStringW rawCommand = cmd;
         const int rawCount = static_cast<int>(params.size());
+#ifdef _VSMOD
+        OutlineTag outline;
+        if (EventBoxTag(cmd) || ReadOutlineTag(cmd, outline))
+        {
+            result->push_back({cmd, cmd, std::move(params), rawCount});
+            continue;
+        }
+#endif
         if(!cmd.Find(L"1c") || !cmd.Find(L"2c") || !cmd.Find(L"3c") || !cmd.Find(L"4c"))
             params.push_back(cmd.Mid(2).Trim(L"&H")), cmd = cmd.Left(2);
         else if(!cmd.Find(L"1a") || !cmd.Find(L"2a") || !cmd.Find(L"3a") || !cmd.Find(L"4a"))
@@ -3841,8 +4021,8 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         return *owner;
     };
     const auto paintProgress = [&]() { return fAnimate ? KfxPaint::Unit(CalcAnimation(1, 0, true)) : 1.0; };
-    const auto copyOutline = [&]() {
-        auto state = style.nativeOutline ? std::make_shared<KfxPaint::OutlineStyle>(*style.nativeOutline) :
+    const auto copyOutline = [&](const std::shared_ptr<const KfxPaint::OutlineStyle>& source) {
+        auto state = source ? std::make_shared<KfxPaint::OutlineStyle>(*source) :
             std::make_shared<KfxPaint::OutlineStyle>();
         state->scaleX = (m_fScaledBAS ? sub->m_scalex : 1) * 8;
         state->scaleY = (m_fScaledBAS ? sub->m_scaley : 1) * 8;
@@ -3851,14 +4031,14 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
     const auto editOutlineAlpha = [&](unsigned alpha, double progress) {
         if (!style.nativeOutline || progress <= 0)
             return;
-        auto state = copyOutline();
+        auto state = copyOutline(style.nativeOutline);
         for (auto& layer : state->layers)
         {
             if (!layer.number) continue;
             const auto from = layer.inverseAlpha >= 0 ? unsigned(layer.inverseAlpha) : unsigned(style.alpha[2]);
             KfxPaint::Paint solid;
             solid.solid = alpha;
-            const int part = 8 + int(layer.number - 1) * 2 + 1;
+            const int part = KfxPaint::NativeSlideStart + int(layer.number - 1) * 2 + 1;
             layer.paint[1] = ResolvePaintSource(*sub, layer.paint[1], std::move(solid), from,
                 true, progress, fAnimate && slides() && layer.paint[1] ? slides()->Width(part) : -1, true);
             layer.inverseAlpha = KfxPaint::Mix(from, alpha, progress, true, false);
@@ -3931,16 +4111,83 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         CStringW p = params.size() > 0 ? params[0] : L"";
 
 #ifdef _VSMOD
+        if (EventBoxTag(cmd))
+        {
+            const wchar_t* name = cmd;
+            if (!wcsncmp(name, L"bs", 2))
+            {
+                if (!fAnimate && sub->m_borderStyleOverride < 0 && params.empty())
+                {
+                    if (!wcscmp(name + 2, L"1")) sub->m_borderStyleOverride = 0;
+                    if (!wcscmp(name + 2, L"3")) sub->m_borderStyleOverride = 1;
+                    if (!wcscmp(name + 2, L"4")) sub->m_borderStyleOverride = 2;
+                }
+                continue;
+            }
+            name += 3;
+            if (params.empty() && (*name == L'0' || *name == L'1') && !name[1])
+            {
+                if (!fAnimate || paintProgress() == 1) sub->m_boxMode = *name - L'0';
+                continue;
+            }
+            auto box = style.boxShape ? std::make_shared<KfxPaint::BoxShape>(*style.boxShape) :
+                std::make_shared<KfxPaint::BoxShape>();
+            if (*name == L'r')
+            {
+                ++name;
+                double radius = 0;
+                if ((params.empty() && (!*name || ReadPaintNumber(CStringW(name), radius))) ||
+                    (!*name && params.size() == 1 && ReadPaintNumber(p, radius)))
+                {
+                    box->radius = (std::max)(0., CalcAnimation(radius, box->radius, fAnimate));
+                    style.boxShape = std::move(box);
+                }
+            }
+            else if (*name == L'p')
+            {
+                ++name;
+                const int first = *name == L'y' ? 2 : 0;
+                const int count = *name == L'x' || *name == L'y' ? 2 : 4;
+                if (count == 2) ++name;
+                const bool tuple = !*name && params.size() == size_t(count);
+                double scalar;
+                if (!tuple && (!params.empty() || !ReadPaintNumber(CStringW(name), scalar)))
+                    continue;
+                bool valid = true;
+                for (int i = 0; i < count; ++i)
+                {
+                    double value = 0;
+                    if (tuple)
+                    {
+                        if (!ReadPaintNumber(params[i], value))
+                        {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    else value = scalar;
+                    const auto& input = tuple ? params[i] : CStringW(name);
+                    if (input[0] == L'+' || input[0] == L'-') value += box->padding[first + i];
+                    box->padding[first + i] = (std::max)(0., CalcAnimation(value, box->padding[first + i], fAnimate));
+                }
+                if (valid) style.boxShape = std::move(box);
+            }
+            continue;
+        }
+
         OutlineTag outline;
         if (ReadOutlineTag(cmd, outline))
         {
             using P = OutlineProperty;
             using namespace KfxPaint;
             const auto property = outline.property;
-            const bool base = outline.layer == 0;
+            const bool base = !outline.box && outline.layer == 0;
+            const int channel = outline.box ? 3 : 2;
+            auto& ringState = outline.box ? style.boxRings : style.nativeOutline;
             const bool inverse = property == P::Alpha || property == P::AlphaCorners ||
                 property == P::AlphaGradient || property == P::AlphaSlide;
-            const int part = (base ? 4 : 8 + int(outline.layer - 1) * 2) + int(inverse);
+            const int part = (outline.box ? BoxSlideStart + 2 * int(outline.layer) :
+                base ? 4 : NativeSlideStart + 2 * int(outline.layer - 1)) + int(inverse);
             const double progress = paintProgress();
             if (progress <= 0 || (!params.empty() && !outline.argument.IsEmpty()))
                 continue;
@@ -3956,7 +4203,8 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     if (!value) value = -1;
                 }
                 auto& state = editSlides();
-                (base ? state.channels[part] : state.outline[part - 8]) = value;
+                (outline.box ? state.box[part - BoxSlideStart] :
+                    base ? state.channels[part] : state.outline[part - NativeSlideStart]) = value;
                 continue;
             }
             const bool gradient = property == P::Gradient || property == P::AlphaGradient;
@@ -3992,15 +4240,15 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 }
                 else
                 {
-                    auto state = copyOutline();
+                    auto state = copyOutline(ringState);
                     auto& layer = EditOutlineLayer(*state, outline.layer);
                     const int component = int(inverse);
                     const int fallback = inverse ? layer.inverseAlpha : layer.color;
                     const Value solid = fallback >= 0 ? Value(fallback) :
-                        inverse ? style.alpha[2] : revcolor(style.colors[2]);
+                        inverse ? style.alpha[channel] : revcolor(style.colors[channel]);
                     layer.paint[component] = reset ? Source{} : ResolvePaintSource(*sub,
                         layer.paint[component], std::move(target), solid, inverse, progress, width, true);
-                    style.nativeOutline = std::move(state);
+                    ringState = std::move(state);
                 }
                 continue;
             }
@@ -4008,7 +4256,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             if (property == P::Color || property == P::Alpha || property == P::Waiting)
             {
                 const bool reset = argument.IsEmpty();
-                Value value = inverse ? org.alpha[2] : revcolor(org.colors[2]);
+                Value value = inverse ? org.alpha[channel] : revcolor(org.colors[channel]);
                 if (!reset && !ReadPaintValue(argument, inverse, value)) continue;
                 if (base && property != P::Waiting)
                 {
@@ -4023,10 +4271,10 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 }
                 else
                 {
-                    auto state = copyOutline();
+                    auto state = copyOutline(ringState);
                     auto& layer = EditOutlineLayer(*state, outline.layer);
                     auto& dest = property == P::Waiting ? layer.waitingColor : inverse ? layer.inverseAlpha : layer.color;
-                    const Value from = dest >= 0 ? Value(dest) : inverse ? style.alpha[2] : revcolor(style.colors[2]);
+                    const Value from = dest >= 0 ? Value(dest) : inverse ? style.alpha[channel] : revcolor(style.colors[channel]);
                     if (property != P::Waiting)
                     {
                         Paint target;
@@ -4036,7 +4284,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                             from, inverse, progress, source ? width : -1, true);
                     }
                     dest = reset ? -1 : int(Mix(from, value, progress, inverse, false));
-                    style.nativeOutline = std::move(state);
+                    ringState = std::move(state);
                 }
                 continue;
             }
@@ -4046,15 +4294,15 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             if (!reset && !ReadPaintNumber(argument, value)) continue;
             if (property == P::Blur || property == P::EdgeBlur)
             {
-                auto state = copyOutline();
+                auto state = copyOutline(ringState);
                 auto& layer = EditOutlineLayer(*state, outline.layer);
                 if (property == P::Blur)
-                    layer.blur = reset ? -1 : CalcAnimation((std::clamp)(value, 0., 100.),
+                    layer.blur = reset ? -1 : CalcAnimation((std::max)(0., (std::min)(value, 100.)),
                         layer.blur >= 0 ? layer.blur : style.fGaussianBlurX, fAnimate);
                 else
-                    layer.edgeBlur = reset ? -1 : int(CalcAnimation((std::clamp)(value, 0., 127.),
+                    layer.edgeBlur = reset ? -1 : int(CalcAnimation((std::max)(0., (std::min)(value, 127.)),
                         layer.edgeBlur >= 0 ? layer.edgeBlur : style.fBlur, fAnimate) + 0.5);
-                style.nativeOutline = std::move(state);
+                ringState = std::move(state);
                 continue;
             }
             const bool applyX = property != P::WidthY;
@@ -4067,16 +4315,16 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             }
             else
             {
-                auto state = copyOutline();
+                auto state = copyOutline(ringState);
                 auto& layer = EditOutlineLayer(*state, outline.layer);
                 if (applyX) layer.x = CalcAnimation(value, layer.x, fAnimate);
                 if (applyY) layer.y = CalcAnimation(value, layer.y, fAnimate);
-                if (layer.x > 0 || layer.y > 0)
+                if (!outline.box && (layer.x > 0 || layer.y > 0))
                 {
                     if (layer.color < 0) layer.color = revcolor(style.colors[2]);
                     if (layer.inverseAlpha < 0) layer.inverseAlpha = style.alpha[2];
                 }
-                style.nativeOutline = std::move(state);
+                ringState = std::move(state);
             }
             continue;
         }
@@ -4799,6 +5047,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #ifdef _VSMOD
         else if(cmd == L"kO")
         {
+            sub->m_revealKaraoke = true;
             m_ktype = 3;
             m_kstart = m_kend;
             m_kend += !p.IsEmpty() ? wcstol(p, NULL, 10) * 10 : 1000;
@@ -5138,6 +5387,9 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #endif
         else if(cmd == L"r")
         {
+#ifdef _VSMOD
+            if (!fAnimate) sub->m_boxMode = -1;
+#endif
 #ifdef _VSMOD
             if (slides()) editSlides() = {};
 #endif
@@ -5618,7 +5870,33 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry)
 
     sub->CreateClippers(m_size);
 
+#ifdef _VSMOD
+    const int borderStyle = sub->m_borderStyleOverride < 0 ? stss.borderStyle : sub->m_borderStyleOverride;
+    const bool hasBox = sub->m_boxMode < 0 ? borderStyle == 2 : sub->m_boxMode != 0;
+    if (hasBox || sub->m_borderStyleOverride >= 0 || sub->m_boxMode == 0)
+    {
+        POSITION words = sub->m_words.GetHeadPosition();
+        while (words)
+        {
+            auto& style = sub->m_words.GetNext(words)->m_style;
+            if (hasBox)
+                style.borderStyle = 2;
+            else if (sub->m_borderStyleOverride >= 0)
+                style.borderStyle = sub->m_borderStyleOverride == 2 ? 0 : sub->m_borderStyleOverride;
+            else if (style.borderStyle == 2)
+                style.borderStyle = 0;
+        }
+    }
+#endif
     sub->MakeLines(m_size, marginRect);
+#ifdef _VSMOD
+    if (hasBox)
+    {
+        if (sub->m_revealKaraoke)
+            sub->m_fAnimated = true;
+        sub->CreateEventBox(borderStyle, m_time, m_fScaledBAS);
+    }
+#endif
 
     m_subtitleCache[entry] = sub;
     delete previous;
@@ -6379,6 +6657,34 @@ try
         iclipRect[2] = CRect(clipRect.right, clipRect.top, spd.w, clipRect.bottom);
         iclipRect[3] = CRect(0, clipRect.bottom, spd.w, spd.h);
 
+#ifdef _VSMOD
+        if (!s->m_eventBox.empty())
+        {
+            const CPoint origin(org.x, p2.y);
+            for (auto i = s->m_eventBox.rbegin(); i != s->m_eventBox.rend(); ++i)
+            {
+                auto& box = **i;
+                auto& style = box.m_style;
+#ifdef _LUA
+                box.Paint(origin, org2, 4);
+#else
+                box.Paint(origin, org2);
+#endif
+                const DWORD opacity = MulDiv(255 - style.alpha[3], 255 - alpha, 255);
+                const DWORD colors[4] = {DWORD(revcolor(style.colors[3])) | (opacity << 24), DWORD(-1), 0, 0};
+                style.mod_grad.fadalpha = alpha;
+                style.mod_grad.subpixx = origin.x & 7;
+                style.mod_grad.subpixy = origin.y & 7;
+                const auto drawBox = [&](CRect& clip) {
+                    bbox2 |= box.Draw(spd, clip, pAlphaMask, origin.x, origin.y, colors, true, false, 3,
+                        style.mod_grad, mod_vc, style.mod_blendMode);
+                };
+                if (s->m_clipInverse)
+                    for (auto& clip : iclipRect) drawBox(clip);
+                else drawBox(clipRect);
+            }
+        }
+#endif
         pos = s->GetHeadPosition();
         while(pos)
         {

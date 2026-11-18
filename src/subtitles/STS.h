@@ -216,7 +216,7 @@ class STSStyle
 public:
     CRect	marginRect; // measured from the sides
     int		scrAlignment; // 1 - 9: as on the numpad, 0: default
-    int		borderStyle; // 0: outline, 1: opaque box
+    int		borderStyle; // 0: outline, 1: opaque box, 2: event box
     double	outlineWidthX, outlineWidthY;
     double	shadowDepthX, shadowDepthY;
     COLORREF colors[4]; // usually: {primary, secondary, outline/background, shadow}
@@ -247,6 +247,8 @@ public:
     // patch m004. gradient colors
     MOD_GRADIENT mod_grad;
     std::shared_ptr<const KfxPaint::OutlineStyle> nativeOutline;
+    std::shared_ptr<const KfxPaint::OutlineStyle> boxRings;
+    std::shared_ptr<const KfxPaint::BoxShape> boxShape;
     // patch m007. symbol rotating
     int mod_fontOrient;
     // patch m008. distort

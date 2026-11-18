@@ -147,12 +147,12 @@ def playback(mode, dll, case, path, workers=1):
                     "--window", str(frames[0]), str(frames[-1] + 1)], check=True, env=env, timeout=180)
 
 
-def captures(path):
+def captures(path, positions=coords):
     images = {frame: (path / f"frame-{frame}.bmp").read_bytes() for frame in frames}
     offsets = {frame: struct.unpack_from("<I", image, 10)[0] for frame, image in images.items()}
 
     def get(frame, case, x=100, y=50):
-        left, top = coords[case]
+        left, top = positions[case]
         i = offsets[frame] + ((top + y) * 1920 + left + x) * 4
         b, g, r = images[frame][i:i + 3]
         return r, g, b
@@ -238,6 +238,31 @@ for case in ("union", "fade-gradient", "overlap"):
 close(new(90, "gradient-solid-ordinary", 25, 50), (111, 127, 16))
 close(new(120, "gradient-solid-ordinary"), (0, 255, 0))
 close(new(60, "raised-fill-alpha", 208, 108), (0, 255, 0))
+
+if ROUND2:
+    boxes = write("event-boxes", [
+        (120, 90, r"\bs4\4c&HFF0000&\4a&H00&\boxp(10,20,8,12)\bbs4\bbc&H00FF00&"
+                  r"\2bbs6\2bbgrd(0,&H0000FF&,&H0000FF&)\p1", BOX),
+        (500, 90, r"\bs1\box1\4c&HFF0000&\4a&H00&\boxp16\boxr14\clip(496,60,800,250)\p1", BOX),
+        (900, 90, r"\bs4\box0\4c&HFF0000&\4a&H00&\boxp16\p1", BOX),
+    ])
+    locations = {"rings": (120, 90), "rounded": (500, 90), "off": (900, 90)}
+    playback("csri", CANDIDATE, boxes, ROOT / "boxes")
+    playback("rgba", MANG, boxes, ROOT / "boxes-reference")
+    tested = captures(ROOT / "boxes", locations)
+    expected_box = captures(ROOT / "boxes-reference", locations)
+    for case, x, y, expected in [
+        ("rings", -6, 50, (0, 0, 255)),
+        ("rings", -12, 50, (0, 255, 0)),
+        ("rings", -17, 50, (255, 0, 0)),
+        ("rings", -23, 50, (0, 0, 0)),
+        ("rings", 212, 50, (0, 0, 255)),
+        ("rounded", -5, 50, (0, 0, 0)),
+        ("rounded", 100, -8, (0, 0, 255)),
+        ("off", -6, 50, (0, 0, 0)),
+    ]:
+        close(tested(60, case, x, y), expected)
+        close(expected_box(60, case, x, y), expected)
 
 for frame, color in [(60, 2), (120, 0)]:
     assert sum(new(frame, "karaoke", x, y)[color] > 200

@@ -81,15 +81,26 @@ struct OutlineStyle
     double scaleX = 1, scaleY = 1;
 };
 
+struct BoxShape
+{
+    std::array<double, 4> padding{}; // left, right, top, bottom
+    double radius = 0;
+};
+
+constexpr int NativeSlideStart = 8;
+constexpr int BoxSlideStart = NativeSlideStart + 2 * (MaxOutlineLayers - 1);
+
 struct SlideSettings
 {
     std::array<double, 8> channels{};
     std::array<double, 2 * (MaxOutlineLayers - 1)> outline{};
+    std::array<double, 2 * MaxOutlineLayers> box{};
     double global = 0;
 
     double Width(int part) const
     {
-        const double channel = part < int(channels.size()) ? channels[part] : outline[part - channels.size()];
+        const double channel = part < NativeSlideStart ? channels[part] :
+            part < BoxSlideStart ? outline[part - NativeSlideStart] : box[part - BoxSlideStart];
         const double setting = channel ? channel : global;
         return setting == -1 ? 0 : setting > 0 ? setting : -1;
     }

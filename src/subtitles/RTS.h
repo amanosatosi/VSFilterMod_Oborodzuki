@@ -75,6 +75,7 @@ public:
     int m_width, m_ascent, m_descent;
 
     CWord(STSStyle& style, CStringW str, int ktype, int kstart, int kend, double scalex, double scaley); // str[0] = 0 -> m_fLineBreak = true (in this case we only need and use the height of m_font from the whole class)
+    CWord(CWord& word);
     virtual ~CWord();
 
     virtual CWord* Copy() = 0;
@@ -221,6 +222,13 @@ class CSubtitle : public CAtlList<CLine*>
 public:
     unsigned m_paintSegments = 0;
     std::unique_ptr<KfxPaint::SlideSettings> m_slideSettings;
+#ifdef _VSMOD
+    int m_borderStyleOverride = -1;
+    int m_boxMode = -1;
+    bool m_revealKaraoke = false;
+    std::vector<std::unique_ptr<CWord>> m_eventBox;
+    void CreateEventBox(int borderStyle, int time, bool scaledBorder);
+#endif
     int m_scrAlignment;
     int m_wrapStyle;
     bool m_fAnimated;
