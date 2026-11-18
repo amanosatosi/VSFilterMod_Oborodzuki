@@ -60,14 +60,21 @@ legacy = write("animated-scenes-solid", [
 def benchmark(dll, scenario, workers, mode):
     env = dict(os.environ, OBORODZUKI_WORKERS=str(workers), OBORODZUKI_BENCH_ITERATION="1")
     p = subprocess.run([str(BENCH), "csri", str(dll), str(scenario[0]), mode], check=True,
-                       capture_output=True, text=True, timeout=180)
-    return json.loads(p.stdout)
+                       env=env, capture_output=True, text=True, timeout=180)
+    result = json.loads(p.stdout)
+    if mode == "animation" and result["frames"] != 120:
+        raise RuntimeError("Render benchmark did not receive its iteration environment")
+    return result
 
 
 if sys.argv[1:] == ["--profile"]:
     results = [dict(benchmark(Path("bundle/renderer.dll").resolve(), scene, n, "animation"),
                     scene=scene[0].stem, workers=n)
                for scene in (legacy, heavy) for n in (1, 2, 4)]
+    for result in results:
+        band_plan = next(stage for stage in result["profile"] if stage["name"] == "band_plan")
+        if bool(band_plan["calls"]) != (result["workers"] > 1):
+            raise RuntimeError(f"Unexpected band planning at {result['workers']} workers")
     (ROOT / "paint-profile.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
     sys.exit()
 
