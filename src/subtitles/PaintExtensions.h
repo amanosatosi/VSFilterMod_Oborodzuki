@@ -95,6 +95,7 @@ struct OutlineLayer
     int edgeBlur = -1;
     int color = -1, inverseAlpha = -1;
     int waitingColor = -1;
+    Source waitingPaint;
     std::array<Source, 2> paint;
 };
 
@@ -112,17 +113,23 @@ struct BoxShape
 
 constexpr int NativeSlideStart = 8;
 constexpr int BoxSlideStart = NativeSlideStart + 2 * (MaxOutlineLayers - 1);
+constexpr int WaitingSlidePart = BoxSlideStart + 2 * MaxOutlineLayers;
+constexpr int PositionedAlphaSlidePart = WaitingSlidePart + 1;
 
 struct SlideSettings
 {
     std::array<double, 8> channels{};
     std::array<double, 2 * (MaxOutlineLayers - 1)> outline{};
     std::array<double, 2 * MaxOutlineLayers> box{};
+    double waiting = 0;
+    double positionedAlpha = 0;
     double global = 0;
 
     double Width(int part) const
     {
-        const double channel = part < NativeSlideStart ? channels[part] :
+        const double channel = part == PositionedAlphaSlidePart ? positionedAlpha :
+            part == WaitingSlidePart ? waiting :
+            part < NativeSlideStart ? channels[part] :
             part < BoxSlideStart ? outline[part - NativeSlideStart] : box[part - BoxSlideStart];
         const double setting = channel ? channel : global;
         return setting == -1 ? 0 : setting > 0 ? setting : -1;

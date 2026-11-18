@@ -347,6 +347,34 @@ if ROUND2:
         except AssertionError as error:
             raise AssertionError(f"{case} at ({x},{y}): {error}") from error
 
+    opacity = write("positioned-opacity", [
+        (120, 90, r"\1c&H0000FF&\4c&H00FF00&\4a$0\shad8"
+                  r"\pgrdalpha(145,70,270,210,0,$128,$128)\p1", BOX),
+        (500, 90, r"\bs4\4c&HFF0000&\4a$0\boxp10"
+                  r"\pgrdalpha(490,70,720,220,90,$255,$255)\p1", BOX),
+        (900, 90, r"\bord8\3c&H00FF00&\3sgrd(0,&H0000FF&,&HFF0000&)\kt25\k25\p1", BOX),
+        (1300, 90, r"\bord8\3c&H00FF00&\kt25\kO25\p1", BOX),
+    ])
+    positions = {"mask": (120, 90), "box": (500, 90), "wait": (900, 90), "reveal": (1300, 90)}
+    playback("csri", CANDIDATE, opacity, ROOT / "opacity")
+    playback("rgba", MANG, opacity, ROOT / "opacity-reference")
+    actual = captures(ROOT / "opacity", positions)
+    expected_opacity = captures(ROOT / "opacity-reference", positions)
+    for frame, case, x, y, color in [
+        (60, "mask", 50, 50, (127, 0, 0)),
+        (60, "mask", 180, 50, (255, 0, 0)),
+        (60, "box", 50, 50, (0, 0, 255)),
+        (60, "wait", 25, -4, (215, 0, 40)),
+        (90, "wait", 25, -4, (0, 255, 0)),
+        (60, "reveal", 50, 50, (0, 0, 0)),
+        (90, "reveal", 50, 50, (255, 255, 239)),
+    ]:
+        try:
+            close(actual(frame, case, x, y), color)
+            close(expected_opacity(frame, case, x, y), color)
+        except AssertionError as error:
+            raise AssertionError(f"{case} at {frame} ({x},{y}): {error}") from error
+
 for frame, color in [(60, 2), (120, 0)]:
     assert sum(new(frame, "karaoke", x, y)[color] > 200
                for x in range(250) for y in range(85)) > 100, "karaoke channel unavailable"
@@ -367,6 +395,7 @@ if ROUND2:
          r"\bs5\bord($height/30)\2bs5\2bgrd(30,$white,$black)\2bga(90,$0,$150)"
          r"\t(0,25%,\2bs~+2\2bgrd(90,$black,$white))\grds($width/4)"
          r"\pgrd(100,100,1600,900,40,&H00FF00&,$white)\t(300,800,\pos(~+15,~-8))"
+         r"\pgrdalpha(100,100,1600,900,20,$0,$120)"
          r"\fad(400,250,&HFF0000&+a,$black)\p1"
          if i % 2 else r"\bs4\boxp(7,9,8,12)\boxr10\bbs4\bbgrd(65,$white,$black)"
                        r"\4a$0\t(200,850,\frz20\scale90)\1grd(45,$white,$black)\p1",

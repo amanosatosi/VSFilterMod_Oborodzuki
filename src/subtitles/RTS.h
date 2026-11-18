@@ -239,6 +239,7 @@ public:
     struct LineAlignment { int first, inherited; };
     std::map<int, LineAlignment> m_lineAlignment;
     int m_logicalLine = 0, m_textAnchor = -1, m_textWidth = 0;
+    unsigned m_positionedAlphaScopes = 0;
     void CreateEventBox(int borderStyle, int time, bool scaledBorder);
 #endif
     int m_scrAlignment;

@@ -4100,7 +4100,7 @@ MOD_GRADIENT::MOD_GRADIENT()
 
 bool MOD_GRADIENT::operator == (MOD_GRADIENT& mg)
 {
-    return (paint == mg.paint && (!paint || legacyParts == mg.legacyParts)
+    return (paint == mg.paint && positionedOpacity == mg.positionedOpacity && (!paint || legacyParts == mg.legacyParts)
             && color[0][0] == mg.color[0][0]
             && color[1][0] == mg.color[1][0]
             && color[2][0] == mg.color[2][0]
@@ -4164,6 +4164,7 @@ void MOD_GRADIENT::clear()
     img_alpha = 0;
     clipDiff = 0;
     paint.reset();
+    positionedOpacity.reset();
     legacyParts = 0;
 }
 

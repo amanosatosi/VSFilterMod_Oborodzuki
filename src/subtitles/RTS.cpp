@@ -603,7 +603,7 @@ bool CWord::HasNativeOutline() const
     for (const auto& layer : m_style.nativeOutline->layers)
     {
         if (layer.number ? layer.x > 0 || layer.y > 0 :
-            (layer.blur >= 0 || layer.edgeBlur >= 0 || layer.waitingColor >= 0) &&
+            (layer.blur >= 0 || layer.edgeBlur >= 0 || layer.waitingColor >= 0 || layer.waitingPaint) &&
                 m_style.outlineWidthX + m_style.outlineWidthY > 0)
             return true;
     }
@@ -689,6 +689,7 @@ CRect CWord::DrawNativeOutline(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, 
         const DWORD opacity = MulDiv(255 - alpha, 255 - fade, 255);
         MOD_GRADIENT extra;
         extra.paint = r->paint;
+        extra.positionedOpacity = m_style.mod_grad.positionedOpacity;
         extra.fadalpha = fade;
         MOD_GRADIENT& paint = layer && layer->number ? extra : m_style.mod_grad;
         const auto draw = [&](CRect region, DWORD color, MOD_GRADIENT& shading) {
@@ -697,7 +698,7 @@ CRect CWord::DrawNativeOutline(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, 
             bounds |= r->mask->Draw(spd, region, mask, x, y, colors, true, false, 2,
                 shading, vectorClip, m_style.mod_blendMode);
         };
-        const bool waiting = layer && layer->waitingColor >= 0 && m_ktype != 2 && m_ktype != 3 &&
+        const bool waiting = layer && (layer->waitingColor >= 0 || layer->waitingPaint) && m_ktype != 2 && m_ktype != 3 &&
             time < (m_ktype == 1 ? m_kend : m_kstart);
         if (!waiting)
         {
@@ -726,10 +727,10 @@ CRect CWord::DrawNativeOutline(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, 
         auto waitingPaint = paint;
         auto parts = paint.paint ? std::make_shared<KfxPaint::Sources>(*paint.paint) :
             std::make_shared<KfxPaint::Sources>();
-        parts->parts[4].reset();
+        parts->parts[4] = layer->waitingPaint;
         waitingPaint.paint = std::move(parts);
         waitingPaint.legacyParts &= ~(1u << 4);
-        draw(inactive, layer->waitingColor, waitingPaint);
+        draw(inactive, layer->waitingColor >= 0 ? DWORD(layer->waitingColor) : rgb, waitingPaint);
     }
     return bounds;
 }
@@ -2182,7 +2183,8 @@ CRect CLine::PaintShadow(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPo
             else if(w->m_style.borderStyle == 1 && w->m_pOpaqueBox)
             {
 #ifdef _VSMOD // patch m004. gradient colors
-                bbox |= w->m_pOpaqueBox->Draw(spd, clipRect, pAlphaMask, x, y, sw, true, false, 3, w->m_style.mod_grad, mod_vc, w->m_style.mod_blendMode);
+                bbox |= w->m_pOpaqueBox->Draw(spd, clipRect, pAlphaMask, x, y, sw, true, false, 3,
+                    w->m_style.mod_grad, mod_vc, w->m_style.mod_blendMode, false, false);
 #else
                 bbox |= w->m_pOpaqueBox->Draw(spd, clipRect, pAlphaMask, x, y, sw, true, false);
 #endif
@@ -2265,7 +2267,8 @@ CRect CLine::PaintOutline(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CP
             else if(w->m_style.borderStyle == 1 && w->m_pOpaqueBox)
             {
 #ifdef _VSMOD // patch m004. gradient colors
-                bbox |= w->m_pOpaqueBox->Draw(spd, clipRect, pAlphaMask, x, y, sw, true, false, 2, w->m_style.mod_grad, mod_vc, w->m_style.mod_blendMode);
+                bbox |= w->m_pOpaqueBox->Draw(spd, clipRect, pAlphaMask, x, y, sw, true, false, 2,
+                    w->m_style.mod_grad, mod_vc, w->m_style.mod_blendMode, false, false);
 #else
                 bbox |= w->m_pOpaqueBox->Draw(spd, clipRect, pAlphaMask, x, y, sw, true, false);
 #endif
@@ -3483,11 +3486,13 @@ struct PaintTag
     int part;
     bool slide;
     bool positioned;
+    bool positionedAlpha;
     CStringW argument;
 };
 
 enum class OutlineProperty { Width, WidthX, WidthY, Color, Alpha, Blur, EdgeBlur, Corners,
-    AlphaCorners, Gradient, AlphaGradient, Positioned, Slide, AlphaSlide, Waiting };
+    AlphaCorners, Gradient, AlphaGradient, Positioned, Slide, AlphaSlide, Waiting,
+    WaitingCorners, WaitingGradient, WaitingSlide };
 
 struct OutlineTag
 {
@@ -3536,8 +3541,17 @@ bool ReadPaintTag(const CStringW& name, PaintTag& tag)
     }
     if (*p != L'g' && *p != L'v' && *p != L'p') return false;
     tag.positioned = !wcsncmp(p, L"pgrd", 4);
-    if (tag.positioned && !wcsncmp(p + 4, L"alpha", 5))
-        return false;
+    tag.positionedAlpha = tag.positioned && !channel && !wcsncmp(p + 4, L"alpha", 5);
+    if (tag.positionedAlpha)
+    {
+        p += 9;
+        tag.slide = *p == L's';
+        if (tag.slide) ++p;
+        tag.part = KfxPaint::PositionedAlphaSlidePart;
+        tag.argument = p;
+        tag.argument.Trim();
+        return true;
+    }
     const bool color = !wcsncmp(p, L"grd", 3) || tag.positioned;
     const bool alpha = !wcsncmp(p, L"gra", 3);
     if (color || (alpha && channel))
@@ -3578,11 +3592,39 @@ bool ReadOutlineTag(const CStringW& name, OutlineTag& tag)
             p = next;
         }
     }
+    using P = OutlineProperty;
+    if (number == 3 && *p == L's')
+    {
+        tag.layer = 0;
+        if (!wcsncmp(p, L"sgrds", 5) || !wcsncmp(p, L"svcs", 4))
+        {
+            tag.property = P::WaitingSlide;
+            p += p[1] == L'g' ? 5 : 4;
+        }
+        else if (!wcsncmp(p, L"sgrd", 4))
+        {
+            tag.property = P::WaitingGradient;
+            p += 4;
+        }
+        else if (!wcsncmp(p, L"svc", 3))
+        {
+            tag.property = P::WaitingCorners;
+            p += 3;
+        }
+        else if (!wcsncmp(p, L"sc", 2))
+        {
+            tag.property = P::Waiting;
+            p += 2;
+        }
+        else return false;
+        tag.argument = p;
+        tag.argument.Trim();
+        return true;
+    }
     if (*p++ != L'b')
         return false;
     tag.box = *p == L'b';
     if (tag.box) ++p;
-    using P = OutlineProperty;
     static constexpr struct { const wchar_t* name; P property; } names[] = {
         {L"pgrds", P::Slide}, {L"grds", P::Slide}, {L"gas", P::AlphaSlide}, {L"vcs", P::Slide}, {L"vas", P::AlphaSlide},
         {L"pgrd", P::Positioned},
@@ -4473,13 +4515,15 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             auto& ringState = outline.box ? style.boxRings : style.nativeOutline;
             const bool inverse = property == P::Alpha || property == P::AlphaCorners ||
                 property == P::AlphaGradient || property == P::AlphaSlide;
-            const int part = (outline.box ? BoxSlideStart + 2 * int(outline.layer) :
+            const bool waitingField = property == P::WaitingGradient || property == P::WaitingCorners;
+            const int part = waitingField || property == P::WaitingSlide ? WaitingSlidePart :
+                (outline.box ? BoxSlideStart + 2 * int(outline.layer) :
                 base ? 4 : NativeSlideStart + 2 * int(outline.layer - 1)) + int(inverse);
             const double progress = paintProgress();
             if (progress <= 0 || (!params.empty() && !outline.argument.IsEmpty()))
                 continue;
             const auto& argument = params.empty() ? outline.argument : p;
-            if (property == P::Slide || property == P::AlphaSlide)
+            if (property == P::Slide || property == P::AlphaSlide || property == P::WaitingSlide)
             {
                 if (params.size() > 1) continue;
                 double value = 0;
@@ -4493,13 +4537,14 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     if (!value) value = -1;
                 }
                 auto& state = editSlides();
-                (outline.box ? state.box[part - BoxSlideStart] :
+                (property == P::WaitingSlide ? state.waiting : outline.box ? state.box[part - BoxSlideStart] :
                     base ? state.channels[part] : state.outline[part - NativeSlideStart]) = value;
                 continue;
             }
             const bool positioned = property == P::Positioned;
-            const bool gradient = property == P::Gradient || property == P::AlphaGradient || positioned;
-            const bool corners = property == P::Corners || property == P::AlphaCorners;
+            const bool gradient = property == P::Gradient || property == P::AlphaGradient ||
+                property == P::WaitingGradient || positioned;
+            const bool corners = property == P::Corners || property == P::AlphaCorners || property == P::WaitingCorners;
             const double width = fAnimate && slides() ? slides()->Width(part) : -1;
             if (gradient || corners)
             {
@@ -4520,7 +4565,16 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     }
                     if (target.stops.size() != 4) continue;
                 }
-                if (base)
+                if (waitingField)
+                {
+                    auto state = copyOutline(ringState);
+                    auto& layer = EditOutlineLayer(*state, 0);
+                    const Value solid = layer.waitingColor >= 0 ? Value(layer.waitingColor) : revcolor(style.colors[2]);
+                    layer.waitingPaint = reset ? Source{} : ResolvePaintSource(*sub,
+                        layer.waitingPaint, std::move(target), solid, false, progress, width, true, fAnimate);
+                    ringState = std::move(state);
+                }
+                else if (base)
                 {
                     const Value solid = inverse ? style.alpha[2] : revcolor(style.colors[2]);
                     Source old = style.mod_grad.paint ? style.mod_grad.paint->parts[part] : Source{};
@@ -4570,7 +4624,15 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     auto& layer = EditOutlineLayer(*state, outline.layer);
                     auto& dest = property == P::Waiting ? layer.waitingColor : inverse ? layer.inverseAlpha : layer.color;
                     const Value from = dest >= 0 ? Value(dest) : inverse ? style.alpha[channel] : revcolor(style.colors[channel]);
-                    if (property != P::Waiting)
+                    if (property == P::Waiting)
+                    {
+                        Paint target;
+                        target.solid = value;
+                        const double waitingWidth = fAnimate && slides() ? slides()->Width(WaitingSlidePart) : -1;
+                        layer.waitingPaint = reset ? Source{} : ResolvePaintSource(*sub, layer.waitingPaint,
+                            std::move(target), from, false, progress, layer.waitingPaint ? waitingWidth : -1, true);
+                    }
+                    else
                     {
                         Paint target;
                         target.solid = value;
@@ -4653,7 +4715,27 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     if (setting == 0) setting = -1;
                 }
                 auto& state = editSlides();
-                (paint.part < 0 ? state.global : state.channels[paint.part]) = setting;
+                (paint.positionedAlpha ? state.positionedAlpha :
+                    paint.part < 0 ? state.global : state.channels[paint.part]) = setting;
+            }
+            else if (paint.positionedAlpha)
+            {
+                if (!tag.parenthesized || !paint.argument.IsEmpty()) continue;
+                auto& source = style.mod_grad.positionedOpacity;
+                if (params.empty())
+                {
+                    if (!fAnimate) source.reset();
+                    continue;
+                }
+                constexpr unsigned maxScopes = 32;
+                if (sub->m_positionedAlphaScopes >= maxScopes) continue;
+                KfxPaint::Paint field;
+                if (!readField(params, true, true, field)) continue;
+                const double progress = paintProgress();
+                if (progress <= 0) continue;
+                source = ResolvePaintSource(*sub, source, std::move(field), 0, true, progress,
+                    fAnimate && slides() ? slides()->Width(paint.part) : -1, false, fAnimate);
+                ++sub->m_positionedAlphaScopes;
             }
             else if (params.empty() && (paint.argument.IsEmpty() || paint.argument == L"0"))
             {
@@ -6586,6 +6668,9 @@ static CRect PaintFrameBands(EventWorkerPool& pool, const std::vector<FramePaint
         int top = 0, bottom = 0;
         uint64_t pixels = 0;
         std::vector<const OverlayDraw*> draws;
+#ifdef _VSMOD
+        bool positionedAlpha = false;
+#endif
     };
     // Bound the number of jobs for large surfaces. Smaller bands distribute
     // overlapping effects independently of how many distinct events draw them.
@@ -6611,6 +6696,9 @@ static CRect PaintFrameBands(EventWorkerPool& pool, const std::vector<FramePaint
                         (std::max)(int(draw.bounds.top), band.top);
                     band.pixels += uint64_t(rows) * draw.bounds.Width();
                     band.draws.push_back(&draw);
+#ifdef _VSMOD
+                    if (draw.gradient.positionedOpacity) band.positionedAlpha = true;
+#endif
                 }
             }
         }
@@ -6620,8 +6708,7 @@ static CRect PaintFrameBands(EventWorkerPool& pool, const std::vector<FramePaint
     if (totalPixels < 2 * pixelsPerWorker)
     {
         for (const auto& event : overlays)
-            for (const auto& draw : event.draws)
-                draw.Blend(draw.bounds.top, draw.bounds.bottom);
+            event.Blend();
         return bounds;
     }
 
@@ -6636,6 +6723,13 @@ static CRect PaintFrameBands(EventWorkerPool& pool, const std::vector<FramePaint
             if (band.draws.empty())
                 break;
             work.emplace_back([job = &band] {
+#ifdef _VSMOD
+                if (job->positionedAlpha)
+                {
+                    BlendCapturedBands(job->draws, job->top, job->bottom);
+                    return;
+                }
+#endif
                 for (const auto* draw : job->draws)
                     draw->Blend(job->top, job->bottom);
             });
@@ -7212,7 +7306,7 @@ try
                 style.mod_grad.subpixy = origin.y & 7;
                 const auto drawBox = [&](CRect& clip) {
                     bbox2 |= box.Draw(spd, clip, pAlphaMask, origin.x, origin.y, colors, true, false, 3,
-                        style.mod_grad, mod_vc, style.mod_blendMode);
+                        style.mod_grad, mod_vc, style.mod_blendMode, false, false);
                 };
                 if (s->m_clipInverse)
                     for (auto& clip : iclipRect) drawBox(clip);
@@ -7349,8 +7443,7 @@ try
                     const OverlayCaptureScope capture(overlays);
                     bounds = paint();
                 }
-                for (const auto& draw : overlays.draws)
-                    draw.Blend(draw.bounds.top, draw.bounds.bottom);
+                overlays.Blend();
                 return bounds;
             };
             if (parallel)

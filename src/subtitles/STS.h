@@ -170,6 +170,7 @@ public:
 
     int clipDiff;
     std::shared_ptr<const KfxPaint::Sources> paint;
+    KfxPaint::Source positionedOpacity;
     unsigned legacyParts = 0;
 
     MOD_GRADIENT();

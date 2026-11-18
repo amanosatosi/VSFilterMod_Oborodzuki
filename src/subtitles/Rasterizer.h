@@ -74,6 +74,8 @@ public:
     MOD_BLEND mod_blendMode = BLEND_NORMAL;
 };
 
+struct OverlayDrawList;
+
 struct OverlayDraw
 {
     CRect bounds;
@@ -90,6 +92,7 @@ struct OverlayDraw
     KfxPaint::Fade paintFade;
     double paintScaleX = 1, paintScaleY = 1;
     bool reversePaint = false;
+    const OverlayDrawList* captureOwner = nullptr;
 #else
     int maskPitch;
 #endif
@@ -104,7 +107,15 @@ struct OverlayDrawList
     // Keep earlier phases alive until all bands have read them.
     std::vector<std::unique_ptr<BYTE[]>> retiredMasks;
     std::map<unsigned, CRect> paintSegments;
+#ifdef _VSMOD
+    bool hasPositionedAlpha = false;
+#endif
+    void Blend() const;
 };
+
+#ifdef _VSMOD
+void BlendCapturedBands(const std::vector<const OverlayDraw*>& draws, int top, int bottom);
+#endif
 
 #ifdef _VSMOD
 class OverlayPaintScope
@@ -223,7 +234,7 @@ public:
         bool separateMask = false);
     int getOverlayWidth();
 #ifdef _VSMOD // patch m004. gradient colors
-    CRect Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int xsub, int ysub, const DWORD* switchpts, bool fBody, bool fBorder, int typ, MOD_GRADIENT& mod_grad, MOD_MOVEVC& mod_vc, MOD_BLEND mod_blendMode, bool reversePaint = false);
+    CRect Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int xsub, int ysub, const DWORD* switchpts, bool fBody, bool fBorder, int typ, MOD_GRADIENT& mod_grad, MOD_MOVEVC& mod_vc, MOD_BLEND mod_blendMode, bool reversePaint = false, bool applyPositionedAlpha = true);
 #else
     CRect Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int xsub, int ysub, const DWORD* switchpts, bool fBody, bool fBorder);
 #endif

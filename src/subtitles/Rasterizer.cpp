@@ -1449,6 +1449,156 @@ void OverlayDraw::Blend(int top, int bottom) const
 #endif
 }
 
+#ifdef _VSMOD
+namespace
+{
+struct PositionedDraw
+{
+    struct Pixel { DWORD color = 0; BYTE coverage = 0; };
+    const OverlayDraw& draw;
+    COverlayKfxPaint color;
+    KfxPaint::Sampler opacity;
+    std::vector<Pixel> row;
+    size_t scope;
+    int divider;
+
+    PositionedDraw(const OverlayDraw& source, size_t scopeIndex)
+        : draw(source), color(source), row(source.bounds.Width()), scope(scopeIndex),
+          divider(source.info.sw[1] == DWORD(-1) ? source.bounds.Width() :
+            int((std::max)(int64_t(0), (std::min)(int64_t(source.bounds.Width()),
+                int64_t(int32_t(source.info.sw[3])) + 1 - source.info.xo))))
+    {
+        opacity.Prepare(draw.gradient.positionedOpacity.get(), {}, draw.paintScaleX, draw.paintScaleY, true);
+    }
+
+    void Sample(int y, int left, float* above)
+    {
+        const int fromBottom = draw.bounds.bottom - y - 1;
+        const auto offset = 2 * ptrdiff_t(draw.info.overlayp) * (y - draw.bounds.top);
+        const auto* source = draw.info.src + offset;
+        const auto* selected = draw.info.s + offset;
+        if (!draw.body && draw.alphaMask && !draw.gradient.paint)
+            source = selected;
+        for (int x = 0; x < int(row.size()); ++x)
+        {
+            auto& pixel = row[x];
+            pixel.coverage = draw.body ? selected[2 * x] :
+                BYTE((std::max)(0, source[2 * x + 1] - source[2 * x]));
+            if (draw.alphaMask && pixel.coverage)
+                pixel.coverage = BYTE(pixel.coverage * draw.maskPosition.GetAlphaValue(x, fromBottom) >> 6);
+            if (!pixel.coverage) continue;
+            pixel.color = x < divider ? color.getcolor1(x, fromBottom) : color.getcolor2(x, fromBottom);
+            const unsigned original = pixel.coverage * (pixel.color >> 24) >> 6;
+            const int screenX = draw.bounds.left + x;
+            auto& remaining = above[screenX - left];
+            const auto inverse = opacity.At(screenX + 0.5, y + 0.5, 0, 0);
+            if (inverse)
+            {
+                // Allocate this source's share of the masked finished paint.
+                // The sources above it must still attenuate it in painter order.
+                const double k = (255 - inverse) / 255.0;
+                const auto adjusted = unsigned(std::lround(original * k * remaining / (1 - k + k * remaining)));
+                pixel.coverage = adjusted ? 64 : 0;
+                pixel.color = (pixel.color & 0xffffff) | (adjusted << 24);
+            }
+            remaining *= 1 - original / 255.f;
+        }
+    }
+
+    template<class Mixer>
+    void Blend(int y, Mixer& mixer) const
+    {
+        auto* dst = reinterpret_cast<DWORD*>(reinterpret_cast<BYTE*>(draw.info.dst) +
+            ptrdiff_t(y - draw.bounds.top) * draw.info.pitch);
+        for (int x = 0; x < int(row.size()); ++x)
+            if (row[x].coverage)
+                mixer.PixMix(dst + x, row[x].color, row[x].coverage, draw.info.mod_blendMode);
+    }
+};
+
+void BlendPositionedOverlays(const OverlayDraw* const* draws, size_t count, int top, int bottom)
+{
+    int left = INT_MAX, right = INT_MIN;
+    int firstRow = bottom, lastRow = top;
+    std::vector<const KfxPaint::Paint*> scopes;
+    std::vector<std::unique_ptr<PositionedDraw>> positioned(count);
+    for (size_t i = 0; i < count; ++i)
+    {
+        const auto& draw = *draws[i];
+        firstRow = (std::min)(firstRow, int(draw.bounds.top));
+        lastRow = (std::max)(lastRow, int(draw.bounds.bottom));
+        const auto* mask = draw.gradient.positionedOpacity.get();
+        if (!mask) continue;
+        const auto old = std::find(scopes.begin(), scopes.end(), mask);
+        const size_t scope = old - scopes.begin();
+        if (old == scopes.end()) scopes.push_back(mask);
+        positioned[i] = std::make_unique<PositionedDraw>(draw, scope);
+        left = (std::min)(left, int(draw.bounds.left));
+        right = (std::max)(right, int(draw.bounds.right));
+    }
+    const size_t width = scopes.empty() ? 0 : right - left;
+    std::vector<float> above(width * scopes.size());
+    RasterizerNfo unused{};
+    COverlayMixer scalar(&unused, nullptr);
+    COverlayMixerSSE2 simd(&unused, nullptr);
+    const bool sse2 = (g_cpuid.m_flags & CCpuID::sse2) != 0;
+    for (int y = (std::max)(top, firstRow); y < (std::min)(bottom, lastRow); ++y)
+    {
+        std::fill(above.begin(), above.end(), 1.f);
+        for (size_t i = count; i-- > 0;)
+            if (positioned[i] && draws[i]->bounds.top <= y && draws[i]->bounds.bottom > y)
+                positioned[i]->Sample(y, left, above.data() + positioned[i]->scope * width);
+        for (size_t i = 0; i < count; ++i)
+        {
+            if (draws[i]->bounds.top > y || draws[i]->bounds.bottom <= y) continue;
+            if (!positioned[i])
+                draws[i]->Blend(y, y + 1);
+            else if (sse2)
+                positioned[i]->Blend(y, simd);
+            else
+                positioned[i]->Blend(y, scalar);
+        }
+    }
+#ifndef _M_X64
+    _mm_empty();
+#endif
+}
+}
+
+void BlendCapturedBands(const std::vector<const OverlayDraw*>& draws, int top, int bottom)
+{
+    for (size_t i = 0; i < draws.size();)
+    {
+        const auto* owner = draws[i]->captureOwner;
+        if (!owner || !owner->hasPositionedAlpha)
+        {
+            draws[i++]->Blend(top, bottom);
+            continue;
+        }
+        size_t end = i + 1;
+        while (end < draws.size() && draws[end]->captureOwner == owner) ++end;
+        BlendPositionedOverlays(draws.data() + i, end - i, top, bottom);
+        i = end;
+    }
+}
+#endif
+
+void OverlayDrawList::Blend() const
+{
+#ifdef _VSMOD
+    if (hasPositionedAlpha)
+    {
+        std::vector<const OverlayDraw*> commands;
+        commands.reserve(draws.size());
+        for (const auto& draw : draws) commands.push_back(&draw);
+        BlendPositionedOverlays(commands.data(), commands.size(), 0, INT_MAX);
+        return;
+    }
+#endif
+    for (const auto& draw : draws)
+        draw.Blend(draw.bounds.top, draw.bounds.bottom);
+}
+
 // Render a subpicture onto a surface.
 // spd is the surface to render on.
 // clipRect is a rectangular clip region to render inside.
@@ -1460,7 +1610,7 @@ void OverlayDraw::Blend(int top, int bottom) const
 // fBorder tells whether to render the border of the subs.
 #ifdef _VSMOD // patch m004. gradient colors
 CRect Rasterizer::Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int xsub, int ysub,
-                       const DWORD* switchpts, bool fBody, bool fBorder, int typ, MOD_GRADIENT& mod_grad, MOD_MOVEVC& mod_vc, MOD_BLEND mod_blendMode, bool reversePaint)
+                       const DWORD* switchpts, bool fBody, bool fBorder, int typ, MOD_GRADIENT& mod_grad, MOD_MOVEVC& mod_vc, MOD_BLEND mod_blendMode, bool reversePaint, bool applyPositionedAlpha)
 #else
 CRect Rasterizer::Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int xsub, int ysub,
                        const DWORD* switchpts, bool fBody, bool fBorder)
@@ -1571,6 +1721,7 @@ CRect Rasterizer::Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int x
     draw.maskPosition.curpos = CPoint(x, y);
     draw.maskPosition.alphamask = draw.alphaMask;
     draw.gradient = mod_grad;
+    if (!applyPositionedAlpha) draw.gradient.positionedOpacity.reset();
     draw.gradient.width = mOverlayWidth;
     draw.gradient.height = mOverlayHeight;
     draw.gradient.xoffset = xo;
@@ -1633,7 +1784,20 @@ CRect Rasterizer::Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int x
 #endif
 
     if (activeOverlayDraws)
+    {
+#ifdef _VSMOD
+        draw.captureOwner = activeOverlayDraws;
+        if (draw.gradient.positionedOpacity) activeOverlayDraws->hasPositionedAlpha = true;
+#endif
         activeOverlayDraws->draws.push_back(std::move(draw));
+    }
+#ifdef _VSMOD
+    else if (draw.gradient.positionedOpacity)
+    {
+        const OverlayDraw* command = &draw;
+        BlendPositionedOverlays(&command, 1, bbox.top, bbox.bottom);
+    }
+#endif
     else
         draw.Blend(bbox.top, bbox.bottom);
     return bbox;
