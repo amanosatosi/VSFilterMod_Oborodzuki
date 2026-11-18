@@ -31,7 +31,8 @@ def write(name, entries):
     ass = HEADER
     for index, (x, y, tags, body) in enumerate(entries):
         ass += f"Dialogue: {index % 3},0:00:01.00,0:00:05.00,Default,,0,0,0,,"
-        ass += rf"{{\an7\pos({x},{y})\bord0\shad0{tags}}}" + body + "\n"
+        position = "" if r"\move(" in tags else rf"\pos({x},{y})"
+        ass += rf"{{\an7{position}\bord0\shad0{tags}}}" + body + "\n"
     path.write_text(ass, encoding="utf-8-sig")
     return path.resolve(), len(entries)
 
@@ -122,7 +123,7 @@ if ROUND2:
 coords = {}
 entries = []
 for i, (case, tags) in enumerate(cases.items()):
-    x, y = 75 + (i % 5) * 340, 60 + (i // 5) * 163
+    x, y = 75 + (i % 5) * 340, 60 + (i // 5) * (138 if ROUND2 else 163)
     coords[case] = (x, y)
     if case == "clip":
         tags += rf"\clip({x+80},{y},{x+200},{y+100})"
@@ -153,6 +154,8 @@ def captures(path, positions=coords):
 
     def get(frame, case, x=100, y=50):
         left, top = positions[case]
+        if not (0 <= left + x < 1920 and 0 <= top + y < 1080):
+            raise ValueError(f"Pixel probe for {case} is outside the frame")
         i = offsets[frame] + ((top + y) * 1920 + left + x) * 4
         b, g, r = images[frame][i:i + 3]
         return r, g, b
@@ -263,6 +266,22 @@ if ROUND2:
     ]:
         close(tested(60, case, x, y), expected)
         close(expected_box(60, case, x, y), expected)
+
+    fixed = write("positioned-paint", [
+        (100, 460, r"\move(100,460,200,460,0,1000)\1c&H00FF00&"
+                   r"\pgrd(160,460,260,560,0,&H0000FF&,&HFF0000&)\p1", BOX),
+    ])
+    locations = {"moving": (0, 460)}
+    playback("csri", CANDIDATE, fixed, ROOT / "fixed")
+    playback("rgba", MANG, fixed, ROOT / "fixed-reference")
+    moving = captures(ROOT / "fixed", locations)
+    fixed_reference = captures(ROOT / "fixed-reference", locations)
+    for frame, x, rgb in [
+        (60, 145, (0, 255, 0)), (60, 220, (101, 0, 154)), (90, 220, (101, 0, 154)),
+        (120, 220, (101, 0, 154)), (120, 285, (0, 255, 0)),
+    ]:
+        close(moving(frame, "moving", x), rgb)
+        close(fixed_reference(frame, "moving", x), rgb)
 
 for frame, color in [(60, 2), (120, 0)]:
     assert sum(new(frame, "karaoke", x, y)[color] > 200

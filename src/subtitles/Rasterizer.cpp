@@ -1393,7 +1393,7 @@ CRect Rasterizer::Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int x
         const int first = 2 * typ;
         bool hasField = false;
         for (int part = first; part < last; ++part)
-            hasField = hasField || bool(parts[part]);
+            hasField = hasField || (parts[part] && !parts[part]->positioned);
         if (hasField)
         {
             PROFILE_RENDER_STAGE(PaintBounds);
@@ -1418,7 +1418,7 @@ CRect Rasterizer::Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int x
                 paintBounds.SetRect(x, y, x+w, y+h);
             if (activeOverlayDraws && top < bottom)
                 for (int part = first; part < last; ++part)
-                    if (parts[part])
+                    if (parts[part] && !parts[part]->positioned)
                     {
                         auto& segments = activeOverlayDraws->paintSegments;
                         const auto inserted = segments.emplace(parts[part]->segment, paintBounds);

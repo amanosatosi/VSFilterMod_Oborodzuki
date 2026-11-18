@@ -41,6 +41,26 @@ struct Stop
     Value value;
 };
 
+struct Rect
+{
+    double left, top, right, bottom;
+};
+
+inline Rect Normalize(Rect rect)
+{
+    if (rect.left > rect.right) std::swap(rect.left, rect.right);
+    if (rect.top > rect.bottom) std::swap(rect.top, rect.bottom);
+    return rect;
+}
+
+inline Rect Unite(Rect a, Rect b)
+{
+    a = Normalize(a);
+    b = Normalize(b);
+    return {(std::min)(a.left, b.left), (std::min)(a.top, b.top),
+            (std::max)(a.right, b.right), (std::max)(a.bottom, b.bottom)};
+}
+
 struct Paint;
 using Source = std::shared_ptr<const Paint>;
 struct Paint
@@ -48,6 +68,9 @@ struct Paint
     enum class Kind { Solid, Field, Corners, Slide };
     Kind kind = Kind::Solid;
     unsigned segment = 0;
+    bool positioned = false;
+    Rect rect{};
+    Value outside = 0;
     double angle = 0;
     Value solid = 0;
     std::vector<Stop> stops;
@@ -131,8 +154,17 @@ inline Paint Interpolate(const Paint* from, const Paint& to, Value solid, double
     Paint result;
     result.kind = Paint::Kind::Field;
     result.angle = to.angle;
+    result.positioned = to.positioned;
+    result.rect = to.rect;
+    result.outside = to.outside;
     if (from)
     {
+        if (to.positioned)
+        {
+            const auto at = [t](double a, double b) { return a * (1 - t) + b * t; };
+            result.rect = {at(from->rect.left, to.rect.left), at(from->rect.top, to.rect.top),
+                at(from->rect.right, to.rect.right), at(from->rect.bottom, to.rect.bottom)};
+        }
         const auto delta = std::fmod(to.angle - from->angle, 360.0);
         result.angle = std::fmod(from->angle +
             t * (delta > 180 ? delta - 360 : delta < -180 ? delta + 360 : delta), 360.0);
@@ -167,11 +199,6 @@ inline Paint Interpolate(const Paint* from, const Paint& to, Value solid, double
     return result;
 }
 
-struct Rect
-{
-    double left, top, right, bottom;
-};
-
 struct Projection
 {
     double dx = 0, dy = 0, low = 0, span = 0, inverseSpan = 0;
@@ -197,15 +224,24 @@ class Sampler
     {
         const Paint* paint = nullptr;
         Projection axis;
+        Rect bounds{};
 
         Endpoint() = default;
-        Endpoint(const Paint* source, Rect bounds) : paint(source),
-            axis(source->kind == Paint::Kind::Field ? Projection(bounds, source->angle) : Projection{}) {}
+        Endpoint(const Paint* source, Rect occupied) : paint(source),
+            bounds(source->positioned ? Normalize(source->rect) : occupied)
+        {
+            if (source->kind == Paint::Kind::Field)
+                axis = Projection(bounds, source->angle);
+        }
 
         Value At(double x, double y, double u, double v, bool alpha) const
         {
             if (paint->kind == Paint::Kind::Solid)
                 return paint->solid;
+            if (paint->positioned &&
+                (bounds.left >= bounds.right || bounds.top >= bounds.bottom ||
+                 x < bounds.left || x > bounds.right || y < bounds.top || y > bounds.bottom))
+                return paint->outside;
             if (paint->kind == Paint::Kind::Corners)
             {
                 // The legacy vector endpoint lives in bitmap coordinates.
@@ -244,7 +280,7 @@ public:
         alpha = inverseAlpha;
         for (; paint->kind == Paint::Kind::Slide; paint = paint->from.get())
         {
-            const Projection axis(bounds, paint->angle);
+            const Projection axis(paint->positioned ? Normalize(paint->rect) : bounds, paint->angle);
             const double scale = sx == sy ? sx : (sx > 0 && sy > 0 ?
                 1 / std::hypot(axis.dx / sx, axis.dy / sy) : 0);
             const double limit = (std::numeric_limits<double>::max)() / 2;
