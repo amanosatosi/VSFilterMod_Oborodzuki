@@ -361,6 +361,38 @@ if ROUND2:
         assert sum(r > 110 and r > 2*b and g < 12 for r, g, b in strike) >= 15
         assert sum(b > 110 and b > 2*r and g < 12 for r, g, b in strike) >= 15
 
+    details = write("ring-and-slide-regressions", [
+        (120, 120, r"\bord4\3c&H0000FF&\2bs6\2bc&H00FF00&\2bblur2\p1", BOX),
+        (480, 120, r"\bord4\3c&H0000FF&\2bs6\2bc&H00FF00&\blur2\1bblur0\2bblur0\p1", BOX),
+        (840, 120, r"\10bs5\10bc&HFF0000&\p1", BOX),
+        (1200, 120, (r"\grds($width/4)" + gd(0, RED, RED) + t(gd(0, BLUE, BLUE)) + r"\p1"), BOX),
+    ])
+    locations = {"blur": (120, 120), "sharp": (480, 120), "ten": (840, 120), "slide": (1200, 120)}
+    playback("csri", CANDIDATE, details, ROOT / "details")
+    playback("rgba", MANG, details, ROOT / "details-reference")
+    for getter in (captures(ROOT / "details", locations), captures(ROOT / "details-reference", locations)):
+        assert getter(60, "blur", -12, 50)[1] > 5
+        close(getter(60, "sharp", -12, 50), (0, 0, 0))
+        close(getter(60, "ten", -3, 50), (0, 0, 255))
+        close(getter(90, "slide", 25, 50), (0, 0, 255))
+        close(getter(90, "slide", 175, 50), (255, 0, 0))
+
+    alignment = write("logical-line-alignment", [
+        (120, 120, r"\fs48\1c$white\ta7", r"MMMM{\ta3}\NM\NM"),
+    ])
+    locations = {"lines": (120, 120)}
+    playback("csri", CANDIDATE, alignment, ROOT / "alignment")
+    playback("rgba", MANG, alignment, ROOT / "alignment-reference")
+    for getter in (captures(ROOT / "alignment", locations), captures(ROOT / "alignment-reference", locations)):
+        first_x = []
+        in_line = False
+        for y in range(200):
+            hits = [x for x in range(210) if min(getter(90, "lines", x, y)) > 200]
+            if hits and not in_line:
+                first_x.append(hits[0])
+            in_line = bool(hits)
+        assert len(first_x) == 3 and first_x[0] + 45 < first_x[1] and abs(first_x[1] - first_x[2]) <= 2, first_x
+
     geometry = write("geometric-borders", [
         (120, 90, r"\bs5\bord12\3c&H0000FF&\2bs8\2bc&HFF0000&\p1", BOX),
         (500, 90, r"\bord12\3c&H0000FF&\p1", BOX),
