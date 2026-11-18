@@ -490,7 +490,7 @@ if ROUND3:
         (860, 200, r"\fs45\1c$white\vert1\vdir1\vcolsp30", r"日A\N日本"),
         (1260, 200, r"\fs45\1c$white\vert1\vdir2\vcolsp30", r"日A\N日本"),
         (220, 690, r"\fs48\1c$white\vert0", r"minimum{\vert1}"),
-        (520, 690, r"\fs48\1c$white\vert1\vtype2\1c$red\2c$blue\kf100", "MMMM"),
+        (520, 690, rf"\fs48\vert1\vtype2\1c{RED}\2c{BLUE}\kf100", "MMMM"),
     ])
     centers = {"latin": (220, 200), "myanmar": (520, 200), "left": (860, 200),
                "right": (1260, 200), "disabled": (220, 690), "karaoke": (520, 690)}
@@ -519,7 +519,8 @@ if ROUND3:
                     red.append(y)
                 if b > 210 and r < 40:
                     blue.append(y)
-        assert red and blue and max(red) <= min(blue) + 3
+        assert red and blue and max(red) <= min(blue) + 3, (
+            len(red), len(blue), max(red, default=None), min(blue, default=None))
     expected = benchmark(CANDIDATE, vertical, 1, "regression")["hashes"]
     for workers in (2, 4, 6, 8):
         assert benchmark(CANDIDATE, vertical, workers, "regression")["hashes"] == expected
@@ -532,8 +533,8 @@ if ROUND3:
         (580, 200, r"\1c$white\p1\mpersp(0,0,1,0,0,1,1,1)", bars),
         (960, 200, r"\1c$white\p1" + pin + r"\mpersp()", bars),
         (1340, 200, r"\1c$white\p1\t(0,1000," + pin + ")", bars),
-        (200, 570, r"\fs56\1c$white\2c$red\kf100\3grd(0,$blue,$green)"
-         r"\bord4\2bs4\shad3\blur.7\fad(300,300,$red,$blue+a)" + pin, "ABCD"),
+        (200, 570, rf"\fs56\1c{WHITE}\2c{RED}\kf100\3grd(0,{BLUE},{GREEN})"
+         rf"\bord4\2bs4\shad3\blur.7\fad(300,300,{RED},{BLUE}+a)" + pin, "ABCD"),
     ])
     centers = {"warped": (200, 200), "crossed": (580, 200), "reset": (960, 200),
                "animated": (1340, 200), "paint": (200, 570)}
@@ -551,6 +552,36 @@ if ROUND3:
     expected = benchmark(CANDIDATE, perspective, 1, "regression")["hashes"]
     for workers in (2, 4, 6, 8):
         assert benchmark(CANDIDATE, perspective, workers, "regression")["hashes"] == expected
+
+    ruby = write("native-horizontal-ruby", [
+        (270, 200, rf"\fs55\1c{WHITE}\furis65", "<漢字|かんじ|KANJI>"),
+        (660, 200, rf"\fs55\1c{WHITE}\furisx60\furisy70\furistyle2\furipos(0,4)", "<漢字||KANJI>"),
+        (1100, 200, rf"\an8\fs46\1c{WHITE}\fnMyanmar Text\furis70\furichangepos2",
+         r"<satou|ဆာတို့|佐藤>-<san|စံ>\N<suzuki|စူဇူကီ|鈴木>-<kun|ကွန်း>"),
+        (300, 610, rf"\fs52\1c{WHITE}\furiplaceauto1\furiap0\furifsp2", r"<明日|あした>\N<明日|あした>"),
+        (690, 620, rf"\fs55\1c{WHITE}\furi0", "<漢字|かんじ|KANJI>"),
+        (1260, 630, rf"\fs61\1c{WHITE}\2c{BLUE}\furichangepos1",
+         r"<病|{\k30}や{\k26}ま{\k10}い> <掴|{\k40}つ{\k60}か>ん{\k70}だ"),
+    ])
+    centers = {"both": (270, 200), "reverse": (660, 200), "mixed": (1100, 200),
+               "outward": (300, 610), "disabled": (690, 620), "timed": (1260, 630)}
+    playback("csri", CANDIDATE, ruby, ROOT / "ruby")
+    playback("rgba", MANG, ruby, ROOT / "ruby-reference")
+    for getter in (captures(ROOT / "ruby", centers), captures(ROOT / "ruby-reference", centers)):
+        both = ink_bounds(getter, 60, "both", left=-120, right=210, top=-140, bottom=185)
+        reverse = ink_bounds(getter, 60, "reverse", left=-120, right=230, top=-100, bottom=185)
+        disabled = ink_bounds(getter, 60, "disabled", left=-30, right=380, top=-90, bottom=190)
+        assert both[1] < reverse[1] - 9 and reverse[3] > 50, (both, reverse)
+        assert both[3] - both[1] > disabled[3] - disabled[1] + 20, (both, disabled)
+        mixed = ink_bounds(getter, 60, "mixed", left=-310, right=310, top=-150, bottom=310)
+        outward = ink_bounds(getter, 60, "outward", left=-120, right=230, top=-120, bottom=280)
+        assert mixed[1] < 0 and mixed[3] > 60, mixed
+        assert outward[1] < 0 and outward[3] > 100, outward
+        assert any(getter(60, "timed", x, y) != getter(90, "timed", x, y)
+                   for y in range(160) for x in range(260)), "Ruby's reading timing should affect visible paint"
+    expected = benchmark(CANDIDATE, ruby, 1, "regression")["hashes"]
+    for workers in (2, 4, 6, 8):
+        assert benchmark(CANDIDATE, ruby, workers, "regression")["hashes"] == expected
 
 # Check old corner math against the validated VSFilterMod path rather than
 # requiring its different legacy bitmap geometry to agree with libass.

@@ -28,6 +28,7 @@
 #include "AssMotion.h"
 #include "RenderGeometry.h"
 #include "ShapedText.h"
+#include "Furigana.h"
 #include "..\SubPic\ISubPic.h"
 
 class CMyFont : public CFont
@@ -71,6 +72,7 @@ protected:
     {
         CPoint offset;
         double cosine = 1, sine = 0, center = 0, baseline = 0;
+        int clipStart = INT_MIN, clipEnd = INT_MAX;
         bool rotate = false;
     };
     std::unique_ptr<LayoutPlacement> m_layoutPlacement;
@@ -109,7 +111,14 @@ public:
 #ifdef _VSMOD
     CPoint LayoutPosition(CPoint flat) const;
     void PlaceLayout(CPoint offset, double cosine, double sine, double center, double baseline);
+    void ClipRubyCoverage(int start, int end)
+    {
+        m_layoutPlacement->clipStart = start;
+        m_layoutPlacement->clipEnd = end;
+    }
+    CRect RubyClip(const CRect& clip, int x, int y) const;
     bool m_verticalWord = false;
+    unsigned m_rubyGroup = 0;
     int VerticalPaintSplit(int y, double progress) const
     {
         return ((y + mOffsetY + 4) >> 3) + int(progress * mOverlayHeight);
@@ -286,6 +295,17 @@ public:
     bool m_perspectiveJitter = false;
     void ConfigurePerspective();
     void PreparePerspective(CPoint anchor, CPoint origin, const CRect& bounds, REFERENCE_TIME timestamp);
+    struct RubyGroup
+    {
+        struct Timing { int type, start, end; double width; };
+        Furigana::Options options;
+        std::array<std::vector<std::unique_ptr<CWord>>, 2> annotations;
+        std::vector<Timing> baseTiming;
+    };
+    std::vector<RubyGroup> m_rubyGroups;
+    Furigana::Options m_rubyOptions;
+    bool m_keepRubyKaraoke = false;
+    void PlaceHorizontalRuby();
     double m_clipOffsetX = 0, m_clipOffsetY = 0;
     bool m_hasRectClip = false;
     struct LineAlignment { int first, inherited, full; };
@@ -357,6 +377,7 @@ class CRenderedTextSubtitle : public CSimpleTextSubtitle, public ISubPicProvider
 #ifdef _VSMOD
     std::unique_ptr<ShapedText::Context> m_shaper;
     bool ParseShapedString(CSubtitle* sub, const CStringW& text, STSStyle& style, bool verticalVariants);
+    bool ParseFurigana(CSubtitle* sub, Furigana::Fields& fields, STSStyle& style);
 #endif
 
     CScreenLayoutAllocator m_sla;
