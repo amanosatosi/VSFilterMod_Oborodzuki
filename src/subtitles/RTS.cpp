@@ -742,6 +742,68 @@ CRect CWord::DrawNativeShadow(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, i
     return rasterizer->Draw(spd, clip, mask, x, y, colors, true, false, 3, m_style.mod_grad,
         vectorClip, m_style.mod_blendMode);
 }
+
+bool CWord::RasterizeDecorations(CPoint p, CPoint org)
+{
+    if (!m_undecoratedGlyphs)
+        return true;
+#ifdef _LUA
+    m_undecoratedGlyphs->Paint(p, org, m_layer);
+#else
+    m_undecoratedGlyphs->Paint(p, org);
+#endif
+    if (!m_decorationMask)
+    {
+        auto mask = std::make_unique<Rasterizer>();
+        if (!mask->CreateDecorationMask(*this, *m_undecoratedGlyphs))
+        {
+            m_undecoratedGlyphs.reset();
+            return true;
+        }
+        m_decorationMask = std::move(mask);
+    }
+    return m_decorationMask->Rasterize(p.x, p.y, m_style.fBlur, m_style.fGaussianBlurX, m_style.fGaussianBlurY);
+}
+
+CRect CWord::DrawBodyPaint(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int y, const DWORD* colors,
+    MOD_MOVEVC& vectorClip, bool reverse)
+{
+    auto& style = m_style.mod_grad;
+    if (!m_decorationMask)
+        return Draw(spd, clip, mask, x, y, colors, true, false, 0, style, vectorClip, m_style.mod_blendMode, reverse);
+
+    auto bounds = m_undecoratedGlyphs->Draw(spd, clip, mask, x, y, colors, true, false, 0,
+        style, vectorClip, m_style.mod_blendMode, reverse);
+    const auto& deco = *m_style.decoration;
+    auto gradient = style;
+    auto sources = style.paint ? std::make_shared<KfxPaint::Sources>(*style.paint) :
+        std::make_shared<KfxPaint::Sources>();
+    DWORD palette[4];
+    std::copy_n(colors, 4, palette);
+    for (int i = 0; i < 2; ++i)
+    {
+        for (int component = 0; component < 2; ++component)
+        {
+            const int part = 2 * i + component;
+            if (deco.paint[component] || (component ? deco.inverseAlpha : deco.color) >= 0)
+            {
+                sources->parts[part] = deco.paint[component];
+                gradient.legacyParts &= ~(1u << part);
+            }
+        }
+        if (deco.color >= 0)
+            palette[2 * i] = (palette[2 * i] & 0xff000000u) | DWORD(deco.color);
+        if (deco.inverseAlpha >= 0)
+        {
+            const DWORD opacity = MulDiv(255 - deco.inverseAlpha, 255 - style.fadalpha, 255);
+            palette[2 * i] = (palette[2 * i] & 0xffffffu) | (opacity << 24);
+        }
+    }
+    gradient.paint = std::move(sources);
+    bounds |= m_decorationMask->Draw(spd, clip, mask, x, y, palette, true, false, 0,
+        gradient, vectorClip, m_style.mod_blendMode, reverse);
+    return bounds;
+}
 #endif
 
 CWord::CWord(STSStyle& style, CStringW str, int ktype, int kstart, int kend, double scalex, double scaley)
@@ -835,6 +897,10 @@ void CWord::Paint(CPoint p, CPoint org)
 
 #ifdef _VSMOD
         m_nativeMasks.reset();
+        m_decorationMask.reset();
+        m_undecoratedGlyphs.reset();
+        if (m_style.decoration && m_style.decoration->Active() && (m_style.fUnderline || m_style.fStrikeOut))
+            m_undecoratedGlyphs = CreateUndecoratedWord();
         if (HasNativeOutline())
         {
             if (!CreateNativeOutline()) return;
@@ -852,7 +918,7 @@ void CWord::Paint(CPoint p, CPoint org)
 
         if(!Rasterize(p.x & 7, p.y & 7, m_style.fBlur, m_style.fGaussianBlurX, m_style.fGaussianBlurY)) return;
 #ifdef _VSMOD
-        if (!RasterizeNativeOutline(p)) return;
+        if (!RasterizeNativeOutline(p) || !RasterizeDecorations(p, org)) return;
 #endif
         m_fDrawn = true;
     }
@@ -860,7 +926,7 @@ void CWord::Paint(CPoint p, CPoint org)
     {
         Rasterize(p.x & 7, p.y & 7, m_style.fBlur, m_style.fGaussianBlurX, m_style.fGaussianBlurY);
 #ifdef _VSMOD
-        if (!RasterizeNativeOutline(p)) return;
+        if (!RasterizeNativeOutline(p) || !RasterizeDecorations(p, org)) return;
 #endif
     }
 
@@ -1483,6 +1549,26 @@ CWord* CText::Copy()
 #endif
     return T;
 }
+
+#ifdef _VSMOD
+std::unique_ptr<CWord> CText::CreateUndecoratedWord()
+{
+#ifdef _LUA
+    if (!LuaRendererHandler.IsEmpty() || !m_style.LuaBeforeTransformHandler.IsEmpty() ||
+        !m_style.LuaCustomTransformHandler.IsEmpty() || !m_style.LuaAfterTransformHandler.IsEmpty())
+        return {};
+#endif
+    auto copy = std::unique_ptr<CWord>(Copy());
+    auto& style = copy->m_style;
+    style.fUnderline = style.fStrikeOut = false;
+    style.borderStyle = 0;
+    style.outlineWidthX = style.outlineWidthY = 0;
+    style.shadowDepthX = style.shadowDepthY = 0;
+    style.nativeOutline.reset();
+    style.decoration.reset();
+    return copy;
+}
+#endif
 
 bool CText::Append(CWord* w)
 {
@@ -2388,7 +2474,7 @@ CRect CLine::PaintBody(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoin
         sw[3] = (int)(w->m_style.outlineWidthX + t * w->getOverlayWidth() + t * bluradjust) >> 3;
 
 #ifdef _VSMOD // patch m004. gradient colors
-        bbox |= w->Draw(spd, clipRect, pAlphaMask, x, y, sw, true, false, 0, w->m_style.mod_grad, mod_vc, w->m_style.mod_blendMode, reversePaint);
+        bbox |= w->DrawBodyPaint(spd, clipRect, pAlphaMask, x, y, sw, mod_vc, reversePaint);
 #else
         bbox |= w->Draw(spd, clipRect, pAlphaMask, x, y, sw, true, false);
 #endif
@@ -3487,6 +3573,7 @@ struct PaintTag
     bool slide;
     bool positioned;
     bool positionedAlpha;
+    bool decoration;
     CStringW argument;
 };
 
@@ -3502,38 +3589,17 @@ struct OutlineTag
     CStringW argument;
 };
 
-int ReadDecimalDigit(const wchar_t*& p)
-{
-    unsigned codepoint = *p++;
-    if (codepoint >= 0xD800 && codepoint <= 0xDBFF && *p >= 0xDC00 && *p <= 0xDFFF)
-        codepoint = 0x10000 + ((codepoint - 0xD800) << 10) + (*p++ - 0xDC00);
-    // Unicode 17 Decimal_Number zero code points in ascending order.
-    static constexpr unsigned zeroes[] = {
-        0x30, 0x660, 0x6F0, 0x7C0, 0x966, 0x9E6, 0xA66, 0xAE6, 0xB66,
-        0xBE6, 0xC66, 0xCE6, 0xD66, 0xDE6, 0xE50, 0xED0, 0xF20, 0x1040,
-        0x1090, 0x17E0, 0x1810, 0x1946, 0x19D0, 0x1A80, 0x1A90, 0x1B50, 0x1BB0,
-        0x1C40, 0x1C50, 0xA620, 0xA8D0, 0xA900, 0xA9D0, 0xA9F0, 0xAA50, 0xABF0,
-        0xFF10, 0x104A0, 0x10D30, 0x10D40, 0x11066, 0x110F0, 0x11136, 0x111D0, 0x112F0,
-        0x11450, 0x114D0, 0x11650, 0x116C0, 0x116D0, 0x116DA, 0x11730, 0x118E0, 0x11950,
-        0x11BF0, 0x11C50, 0x11D50, 0x11DA0, 0x11DE0, 0x11F50, 0x16130, 0x16A60, 0x16AC0,
-        0x16B50, 0x16D70, 0x1CCF0, 0x1D7CE, 0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6, 0x1E140,
-        0x1E2F0, 0x1E4F0, 0x1E5F1, 0x1E950, 0x1FBF0,
-    };
-    const auto* after = std::upper_bound(zeroes, zeroes + sizeof(zeroes) / sizeof(*zeroes), codepoint);
-    if (after == zeroes || codepoint - after[-1] > 9)
-        return -1;
-    return int(codepoint - after[-1]);
-}
+using AssNumeric::ReadDecimalDigit;
 
 bool ReadPaintTag(const CStringW& name, PaintTag& tag)
 {
     const wchar_t* p = name;
-    int channel = *p >= L'1' && *p <= L'4' ? *p++ - L'0' : 0;
+    int channel = *p >= L'1' && *p <= L'5' ? *p++ - L'0' : 0;
     if (*p >= 128 && channel == 0)
     {
         const auto* next = p;
         const int digit = ReadDecimalDigit(next);
-        if (digit >= 1 && digit <= 4)
+        if (digit >= 1 && digit <= 5)
         {
             channel = digit;
             p = next;
@@ -3541,6 +3607,7 @@ bool ReadPaintTag(const CStringW& name, PaintTag& tag)
     }
     if (*p != L'g' && *p != L'v' && *p != L'p') return false;
     tag.positioned = !wcsncmp(p, L"pgrd", 4);
+    tag.decoration = channel == 5;
     tag.positionedAlpha = tag.positioned && !channel && !wcsncmp(p + 4, L"alpha", 5);
     if (tag.positionedAlpha)
     {
@@ -3560,9 +3627,11 @@ bool ReadPaintTag(const CStringW& name, PaintTag& tag)
         tag.slide = *p == L's';
         if (tag.slide) ++p;
         tag.part = !channel && tag.slide && !tag.positioned ? -1 : ((channel ? channel : 1) - 1) * 2 + int(alpha);
+        if (tag.decoration) tag.part = KfxPaint::DecorationSlideStart + int(alpha);
     }
     else if (!wcsncmp(p, L"vcs", 3) || !wcsncmp(p, L"vas", 3))
     {
+        if (tag.decoration) return false;
         tag.slide = true;
         tag.part = ((channel ? channel : 1) - 1) * 2 + int(p[1] == L'a');
         p += 3;
@@ -3570,6 +3639,17 @@ bool ReadPaintTag(const CStringW& name, PaintTag& tag)
     else return false;
     tag.argument = p;
     tag.argument.Trim();
+    return true;
+}
+
+bool ReadDecorationScalar(const CStringW& name, bool& inverse, CStringW& argument)
+{
+    const wchar_t* p = name;
+    if ((*p != L'5' && *p < 128) || ReadDecimalDigit(p) != 5 || (*p != L'c' && *p != L'a'))
+        return false;
+    inverse = *p++ == L'a';
+    argument = p;
+    argument.Trim();
     return true;
 }
 
@@ -3697,24 +3777,7 @@ bool ExtendedNumber(const CStringW& text)
 
 CStringW NormalizeNumericDigits(const CStringW& input)
 {
-    CStringW result;
-    for (const wchar_t* p = input; *p;)
-    {
-        if (*p < 128)
-        {
-            result += *p++;
-            continue;
-        }
-        auto next = p;
-        const int digit = ReadDecimalDigit(next);
-        if (digit >= 0)
-        {
-            result += wchar_t(L'0' + digit);
-            p = next;
-        }
-        else result += *p++;
-    }
-    return result;
+    return CStringW(AssNumeric::NormalizeDigits(input).c_str());
 }
 
 bool NeedsLayoutVariables(const CStringW& event)
@@ -4441,6 +4504,32 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             }
         }
 
+        bool decorationAlpha;
+        CStringW decorationArgument;
+        if (ReadDecorationScalar(cmd, decorationAlpha, decorationArgument))
+        {
+            using namespace KfxPaint;
+            if (params.size() > 1 || (!params.empty() && !decorationArgument.IsEmpty())) continue;
+            const auto& argument = params.empty() ? decorationArgument : p;
+            const auto progress = paintProgress();
+            if (progress <= 0) continue;
+            const bool reset = argument.IsEmpty();
+            Value value = 0;
+            if (!reset && !ReadPaintValue(argument, decorationAlpha, value)) continue;
+            auto deco = style.decoration ? std::make_shared<DecorationPaint>(*style.decoration) :
+                std::make_shared<DecorationPaint>();
+            auto& solid = decorationAlpha ? deco->inverseAlpha : deco->color;
+            const Value from = solid >= 0 ? Value(solid) : decorationAlpha ? style.alpha[0] : revcolor(style.colors[0]);
+            auto& source = deco->paint[int(decorationAlpha)];
+            Paint target;
+            target.solid = value;
+            source = reset ? Source{} : ResolvePaintSource(*sub, source, std::move(target), from, decorationAlpha,
+                progress, fAnimate && slides() && source ? slides()->Width(DecorationSlideStart + int(decorationAlpha)) : -1);
+            solid = reset ? -1 : int(Mix(from, value, progress, decorationAlpha, false));
+            style.decoration = std::move(deco);
+            continue;
+        }
+
         if (EventBoxTag(cmd))
         {
             const wchar_t* name = cmd;
@@ -4716,6 +4805,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 }
                 auto& state = editSlides();
                 (paint.positionedAlpha ? state.positionedAlpha :
+                    paint.decoration ? state.decoration[paint.part - KfxPaint::DecorationSlideStart] :
                     paint.part < 0 ? state.global : state.channels[paint.part]) = setting;
             }
             else if (paint.positionedAlpha)
@@ -4736,6 +4826,27 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 source = ResolvePaintSource(*sub, source, std::move(field), 0, true, progress,
                     fAnimate && slides() ? slides()->Width(paint.part) : -1, false, fAnimate);
                 ++sub->m_positionedAlphaScopes;
+            }
+            else if (paint.decoration)
+            {
+                using namespace KfxPaint;
+                const bool inverse = paint.part == DecorationSlideStart + 1;
+                const auto progress = paintProgress();
+                if (progress <= 0) continue;
+                const bool reset = params.empty() && (paint.positioned ? tag.parenthesized && !fAnimate :
+                    paint.argument.IsEmpty() || paint.argument == L"0");
+                Paint field;
+                if (!reset && (!paint.argument.IsEmpty() || !readField(params, inverse, paint.positioned, field)))
+                    continue;
+                auto deco = style.decoration ? std::make_shared<DecorationPaint>(*style.decoration) :
+                    std::make_shared<DecorationPaint>();
+                auto& source = deco->paint[int(inverse)];
+                if (paint.positioned && reset && (!source || !source->positioned)) continue;
+                const int own = inverse ? deco->inverseAlpha : deco->color;
+                const Value solid = own >= 0 ? Value(own) : inverse ? style.alpha[0] : revcolor(style.colors[0]);
+                source = reset ? Source{} : ResolvePaintSource(*sub, source, std::move(field), solid, inverse, progress,
+                    fAnimate && slides() ? slides()->Width(paint.part) : -1, false, fAnimate);
+                style.decoration = std::move(deco);
             }
             else if (params.empty() && (paint.argument.IsEmpty() || paint.argument == L"0"))
             {

@@ -962,6 +962,42 @@ bool Rasterizer::CreateWidenedRegion(int rx, int ry)
 }
 
 #ifdef _VSMOD
+void Rasterizer::SubtractOutlineSpans(const tSpanBuffer& outer, const tSpanBuffer& inner,
+    tSpanBuffer& output, uint64_t offset)
+{
+    auto cut = inner.begin();
+    for (const auto& span : outer)
+    {
+        auto start = span.first;
+        while (cut != inner.end() && cut->second + offset <= start) ++cut;
+        while (cut != inner.end() && cut->first + offset < span.second)
+        {
+            if (cut->first + offset > start)
+                output.emplace_back(start, cut->first + offset);
+            start = (std::max)(start, cut->second + offset);
+            if (start >= span.second) break;
+            ++cut;
+        }
+        if (start < span.second)
+            output.emplace_back(start, span.second);
+    }
+}
+
+bool Rasterizer::CreateDecorationMask(const Rasterizer& decorated, const Rasterizer& glyphs)
+{
+    if (decorated.mOutline.empty() || glyphs.mOutline.empty()) return false;
+    mWidth = decorated.mWidth;
+    mHeight = decorated.mHeight;
+    mPathOffsetX = decorated.mPathOffsetX;
+    mPathOffsetY = decorated.mPathOffsetY;
+    mWideBorder = 0;
+    const auto dx = int64_t(glyphs.mPathOffsetX) - mPathOffsetX;
+    const auto dy = int64_t(glyphs.mPathOffsetY) - mPathOffsetY;
+    const uint64_t offset = uint64_t(dy * 0x100000000ll + dx);
+    SubtractOutlineSpans(decorated.mOutline, glyphs.mOutline, mOutline, offset);
+    return !mOutline.empty();
+}
+
 bool Rasterizer::CreateMiteredRegion(int rx, int ry)
 {
     struct Point { double x, y; };
@@ -1057,23 +1093,7 @@ bool Rasterizer::CreateOutlineRings(const std::vector<OutlineTarget>& layers, Ra
         if (!CreateWidenedRegion(layer.x, layer.y))
             return false;
         initMask(*layer.mask);
-        auto& ring = layer.mask->mOutline;
-        auto cut = inner->begin();
-        for (const auto& outer : mWideOutline)
-        {
-            auto start = outer.first;
-            while (cut != inner->end() && cut->second <= start) ++cut;
-            while (cut != inner->end() && cut->first < outer.second)
-            {
-                if (cut->first > start)
-                    ring.emplace_back(start, cut->first);
-                start = (std::max)(start, cut->second);
-                if (start >= outer.second) break;
-                ++cut;
-            }
-            if (start < outer.second)
-                ring.emplace_back(start, outer.second);
-        }
+        SubtractOutlineSpans(mWideOutline, *inner, layer.mask->mOutline, 0);
         mWideOutline.swap(previous);
         inner = &previous;
     }

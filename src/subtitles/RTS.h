@@ -54,6 +54,10 @@ class CWord : public Rasterizer
     std::unique_ptr<NativeOutlineMasks> m_nativeMasks;
     bool CreateNativeOutline();
     bool RasterizeNativeOutline(CPoint p);
+    std::unique_ptr<CWord> m_undecoratedGlyphs;
+    std::unique_ptr<Rasterizer> m_decorationMask;
+    virtual std::unique_ptr<CWord> CreateUndecoratedWord() { return {}; }
+    bool RasterizeDecorations(CPoint p, CPoint org);
 #endif
 
 protected:
@@ -94,6 +98,8 @@ public:
         MOD_MOVEVC& vectorClip);
     CRect DrawNativeShadow(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int y, DWORD* colors,
         MOD_MOVEVC& vectorClip);
+    CRect DrawBodyPaint(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int y, const DWORD* colors,
+        MOD_MOVEVC& vectorClip, bool reverse);
 #endif
 
 #if defined (_VSMOD) && defined(_LUA)
@@ -107,6 +113,9 @@ class CText : public CWord
 {
 protected:
     virtual bool CreatePath();
+#ifdef _VSMOD
+    std::unique_ptr<CWord> CreateUndecoratedWord() override;
+#endif
 
 public:
     CText(STSStyle& style, CStringW str, int ktype, int kstart, int kend, double scalex, double scaley);

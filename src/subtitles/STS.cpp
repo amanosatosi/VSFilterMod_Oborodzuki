@@ -20,6 +20,7 @@
  */
 
 #include "stdafx.h"
+#include "AssUnicode.h"
 #include "STS.h"
 #include <atlbase.h>
 #include <atlconv.h>
@@ -1261,6 +1262,10 @@ int GetInt(CStringW& buff, char sep = ',') //throw(...)
     CStringW fmtstr = str.GetLength() > 2 && (str.Left(2) == L"&h" || str.Left(2) == L"0x")
                       ? str = str.Mid(2), L"%x"
                               : L"%d";
+#ifdef _VSMOD
+    if (fmtstr == L"%d" && AssNumeric::HasNonAscii(str))
+        str = AssNumeric::NormalizeDigits(str).c_str();
+#endif
 
     int ret;
     if(swscanf(str, fmtstr, &ret) != 1) throw 1;
@@ -1274,6 +1279,10 @@ double GetFloat(CStringW& buff, char sep = ',') //throw(...)
 
     str = GetStr(buff, sep);
     str.MakeLower();
+#ifdef _VSMOD
+    if (AssNumeric::HasNonAscii(str))
+        str = AssNumeric::NormalizeDigits(str).c_str();
+#endif
 
     float ret;
     if(swscanf(str, L"%f", &ret) != 1) throw 1;
@@ -3593,6 +3602,7 @@ void STSStyle::SetDefault()
     nativeOutline.reset();
     boxRings.reset();
     boxShape.reset();
+    decoration.reset();
     softScale = objectScale = 100;
     // patch m007. symbol rotating
     mod_fontOrient = 0;
@@ -3646,6 +3656,7 @@ bool STSStyle::operator == (STSStyle& s)
            && nativeOutline == s.nativeOutline
            && boxRings == s.boxRings
            && boxShape == s.boxShape
+           && decoration == s.decoration
            && softScale == s.softScale
            && objectScale == s.objectScale
            // patch m007. symbol rotating
@@ -3727,6 +3738,7 @@ void STSStyle::mod_CopyStyleFrom(STSStyle& s)
     nativeOutline = s.nativeOutline;
     boxRings = s.boxRings;
     boxShape = s.boxShape;
+    decoration = s.decoration;
     softScale = s.softScale;
     objectScale = s.objectScale;
     // patch m007. symbol rotating

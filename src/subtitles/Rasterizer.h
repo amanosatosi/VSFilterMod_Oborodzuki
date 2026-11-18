@@ -174,6 +174,8 @@ private:
     std::unique_ptr<std::vector<ContourEdge>> m_geometricEdges;
     unsigned m_geometricContour = 0;
     bool CreateMiteredRegion(int rx, int ry);
+    static void SubtractOutlineSpans(const tSpanBuffer& outer, const tSpanBuffer& inner,
+        tSpanBuffer& output, uint64_t offset);
 #endif
 
     struct Edge
@@ -228,6 +230,7 @@ public:
         Rasterizer* mask;
     };
     bool CreateOutlineRings(const std::vector<OutlineTarget>& layers, Rasterizer* shadow);
+    bool CreateDecorationMask(const Rasterizer& decorated, const Rasterizer& glyphs);
 #endif
     void DeleteOutlines();
     bool Rasterize(int xsub, int ysub, int fBlur, double fGaussianBlurX, double fGaussianBlurY,

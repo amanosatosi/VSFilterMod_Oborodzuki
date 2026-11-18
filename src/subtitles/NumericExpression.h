@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cwchar>
 #include <limits>
+#include "AssUnicode.h"
 
 namespace AssNumeric
 {

@@ -111,10 +111,18 @@ struct BoxShape
     double radius = 0;
 };
 
+struct DecorationPaint
+{
+    std::array<Source, 2> paint;
+    int color = -1, inverseAlpha = -1;
+    bool Active() const { return color >= 0 || inverseAlpha >= 0 || paint[0] || paint[1]; }
+};
+
 constexpr int NativeSlideStart = 8;
 constexpr int BoxSlideStart = NativeSlideStart + 2 * (MaxOutlineLayers - 1);
 constexpr int WaitingSlidePart = BoxSlideStart + 2 * MaxOutlineLayers;
 constexpr int PositionedAlphaSlidePart = WaitingSlidePart + 1;
+constexpr int DecorationSlideStart = PositionedAlphaSlidePart + 1;
 
 struct SlideSettings
 {
@@ -123,11 +131,13 @@ struct SlideSettings
     std::array<double, 2 * MaxOutlineLayers> box{};
     double waiting = 0;
     double positionedAlpha = 0;
+    std::array<double, 2> decoration{};
     double global = 0;
 
     double Width(int part) const
     {
-        const double channel = part == PositionedAlphaSlidePart ? positionedAlpha :
+        const double channel = part >= DecorationSlideStart ? decoration[part - DecorationSlideStart] :
+            part == PositionedAlphaSlidePart ? positionedAlpha :
             part == WaitingSlidePart ? waiting :
             part < NativeSlideStart ? channels[part] :
             part < BoxSlideStart ? outline[part - NativeSlideStart] : box[part - BoxSlideStart];

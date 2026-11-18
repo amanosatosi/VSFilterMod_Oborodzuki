@@ -324,6 +324,22 @@ if ROUND2:
         except AssertionError as error:
             raise AssertionError(f"{case} at {frame} ({x},{y}): {error}") from error
 
+    decoration = write("decoration-paint", [
+        (120, 90, r"\fs64\u1\1c$white\5c&HFF0000&\5a$128", "MMMM"),
+        (520, 90, r"\fs64\s1\1c$white\5grd(0,&H0000FF&,&HFF0000&)", "MMMM"),
+    ])
+    positions = {"underline": (120, 90), "strike": (520, 90)}
+    playback("csri", CANDIDATE, decoration, ROOT / "decoration")
+    playback("rgba", MANG, decoration, ROOT / "decoration-reference")
+    for getter in (captures(ROOT / "decoration", positions),
+                   captures(ROOT / "decoration-reference", positions)):
+        underline = [getter(90, "underline", x, y) for y in range(85) for x in range(265)]
+        strike = [getter(90, "strike", x, y) for y in range(85) for x in range(265)]
+        assert sum(112 <= b <= 145 and r < 12 and g < 12 for r, g, b in underline) >= 30
+        assert sum(r > 210 and g > 210 and b > 210 for r, g, b in underline) >= 100
+        assert sum(r > 110 and r > 2*b and g < 12 for r, g, b in strike) >= 15
+        assert sum(b > 110 and b > 2*r and g < 12 for r, g, b in strike) >= 15
+
     geometry = write("geometric-borders", [
         (120, 90, r"\bs5\bord12\3c&H0000FF&\2bs8\2bc&HFF0000&\p1", BOX),
         (500, 90, r"\bord12\3c&H0000FF&\p1", BOX),
