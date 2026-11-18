@@ -25,6 +25,7 @@
 #include "STS.h"
 #include "Rasterizer.h"
 #include "NumericExpression.h"
+#include "AssMotion.h"
 #include "..\SubPic\ISubPic.h"
 
 class CMyFont : public CFont
@@ -230,6 +231,9 @@ public:
     std::vector<std::unique_ptr<CWord>> m_eventBox;
     std::unique_ptr<AssNumeric::Context> m_layoutVariables;
     bool m_measuringLayout = false;
+    std::unique_ptr<AssMotion::Track> m_motion;
+    double m_clipOffsetX = 0, m_clipOffsetY = 0;
+    bool m_hasRectClip = false;
     void CreateEventBox(int borderStyle, int time, bool scaledBorder);
 #endif
     int m_scrAlignment;

@@ -295,6 +295,34 @@ if ROUND2:
     ]:
         close(evaluated(frame, "numbers", x, 50), color)
 
+    motion = write("competing-motion", [
+        (500, 500, r"\t(0,500,\pos(200,500))\t(250,800,\pos(~+350,~+100))\p1", BOX),
+        (120, 90, r"\clip(120,90,210,190)\clippos(30,0)\p1", BOX),
+        (1100, 90, r"\scale50\p1", BOX),
+    ])
+    locations = {"moving": (0, 0), "clip": (120, 90), "scale": (1100, 90)}
+    playback("csri", CANDIDATE, motion, ROOT / "motion")
+    playback("rgba", MANG, motion, ROOT / "motion-reference")
+    actual = captures(ROOT / "motion", locations)
+    expected_motion = captures(ROOT / "motion-reference", locations)
+    for frame, case, x, y, color in [
+        (60, "moving", 650, 550, (255, 255, 255)),
+        (60, "moving", 430, 550, (0, 0, 0)),
+        (75, "moving", 352, 550, (255, 255, 255)),
+        (90, "moving", 365, 470, (255, 255, 255)),
+        (90, "moving", 350, 470, (0, 0, 0)),
+        (120, "moving", 715, 440, (255, 255, 255)),
+        (60, "clip", 25, 50, (0, 0, 0)),
+        (60, "clip", 35, 50, (255, 255, 255)),
+        (60, "scale", 85, 25, (255, 255, 255)),
+        (60, "scale", 115, 25, (0, 0, 0)),
+    ]:
+        try:
+            close(actual(frame, case, x, y), color)
+            close(expected_motion(frame, case, x, y), color)
+        except AssertionError as error:
+            raise AssertionError(f"{case} at {frame} ({x},{y}): {error}") from error
+
 for frame, color in [(60, 2), (120, 0)]:
     assert sum(new(frame, "karaoke", x, y)[color] > 200
                for x in range(250) for y in range(85)) > 100, "karaoke channel unavailable"

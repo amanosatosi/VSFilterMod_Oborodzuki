@@ -249,6 +249,7 @@ public:
     std::shared_ptr<const KfxPaint::OutlineStyle> nativeOutline;
     std::shared_ptr<const KfxPaint::OutlineStyle> boxRings;
     std::shared_ptr<const KfxPaint::BoxShape> boxShape;
+    double softScale, objectScale; // independent percentages
     // patch m007. symbol rotating
     int mod_fontOrient;
     // patch m008. distort

@@ -644,7 +644,8 @@ bool CWord::CreateNativeOutline()
     add(m_style.outlineWidthX, m_style.outlineWidthY, first);
     for (const auto& layer : style.layers)
         if (layer.number)
-            add(layer.x * style.scaleX, layer.y * style.scaleY, &layer);
+            add(layer.x * style.scaleX * m_style.objectScale / 100,
+                layer.y * style.scaleY * m_style.objectScale / 100, &layer);
     if (targets.empty())
         return true;
     if (m_style.shadowDepthX != 0 || m_style.shadowDepthY != 0)
@@ -662,7 +663,7 @@ bool CWord::RasterizeNativeOutline(CPoint p)
     for (const auto& ring : m_nativeMasks->rings)
     {
         const auto* layer = ring.layer;
-        const double blur = layer ? layer->blur : -1;
+        const double blur = layer && layer->blur >= 0 ? layer->blur * m_style.objectScale / 100 : -1;
         const int edge = layer && layer->edgeBlur >= 0 ? layer->edgeBlur : m_style.fBlur;
         if (!ring.mask->Rasterize(p.x, p.y, edge,
                 blur >= 0 ? blur : m_style.fGaussianBlurX, blur >= 0 ? blur : m_style.fGaussianBlurY, true))
@@ -2829,8 +2830,9 @@ void CSubtitle::CreateEventBox(int borderStyle, int time, bool scaledBorder)
         return;
 
     auto& style = canonical->m_style;
-    const double sx = std::abs(style.fontScaleX) / 100 * (scaledBorder ? m_scalex : 1) * 8;
-    const double sy = std::abs(style.fontScaleY) / 100 * (scaledBorder ? m_scaley : 1) * 8;
+    const double soft = style.softScale > 0 ? style.softScale : 100;
+    const double sx = std::abs(style.fontScaleX) / soft * (scaledBorder ? m_scalex : 1) * 8;
+    const double sy = std::abs(style.fontScaleY) / soft * (scaledBorder ? m_scaley : 1) * 8;
     const KfxPaint::BoxShape defaults;
     const auto& box = style.boxShape ? *style.boxShape : defaults;
     const auto bounded = [](double pixels) { return (std::min)(pixels, 8192.0); };
@@ -3948,6 +3950,12 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
 #endif
         else if(!cmd.Find(L"b"))
             params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+#ifdef _VSMOD
+        else if(cmd == L"clippos")
+        {
+            // Translation uses the arguments already read from the tuple.
+        }
+#endif
         else if(!cmd.Find(L"clip"))
             ;
         else if(!cmd.Find(L"c"))
@@ -4040,6 +4048,10 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
             params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
         else if(!cmd.Find(L"shad"))
             params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
+#ifdef _VSMOD
+        else if(!cmd.Find(L"scale"))
+            params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
+#endif
         else if(!cmd.Find(L"s"))
             params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
         else if(!cmd.Find(L"t"))
@@ -4965,6 +4977,18 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                                ? (n == 0 ? FW_NORMAL : n == 1 ? FW_BOLD : n >= 100 ? n : org.fontWeight)
                                    : org.fontWeight;
         }
+#ifdef _VSMOD
+        else if(cmd == L"clippos")
+        {
+            AssNumeric::Operand x, y;
+            if (params.size() == 2 && tag.parenthesized &&
+                readOperand(params[0], false, false, x) && readOperand(params[1], false, false, y))
+            {
+                sub->m_clipOffsetX = CalcAnimation(x.Resolve(sub->m_clipOffsetX), sub->m_clipOffsetX, fAnimate);
+                sub->m_clipOffsetY = CalcAnimation(y.Resolve(sub->m_clipOffsetY, -1), sub->m_clipOffsetY, fAnimate);
+            }
+        }
+#endif
         else if(cmd == L"clip" || cmd == L"iclip")
         {
             bool invert = (cmd == L"iclip");
@@ -4990,14 +5014,6 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             {
                 CRect r;
 
-                sub->m_clipInverse = invert;
-
-                r.SetRect(
-                    wcstol(params[0], NULL, 10),
-                    wcstol(params[1], NULL, 10),
-                    wcstol(params[2], NULL, 10),
-                    wcstol(params[3], NULL, 10));
-
                 CPoint o(0, 0);
 
                 if(sub->m_relativeTo == 1) // TODO: this should also apply to the other two clippings above
@@ -5005,6 +5021,41 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     o.x = m_vidrect.left >> 3;
                     o.y = m_vidrect.top >> 3;
                 }
+#ifdef _VSMOD
+                sub->m_hasRectClip = true;
+                if (std::any_of(params.begin(), params.end(), ExtendedNumber))
+                {
+                    const LONG previous[] = {sub->m_clip.left, sub->m_clip.top, sub->m_clip.right, sub->m_clip.bottom};
+                    double resolved[4];
+                    bool valid = true;
+                    for (int i = 0; i < 4; ++i)
+                    {
+                        AssNumeric::Operand operand;
+                        if (!readOperand(params[i], false, false, operand))
+                        {
+                            valid = false;
+                            break;
+                        }
+                        const double scale = i % 2 ? sub->m_scaley : sub->m_scalex;
+                        const double offset = i % 2 ? o.y : o.x;
+                        const double dst = operand.relative ? previous[i] + operand.value * scale :
+                            operand.value * scale + offset;
+                        resolved[i] = CalcAnimation(dst, previous[i], fAnimate);
+                    }
+                    if (valid)
+                    {
+                        sub->m_clipInverse = invert;
+                        sub->m_clip.SetRect(int(resolved[0]), int(resolved[1]), int(resolved[2]), int(resolved[3]));
+                    }
+                    continue;
+                }
+#endif
+                sub->m_clipInverse = invert;
+                r.SetRect(
+                    wcstol(params[0], NULL, 10),
+                    wcstol(params[1], NULL, 10),
+                    wcstol(params[2], NULL, 10),
+                    wcstol(params[3], NULL, 10));
 
                 sub->m_clip.SetRect(
                     (int)CalcAnimation(sub->m_scalex * r.left + o.x, sub->m_clip.left, fAnimate),
@@ -5184,21 +5235,25 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         }
         else if(cmd == L"fsc")
         {
-#ifdef _VSMOD // patch f004. \fsc(%f) is working
-            double dst = wcstod(p, NULL);
-            double nx = CalcAnimation(dst, style.fontScaleX, fAnimate);
-            style.fontScaleX = !p.IsEmpty()
-                               ? (nx < 0 ? 0 : nx)
-                                   : org.fontScaleX;
-            double ny = CalcAnimation(dst, style.fontScaleY, fAnimate);
-            style.fontScaleY = !p.IsEmpty()
-                               ? (ny < 0 ? 0 : ny)
-                                   : org.fontScaleY;
+#ifdef _VSMOD
+            AssNumeric::Operand operand;
+            if (p.IsEmpty()) style.softScale = 100;
+            else if (readOperand(p, true, false, operand))
+                style.softScale = (std::max)(0., CalcAnimation(operand.Resolve(style.softScale), style.softScale, fAnimate));
 #else
             style.fontScaleX = org.fontScaleX;
             style.fontScaleY = org.fontScaleY;
 #endif
         }
+#ifdef _VSMOD
+        else if(cmd == L"scale")
+        {
+            AssNumeric::Operand operand;
+            if (p.IsEmpty()) style.objectScale = 100;
+            else if (readOperand(p, true, false, operand))
+                style.objectScale = (std::max)(0., CalcAnimation(operand.Resolve(style.objectScale), style.objectScale, fAnimate));
+        }
+#endif
         else if(cmd == L"fsp")
         {
             style.fontSpacing = !p.IsEmpty()
@@ -5553,6 +5608,42 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         }
         else if(cmd == L"pos")
         {
+#ifdef _VSMOD
+            if (params.size() == 2 && (fAnimate || ExtendedNumber(params[0]) || ExtendedNumber(params[1])))
+            {
+                AssNumeric::Operand x, y;
+                if (!readOperand(params[0], false, false, x) || !readOperand(params[1], false, false, y))
+                    continue;
+                x.value *= sub->m_scalex * 8;
+                y.value *= sub->m_scaley * (y.relative ? -8 : 8);
+                if (fAnimate || x.relative || y.relative)
+                {
+                    if (!sub->m_motion) sub->m_motion = std::make_unique<AssMotion::Track>();
+                    if (fAnimate)
+                    {
+                        const int end = m_animEnd || m_exactAnimationEnd ? m_animEnd : m_delay;
+                        if (sub->m_motion->intents.size() < AssMotion::Track::Limit &&
+                            std::isfinite(m_animAccel) && m_animAccel >= 0)
+                            sub->m_motion->intents.push_back({x, y, m_animStart,
+                                (std::max)(m_animStart, end), m_animAccel});
+                    }
+                    else sub->m_motion->Translate(x, y);
+                    continue;
+                }
+                if (!sub->m_effects[EF_MOVE] && (!sub->m_motion || !sub->m_motion->shifted))
+                {
+                    auto* e = new Effect;
+                    e->param[0] = 0;
+                    e->param[1] = e->param[3] = int(x.value);
+                    e->param[2] = e->param[4] = int(y.value);
+                    e->t[0] = e->t[1] = 0;
+                    sub->m_effects[EF_MOVE] = e;
+                }
+                continue;
+            }
+            if (sub->m_motion && sub->m_motion->shifted)
+                continue;
+#endif
             if(params.size() == 2 && !sub->m_effects[EF_MOVE])
             {
                 if(Effect* e = DNew Effect)
@@ -6152,6 +6243,32 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
         tmp.outlineWidthY *= (m_fScaledBAS ? sub->m_scaley : 1) * 8;
         tmp.shadowDepthX *= (m_fScaledBAS ? sub->m_scalex : 1) * 8;
         tmp.shadowDepthY *= (m_fScaledBAS ? sub->m_scaley : 1) * 8;
+#ifdef _VSMOD
+        if (tmp.softScale != 100 || tmp.objectScale != 100)
+        {
+            const double object = tmp.objectScale / 100;
+            const double glyph = object * tmp.softScale / 100;
+            tmp.fontScaleX *= glyph;
+            tmp.fontScaleY *= glyph;
+            tmp.outlineWidthX *= object;
+            tmp.outlineWidthY *= object;
+            tmp.shadowDepthX *= object;
+            tmp.shadowDepthY *= object;
+            tmp.fGaussianBlurX *= object;
+            tmp.fGaussianBlurY *= object;
+            tmp.mod_verticalSpace *= object;
+            tmp.mod_horizontalSpace *= object;
+            tmp.mod_rand.X *= object;
+            tmp.mod_rand.Y *= object;
+            tmp.mod_rand.Z *= object;
+            if (tmp.mod_jitter.enabled)
+            {
+                auto& offset = tmp.mod_jitter.offset;
+                offset.SetRect(int(offset.left * object), int(offset.top * object),
+                    int(offset.right * object), int(offset.bottom * object));
+            }
+        }
+#endif
 
         if(m_nPolygon)
         {
@@ -6621,6 +6738,9 @@ try
         BYTE* pAlphaMask = s->m_pClipper ? s->m_pClipper->m_pAlphaMask : NULL;
 
 #ifdef _VSMOD // patch m006. moveable vector clip
+        const CPoint clipOffset(int(s->m_clipOffsetX * s->m_scalex), int(s->m_clipOffsetY * s->m_scaley));
+        if (s->m_hasRectClip)
+            clipRect.OffsetRect(clipOffset);
         MOD_MOVEVC mod_vc;
         mod_vc.spd = CSize(spd.w, spd.h);
         //mod_vc.alphamask = pAlphaMask;
@@ -6950,6 +7070,25 @@ try
             }
         }
 
+#ifdef _VSMOD
+        if (s->m_pClipper && clipOffset != CPoint(0, 0))
+        {
+            mod_vc.enable = true;
+            mod_vc.pos += clipOffset;
+            mod_vc.isInverse = s->m_pClipper->m_inverse;
+        }
+        if (s->m_motion)
+        {
+            const CPoint origin = s->m_relativeTo == 1 ? m_vidrect.TopLeft() : CPoint(0, 0);
+            const CPoint current(
+                s->m_scrAlignment % 3 == 1 ? r.left : s->m_scrAlignment % 3 == 2 ? r.CenterPoint().x : r.right,
+                s->m_scrAlignment <= 3 ? r.bottom : s->m_scrAlignment <= 6 ? r.CenterPoint().y : r.top);
+            const auto moved = s->m_motion->At({double(current.x - origin.x), double(current.y - origin.y)}, m_time);
+            const auto bounded = [](double value) { return int((std::max)(-10000000., (std::min)(value, 10000000.))); };
+            r.OffsetRect(bounded(moved.x) + origin.x - current.x, bounded(moved.y) + origin.y - current.y);
+            fPosOverride = true;
+        }
+#endif
         if(!fPosOverride && !fOrgOverride && !s->m_fAnimated)
             r = m_sla.AllocRect(s, segment, entry, stse.layer, m_collisions);
 

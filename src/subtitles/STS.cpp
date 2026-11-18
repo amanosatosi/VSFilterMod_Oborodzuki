@@ -3593,6 +3593,7 @@ void STSStyle::SetDefault()
     nativeOutline.reset();
     boxRings.reset();
     boxShape.reset();
+    softScale = objectScale = 100;
     // patch m007. symbol rotating
     mod_fontOrient = 0;
     // vpatch v001. Orthogonal 2D projection
@@ -3645,6 +3646,8 @@ bool STSStyle::operator == (STSStyle& s)
            && nativeOutline == s.nativeOutline
            && boxRings == s.boxRings
            && boxShape == s.boxShape
+           && softScale == s.softScale
+           && objectScale == s.objectScale
            // patch m007. symbol rotating
            && mod_fontOrient == s.mod_fontOrient
            // patch m008. distort
@@ -3724,6 +3727,8 @@ void STSStyle::mod_CopyStyleFrom(STSStyle& s)
     nativeOutline = s.nativeOutline;
     boxRings = s.boxRings;
     boxShape = s.boxShape;
+    softScale = s.softScale;
+    objectScale = s.objectScale;
     // patch m007. symbol rotating
     mod_fontOrient = s.mod_fontOrient;
     // patch m008. distort
