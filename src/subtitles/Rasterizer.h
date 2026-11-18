@@ -158,6 +158,12 @@ private:
     tSpanBuffer mOutline;
     tSpanBuffer mWideOutline;
     int mWideBorder;
+#ifdef _VSMOD
+    struct ContourEdge { LONG x0, y0, x1, y1; unsigned contour; };
+    std::unique_ptr<std::vector<ContourEdge>> m_geometricEdges;
+    unsigned m_geometricContour = 0;
+    bool CreateMiteredRegion(int rx, int ry);
+#endif
 
     struct Edge
     {
@@ -202,7 +208,7 @@ public:
     bool EndPath(HDC hdc);
     bool PartialBeginPath(HDC hdc, bool bClearPath);
     bool PartialEndPath(HDC hdc, long dx, long dy);
-    bool ScanConvert();
+    bool ScanConvert(bool geometric = false);
     bool CreateWidenedRegion(int borderX, int borderY);
 #ifdef _VSMOD
     struct OutlineTarget

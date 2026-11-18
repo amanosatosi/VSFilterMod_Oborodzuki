@@ -233,6 +233,15 @@ void Rasterizer::_EvaluateLine(int pt1idx, int pt2idx)
 
 void Rasterizer::_EvaluateLine(int x0, int y0, int x1, int y1)
 {
+#ifdef _VSMOD
+    if (m_geometricEdges && (x0 != x1 || y0 != y1))
+    {
+        if (m_geometricEdges->size() >= 65536)
+            m_geometricEdges.reset();
+        else
+            m_geometricEdges->push_back({x0, y0, x1, y1, m_geometricContour});
+    }
+#endif
     if(lastp.x != x0 || lastp.y != y0)
     {
         _EvaluateLine(lastp.x, lastp.y, x0, y0);
@@ -435,7 +444,7 @@ bool Rasterizer::PartialEndPath(HDC hdc, long dx, long dy)
     return false;
 }
 
-bool Rasterizer::ScanConvert()
+bool Rasterizer::ScanConvert(bool geometric)
 {
     PROFILE_RENDER_STAGE(ScanConvert);
     size_t lastmoveto = -1;
@@ -446,6 +455,13 @@ bool Rasterizer::ScanConvert()
     mOutline.clear();
     mWideOutline.clear();
     mWideBorder = 0;
+#ifdef _VSMOD
+    if (geometric)
+        m_geometricEdges = std::make_unique<std::vector<ContourEdge>>();
+    else
+        m_geometricEdges.reset();
+    m_geometricContour = 0;
+#endif
 
     // Determine bounding box
 
@@ -526,6 +542,9 @@ bool Rasterizer::ScanConvert()
         case PT_MOVETO:
             if(lastmoveto >= 0 && firstp != lastp)
                 _EvaluateLine(lastp.x, lastp.y, firstp.x, firstp.y);
+#ifdef _VSMOD
+            if (m_geometricEdges) ++m_geometricContour;
+#endif
             lastmoveto = i;
             fFirstSet = false;
             lastp = mpPathPoints[i];
@@ -908,6 +927,10 @@ bool Rasterizer::CreateWidenedRegion(int rx, int ry)
     mWideBorder = max(rx, ry);
     if (mOutline.empty())
         return true;
+#ifdef _VSMOD
+    if (m_geometricEdges && !m_geometricEdges->empty())
+        return CreateMiteredRegion(rx, ry);
+#endif
 
     // Keep the whole-outline path for dimensions where the packed horizontal
     // offset may carry into the row, or where indexing rows would be costly.
@@ -939,6 +962,84 @@ bool Rasterizer::CreateWidenedRegion(int rx, int ry)
 }
 
 #ifdef _VSMOD
+bool Rasterizer::CreateMiteredRegion(int rx, int ry)
+{
+    struct Point { double x, y; };
+    const double sx = (std::min)(rx, 2048) * 8.0;
+    const double sy = (std::min)(ry, 2048) * 8.0;
+    mWideBorder = int(2 * (std::max)(sx, sy) / 8) + 8;
+    if (!sx && !sy) return true;
+
+    const auto normal = [&](const ContourEdge& edge) {
+        const double dx = (double(edge.x1) - edge.x0) / (std::max)(1., sx);
+        const double dy = (double(edge.y1) - edge.y0) / (std::max)(1., sy);
+        const double inverse = 1 / std::hypot(dx, dy);
+        return Point{-dy * inverse, dx * inverse};
+    };
+    const auto shift = [&](Point point, Point n, double side) {
+        return Point{point.x + sx * n.x * side, point.y + sy * n.y * side};
+    };
+
+    std::vector<POINT> points;
+    std::vector<BYTE> types;
+    // Stroke primitives have the same winding so overlaps merge in the scan
+    // converter. The original fill is unioned afterward, including its holes.
+    const auto add = [&](std::array<Point, 4> polygon, unsigned count) {
+        double area = 0;
+        for (unsigned i = 0; i < count; ++i)
+        {
+            const auto& a = polygon[i];
+            const auto& b = polygon[(i + 1) % count];
+            area += a.x * b.y - a.y * b.x;
+        }
+        if (std::abs(area) < 0.1) return;
+        for (unsigned i = 0; i < count; ++i)
+        {
+            const auto& p = polygon[area > 0 ? i : count - 1 - i];
+            points.push_back({LONG(std::lround(p.x)), LONG(std::lround(p.y))});
+            types.push_back(i ? PT_LINETO : PT_MOVETO);
+        }
+    };
+    const auto& edges = *m_geometricEdges;
+    for (size_t begin = 0; begin < edges.size();)
+    {
+        size_t end = begin + 1;
+        while (end < edges.size() && edges[end].contour == edges[begin].contour) ++end;
+        for (size_t i = begin; i < end; ++i)
+        {
+            const auto& edge = edges[i];
+            const Point a{double(edge.x0), double(edge.y0)}, b{double(edge.x1), double(edge.y1)};
+            const Point n = normal(edge);
+            add({shift(a, n, -1), shift(b, n, -1), shift(b, n, 1), shift(a, n, 1)}, 4);
+            const auto& following = edges[i + 1 == end ? begin : i + 1];
+            if (following.x0 != edge.x1 || following.y0 != edge.y1) continue;
+            const Point next = normal(following);
+            const double denominator = 1 + n.x * next.x + n.y * next.y;
+            Point miter{};
+            if (denominator > 1e-8)
+                miter = {(n.x + next.x) / denominator, (n.y + next.y) / denominator};
+            const bool sharp = denominator > 1e-8 && miter.x * miter.x + miter.y * miter.y <= 4;
+            const double side = n.x * next.y - n.y * next.x > 0 ? -1. : 1.;
+            if (sharp) add({b, shift(b, n, side), shift(b, miter, side), shift(b, next, side)}, 4);
+            else add({b, shift(b, n, side), shift(b, next, side), b}, 3);
+        }
+        begin = end;
+    }
+    if (points.empty())
+    {
+        mWideOutline = mOutline;
+        return true;
+    }
+    Rasterizer strokes;
+    if (!strokes.CopyPath(points.data(), types.data(), points.size()) || !strokes.ScanConvert())
+        return false;
+    const uint64_t offset = uint64_t(int64_t(strokes.mPathOffsetY) * 0x100000000ll + strokes.mPathOffsetX);
+    mWideOutline.reserve(mOutline.size() + strokes.mOutline.size());
+    MergeOutlineSpans(mOutline.cbegin(), mOutline.cend(), strokes.mOutline.cbegin(), strokes.mOutline.cend(),
+        offset, offset, [&](uint64_t start, uint64_t end) { mWideOutline.emplace_back(start, end); });
+    return true;
+}
+
 bool Rasterizer::CreateOutlineRings(const std::vector<OutlineTarget>& layers, Rasterizer* shadow)
 {
     const tSpanBuffer* inner = &mOutline;

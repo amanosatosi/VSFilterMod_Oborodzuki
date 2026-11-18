@@ -216,7 +216,7 @@ class STSStyle
 public:
     CRect	marginRect; // measured from the sides
     int		scrAlignment; // 1 - 9: as on the numpad, 0: default
-    int		borderStyle; // 0: outline, 1: opaque box, 2: event box
+    int		borderStyle; // 0: outline, 1: opaque box, 2: event box, 3: geometric outline
     double	outlineWidthX, outlineWidthY;
     double	shadowDepthX, shadowDepthY;
     COLORREF colors[4]; // usually: {primary, secondary, outline/background, shadow}

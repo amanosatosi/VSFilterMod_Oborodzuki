@@ -75,6 +75,7 @@ public:
     int m_ktype, m_kstart, m_kend;
 
     int m_width, m_ascent, m_descent;
+    int m_logicalLine = 0;
 
     CWord(STSStyle& style, CStringW str, int ktype, int kstart, int kend, double scalex, double scaley); // str[0] = 0 -> m_fLineBreak = true (in this case we only need and use the height of m_font from the whole class)
     CWord(CWord& word);
@@ -166,6 +167,7 @@ class CLine : public CAtlList<CWord*>
 {
 public:
     int m_width, m_ascent, m_descent, m_borderX, m_borderY;
+    int m_horizontalAnchor = -1;
 
     virtual ~CLine();
 
@@ -234,6 +236,9 @@ public:
     std::unique_ptr<AssMotion::Track> m_motion;
     double m_clipOffsetX = 0, m_clipOffsetY = 0;
     bool m_hasRectClip = false;
+    struct LineAlignment { int first, inherited; };
+    std::map<int, LineAlignment> m_lineAlignment;
+    int m_logicalLine = 0, m_textAnchor = -1, m_textWidth = 0;
     void CreateEventBox(int borderStyle, int time, bool scaledBorder);
 #endif
     int m_scrAlignment;
@@ -261,6 +266,8 @@ public:
     void CreateClippers(CSize size);
 
     void MakeLines(CSize size, CRect marginRect);
+    void AppendWord(CWord* word);
+    int LineLeft(const CLine& line, int anchor) const;
 };
 
 class CScreenLayoutAllocator

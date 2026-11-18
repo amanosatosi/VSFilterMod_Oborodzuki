@@ -772,6 +772,7 @@ CWord::CWord(CWord& word)
     m_width = word.m_width;
     m_ascent = word.m_ascent;
     m_descent = word.m_descent;
+    m_logicalLine = word.m_logicalLine;
     m_fLineBreak = word.m_fLineBreak;
     m_fWhiteSpaceChar = word.m_fWhiteSpaceChar;
     isOpaqueBox = word.isOpaqueBox;
@@ -825,7 +826,11 @@ void CWord::Paint(CPoint p, CPoint org)
         Transform(CPoint((org.x - p.x) * 8, (org.y - p.y) * 8));
 #endif
 
+#ifdef _VSMOD
+        if(!ScanConvert(m_style.borderStyle == 3)) return;
+#else
         if(!ScanConvert()) return;
+#endif
 
 #ifdef _VSMOD
         m_nativeMasks.reset();
@@ -2156,7 +2161,7 @@ CRect CLine::PaintShadow(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPo
 #else
             w->Paint(CPoint(x, y), org);
 #endif
-            if(w->m_style.borderStyle == 0)
+            if(w->m_style.borderStyle == 0 || w->m_style.borderStyle == 3)
             {
 #ifdef _VSMOD // patch m004. gradient colors
                 if (w->HasNativeOutline() && !(w->m_ktype == 2 && time < w->m_kstart))
@@ -2490,6 +2495,18 @@ CLine* CSubtitle::GetNextLine(POSITION& pos, int maxwidth)
 
     CLine* ret = DNew CLine();
     if(!ret) return(NULL);
+#ifdef _VSMOD
+    if (!m_lineAlignment.empty())
+    {
+        const auto number = m_words.GetAt(pos)->m_logicalLine;
+        auto at = m_lineAlignment.upper_bound(number);
+        if (at != m_lineAlignment.begin())
+        {
+            --at;
+            ret->m_horizontalAnchor = at->first == number ? at->second.first : at->second.inherited;
+        }
+    }
+#endif
 
 #if defined(_VSMOD) && defined(_LUA)
 
@@ -2716,6 +2733,9 @@ void CSubtitle::MakeLines(CSize size, CRect marginRect)
 
         spaceNeeded.cx = max(l->m_width + l->m_borderX, spaceNeeded.cx);
         spaceNeeded.cy += l->m_ascent + l->m_descent;
+#ifdef _VSMOD
+        m_textWidth = (std::max)(m_textWidth, l->m_width);
+#endif
 
         AddTail(l);
     }
@@ -2730,6 +2750,32 @@ void CSubtitle::MakeLines(CSize size, CRect marginRect)
                         : m_scrAlignment <= 6 ? (marginRect.top + (size.cy - marginRect.bottom) - spaceNeeded.cy + 1) / 2
                         : marginRect.top),
                  spaceNeeded);
+}
+
+void CSubtitle::AppendWord(CWord* word)
+{
+#ifdef _VSMOD
+    word->m_logicalLine = m_logicalLine;
+    if (word->m_fLineBreak)
+        ++m_logicalLine;
+#endif
+    m_words.AddTail(word);
+}
+
+int CSubtitle::LineLeft(const CLine& line, int anchor) const
+{
+    const auto offset = [](int width, int alignment) {
+        return alignment == 1 ? 0 : alignment == 2 ? width / 2 : width;
+    };
+    const int normal = m_scrAlignment % 3;
+#ifdef _VSMOD
+    const int text = m_textAnchor < 0 ? normal : m_textAnchor;
+    if (line.m_horizontalAnchor >= 0)
+        return anchor - offset(m_textWidth, text) + offset(m_textWidth - line.m_width, line.m_horizontalAnchor);
+    return anchor - offset(line.m_width, text);
+#else
+    return anchor - offset(line.m_width, normal);
+#endif
 }
 
 #ifdef _VSMOD
@@ -2813,8 +2859,7 @@ void CSubtitle::CreateEventBox(int borderStyle, int time, bool scaledBorder)
     while (lines)
     {
         auto* line = GetNext(lines);
-        const double x = m_scrAlignment % 3 == 1 ? 0 : m_scrAlignment % 3 == 2 ?
-            -line->m_width / 2.0 : -line->m_width;
+        const double x = LineLeft(*line, 0);
         left = (std::min)(left, x);
         right = (std::max)(right, x + line->m_width);
         if (canonical) continue;
@@ -3201,7 +3246,7 @@ void CRenderedTextSubtitle::ParseString(CSubtitle* sub, CStringW str, STSStyle& 
                 w->m_entry = m_entry;
                 w->LuaRendererHandler = style.LuaRendererHandler;
 #endif
-                sub->m_words.AddTail(w);
+                sub->AppendWord(w);
                 m_kstart = m_kend;
             }
         }
@@ -3216,7 +3261,7 @@ void CRenderedTextSubtitle::ParseString(CSubtitle* sub, CStringW str, STSStyle& 
                 w->m_entry = m_entry;
                 w->LuaRendererHandler = style.LuaRendererHandler;
 #endif
-                sub->m_words.AddTail(w);
+                sub->AppendWord(w);
                 m_kstart = m_kend;
             }
         }
@@ -3230,7 +3275,7 @@ void CRenderedTextSubtitle::ParseString(CSubtitle* sub, CStringW str, STSStyle& 
                 w->m_entry = m_entry;
                 w->LuaRendererHandler = style.LuaRendererHandler;
 #endif
-                sub->m_words.AddTail(w);
+                sub->AppendWord(w);
                 m_kstart = m_kend;
             }
         }
@@ -3254,7 +3299,7 @@ void CRenderedTextSubtitle::ParsePolygon(CSubtitle* sub, CStringW str, STSStyle&
         w->m_entry = m_entry;
         w->LuaRendererHandler = style.LuaRendererHandler;
 #endif
-        sub->m_words.AddTail(w);
+        sub->AppendWord(w);
         m_kstart = m_kend;
     }
 }
@@ -3912,7 +3957,9 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
         const int rawCount = static_cast<int>(params.size());
 #ifdef _VSMOD
         OutlineTag outline;
-        if (EventBoxTag(cmd) || ReadOutlineTag(cmd, outline))
+        PaintTag paint{};
+        if (EventBoxTag(cmd) || ReadOutlineTag(cmd, outline) ||
+            (ReadPaintTag(cmd, paint) && paint.positioned))
         {
             result->push_back({cmd, cmd, std::move(params), rawCount});
             continue;
@@ -4054,6 +4101,12 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
 #endif
         else if(!cmd.Find(L"s"))
             params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+#ifdef _VSMOD
+        else if(!cmd.Find(L"tan"))
+            params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+        else if(!cmd.Find(L"ta"))
+            params.push_back(cmd.Mid(2)), cmd = cmd.Left(2);
+#endif
         else if(!cmd.Find(L"t"))
             ;
         else if(!cmd.Find(L"u"))
@@ -4356,6 +4409,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     if (!wcscmp(name + 2, L"1")) sub->m_borderStyleOverride = 0;
                     if (!wcscmp(name + 2, L"3")) sub->m_borderStyleOverride = 1;
                     if (!wcscmp(name + 2, L"4")) sub->m_borderStyleOverride = 2;
+                    if (!wcscmp(name + 2, L"5")) sub->m_borderStyleOverride = 3;
                 }
                 continue;
             }
@@ -5751,6 +5805,24 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                                ? (n == 0 ? false : n == 1 ? true : org.fStrikeOut)
                                    : org.fStrikeOut;
         }
+#ifdef _VSMOD
+        else if (cmd == L"tan" || cmd == L"ta")
+        {
+            if (fAnimate || p.GetLength() != 1) continue;
+            const wchar_t* number = p;
+            const int alignment = ReadDecimalDigit(number);
+            if (alignment < 1 || alignment > 9) continue;
+            const int horizontal = alignment % 3;
+            if (cmd == L"tan")
+                sub->m_textAnchor = horizontal;
+            else
+            {
+                const auto inserted = sub->m_lineAlignment.emplace(sub->m_logicalLine,
+                    CSubtitle::LineAlignment{horizontal, horizontal});
+                inserted.first->second.inherited = horizontal;
+            }
+        }
+#endif
         else if(cmd == L"t") // \t([<t1>,<t2>,][<accel>,]<style modifiers>)
         {
 #ifdef _VSMOD
@@ -6427,8 +6499,7 @@ static std::function<void()> PrepareEventGeometry(CSubtitle* subtitle, CPoint or
     while (linePosition)
     {
         CLine* line = subtitle->GetNext(linePosition);
-        int x = subtitle->m_scrAlignment % 3 == 1 ? origin.x :
-            subtitle->m_scrAlignment % 3 == 0 ? origin.x - line->m_width : origin.x - line->m_width / 2;
+        int x = subtitle->LineLeft(*line, origin.x);
         POSITION wordPosition = line->GetHeadPosition();
         while (wordPosition)
         {
@@ -7154,9 +7225,7 @@ try
         {
             CLine* l = s->GetNext(pos);
 
-            p.x = (s->m_scrAlignment % 3) == 1 ? org.x
-                  : (s->m_scrAlignment % 3) == 0 ? org.x - l->m_width
-                  :							   org.x - (l->m_width / 2);
+            p.x = s->LineLeft(*l, org.x);
 
 #ifdef _VSMOD // patch m006. moveable vector clip
             if(s->m_clipInverse)
@@ -7193,9 +7262,7 @@ try
         {
             CLine* l = s->GetNext(pos);
 
-            p.x = (s->m_scrAlignment % 3) == 1 ? org.x
-                  : (s->m_scrAlignment % 3) == 0 ? org.x - l->m_width
-                  :							   org.x - (l->m_width / 2);
+            p.x = s->LineLeft(*l, org.x);
 
 #ifdef _VSMOD // patch m006. moveable vector clip
             if(s->m_clipInverse)
@@ -7232,9 +7299,7 @@ try
         {
             CLine* l = s->GetNext(pos);
 
-            p.x = (s->m_scrAlignment % 3) == 1 ? org.x
-                  : (s->m_scrAlignment % 3) == 0 ? org.x - l->m_width
-                  :							   org.x - (l->m_width / 2);
+            p.x = s->LineLeft(*l, org.x);
 
 #ifdef _VSMOD // patch m006. moveable vector clip
             if(s->m_clipInverse)

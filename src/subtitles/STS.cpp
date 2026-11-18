@@ -1914,7 +1914,7 @@ static bool OpenSubStationAlpha(CTextFile* file, CSimpleTextSubtitle& ret, int C
                 style->fontAngleX = style->fontAngleY = 0;
                 style->borderStyle = style->borderStyle == 3 ? 1 :
 #ifdef _VSMOD
-                    style->borderStyle == 4 ? 2 :
+                    style->borderStyle == 4 ? 2 : style->borderStyle == 5 ? 3 :
 #endif
                     0;
                 style->outlineWidthX = max(style->outlineWidthX, 0);
@@ -2139,7 +2139,7 @@ static bool OpenXombieSub(CTextFile* file, CSimpleTextSubtitle& ret, int CharSet
                 style->fontSpacing = max(style->fontSpacing, 0);
                 style->borderStyle = style->borderStyle == 3 ? 1 :
 #ifdef _VSMOD
-                    style->borderStyle == 4 ? 2 :
+                    style->borderStyle == 4 ? 2 : style->borderStyle == 5 ? 3 :
 #endif
                     0;
                 style->outlineWidthX = max(style->outlineWidthX, 0);
@@ -3367,7 +3367,7 @@ bool CSimpleTextSubtitle::SaveAs(CString fn, exttype et, double fps, CTextFile::
                             s->colors[2] & 0xffffff,
                             s->colors[3] & 0xffffff,
                             s->fontWeight > FW_NORMAL ? -1 : 0, s->fItalic ? -1 : 0,
-                            s->borderStyle == 0 ? 1 : s->borderStyle == 1 ? 3 : 0,
+                            s->borderStyle == 0 ? 1 : s->borderStyle + 2,
                             (int)s->outlineWidthY, (int)s->shadowDepthY,
                             s->scrAlignment <= 3 ? s->scrAlignment : s->scrAlignment <= 6 ? ((s->scrAlignment - 3) | 8) : s->scrAlignment <= 9 ? ((s->scrAlignment - 6) | 4) : 2,
                             s->marginRect.left, s->marginRect.right, (s->marginRect.top + s->marginRect.bottom) / 2,
@@ -3388,7 +3388,7 @@ bool CSimpleTextSubtitle::SaveAs(CString fn, exttype et, double fps, CTextFile::
                             s->fItalic ? -1 : 0, s->fUnderline ? -1 : 0, s->fStrikeOut ? -1 : 0,
                             (int)s->fontScaleX, (int)s->fontScaleY,
                             (int)s->fontSpacing, (float)s->fontAngleZ,
-                            s->borderStyle == 0 ? 1 : s->borderStyle == 1 ? 3 : 0,
+                            s->borderStyle == 0 ? 1 : s->borderStyle + 2,
                             (int)s->outlineWidthY, (int)s->shadowDepthY,
                             s->scrAlignment,
                             s->marginRect.left, s->marginRect.right, (s->marginRect.top + s->marginRect.bottom) / 2,
@@ -3525,7 +3525,7 @@ bool CSimpleTextSubtitle::SaveAs(CString fn, exttype et, double fps, CTextFile::
                     s->fItalic ? -1 : 0, s->fUnderline ? -1 : 0, s->fStrikeOut ? -1 : 0,
                     (int)s->fontScaleX, (int)s->fontScaleY,
                     (int)s->fontSpacing, (float)s->fontAngleZ,
-                    s->borderStyle == 0 ? 1 : s->borderStyle == 1 ? 3 : 0,
+                    s->borderStyle == 0 ? 1 : s->borderStyle + 2,
                     (int)s->outlineWidthY, (int)s->shadowDepthY,
                     s->scrAlignment,
                     s->marginRect.left, s->marginRect.right, (s->marginRect.top + s->marginRect.bottom) / 2,

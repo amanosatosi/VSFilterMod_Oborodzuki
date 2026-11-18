@@ -32,7 +32,8 @@ def write(name, entries):
     for index, (x, y, tags, body) in enumerate(entries):
         ass += f"Dialogue: {index % 3},0:00:01.00,0:00:05.00,Default,,0,0,0,,"
         position = "" if r"\move(" in tags else rf"\pos({x},{y})"
-        ass += rf"{{\an7{position}\bord0\shad0{tags}}}" + body + "\n"
+        alignment = "" if r"\an" in tags else r"\an7"
+        ass += rf"{{{alignment}{position}\bord0\shad0{tags}}}" + body + "\n"
     path.write_text(ass, encoding="utf-8-sig")
     return path.resolve(), len(entries)
 
@@ -296,9 +297,9 @@ if ROUND2:
         close(evaluated(frame, "numbers", x, 50), color)
 
     motion = write("competing-motion", [
-        (500, 500, r"\t(0,500,\pos(200,500))\t(250,800,\pos(~+350,~+100))\p1", BOX),
-        (120, 90, r"\clip(120,90,210,190)\clippos(30,0)\p1", BOX),
-        (1100, 90, r"\scale50\p1", BOX),
+        (500, 500, r"\1c$white\t(0,500,\pos(200,500))\t(250,800,\pos(~+350,~+100))\p1", BOX),
+        (120, 90, r"\1c$white\clip(120,90,210,190)\clippos(30,0)\p1", BOX),
+        (1100, 90, r"\1c$white\scale50\p1", BOX),
     ])
     locations = {"moving": (0, 0), "clip": (120, 90), "scale": (1100, 90)}
     playback("csri", CANDIDATE, motion, ROOT / "motion")
@@ -323,6 +324,29 @@ if ROUND2:
         except AssertionError as error:
             raise AssertionError(f"{case} at {frame} ({x},{y}): {error}") from error
 
+    geometry = write("geometric-borders", [
+        (120, 90, r"\bs5\bord12\3c&H0000FF&\2bs8\2bc&HFF0000&\p1", BOX),
+        (500, 90, r"\bord12\3c&H0000FF&\p1", BOX),
+        (900, 90, r"\an9\tan7\1c$white\p1", BOX),
+    ])
+    locations = {"miter": (120, 90), "round": (500, 90), "anchor": (900, 90)}
+    playback("csri", CANDIDATE, geometry, ROOT / "geometry")
+    playback("rgba", MANG, geometry, ROOT / "geometry-reference")
+    actual = captures(ROOT / "geometry", locations)
+    expected_geometry = captures(ROOT / "geometry-reference", locations)
+    for case, x, y, color in [
+        ("miter", -10, -10, (255, 0, 0)),
+        ("miter", -17, -17, (0, 0, 255)),
+        ("round", -10, -10, (0, 0, 0)),
+        ("anchor", 25, 50, (255, 255, 255)),
+        ("anchor", -25, 50, (0, 0, 0)),
+    ]:
+        try:
+            close(actual(60, case, x, y), color)
+            close(expected_geometry(60, case, x, y), color)
+        except AssertionError as error:
+            raise AssertionError(f"{case} at ({x},{y}): {error}") from error
+
 for frame, color in [(60, 2), (120, 0)]:
     assert sum(new(frame, "karaoke", x, y)[color] > 200
                for x in range(250) for y in range(85)) > 100, "karaoke channel unavailable"
@@ -336,12 +360,25 @@ for x in (25, 100, 175):
         assert new(90, "legacy", x, y) == previous(90, "legacy", x, y)
 
 print("Analytic and Mangetsu pixel checks passed.", flush=True)
-expected_hashes = None
-for n in (1, 2, 4, 6, 8):
-    hashes = benchmark(CANDIDATE, heavy, n, "regression")["hashes"]
-    if expected_hashes is None:
-        expected_hashes = hashes
-    assert hashes == expected_hashes, f"gradient seek/frame hashes differ at {n} workers"
+scenes = [heavy]
+if ROUND2:
+    combined = write("combined-extension-seeks", [
+        (140 + (i % 4) * 330, 150 + (i // 4) * 130,
+         r"\bs5\bord($height/30)\2bs5\2bgrd(30,$white,$black)\2bga(90,$0,$150)"
+         r"\t(0,25%,\2bs~+2\2bgrd(90,$black,$white))\grds($width/4)"
+         r"\pgrd(100,100,1600,900,40,&H00FF00&,$white)\t(300,800,\pos(~+15,~-8))"
+         r"\fad(400,250,&HFF0000&+a,$black)\p1"
+         if i % 2 else r"\bs4\boxp(7,9,8,12)\boxr10\bbs4\bbgrd(65,$white,$black)"
+                       r"\4a$0\t(200,850,\frz20\scale90)\1grd(45,$white,$black)\p1",
+         BOX)
+        for i in range(16)
+    ])
+    scenes.append(combined)
+for scene in scenes:
+    expected_hashes = benchmark(CANDIDATE, scene, 1, "regression")["hashes"]
+    for n in (2, 4, 6, 8):
+        hashes = benchmark(CANDIDATE, scene, n, "regression")["hashes"]
+        assert hashes == expected_hashes, f"{scene[0].stem} seek/frame hashes differ at {n} workers"
 
 print("Backward seeks and five worker budgets produced identical hashes.", flush=True)
 results = []
