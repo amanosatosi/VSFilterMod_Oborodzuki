@@ -15,12 +15,30 @@ struct Intent
     double acceleration;
 };
 
+struct Move
+{
+    AssNumeric::Operand x1, y1, x2, y2;
+    int start, end;
+
+    Point At(Point base, int time) const
+    {
+        const Point first{x1.Resolve(base.x), y1.Resolve(base.y)};
+        const Point last{x2.Resolve(base.x), y2.Resolve(base.y)};
+        if (time <= start) return first;
+        if (time >= end) return last;
+        const double t = (double(time) - start) / (double(end) - start);
+        return {first.x + (last.x - first.x) * t, first.y + (last.y - first.y) * t};
+    }
+};
+
 struct Track
 {
     static constexpr size_t Limit = 64;
     std::vector<Intent> intents;
     AssNumeric::Operand x{0, true}, y{0, true};
     bool shifted = false;
+    bool hasMove = false;
+    Move move{};
 
     void Translate(AssNumeric::Operand dx, AssNumeric::Operand dy)
     {
@@ -40,6 +58,7 @@ struct Track
 
     Point At(Point base, int time) const
     {
+        if (hasMove) base = move.At(base, time);
         Point pos{x.Resolve(base.x), y.Resolve(base.y)};
         if (intents.empty()) return pos;
         std::array<int, 2 * Limit + 1> boundaries;

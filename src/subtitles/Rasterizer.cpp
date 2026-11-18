@@ -1538,6 +1538,7 @@ struct PositionedDraw
 
 void BlendPositionedOverlays(const OverlayDraw* const* draws, size_t count, int top, int bottom)
 {
+    PROFILE_RENDER_STAGE(Composite);
     int left = INT_MAX, right = INT_MIN;
     int firstRow = bottom, lastRow = top;
     std::vector<const KfxPaint::Paint*> scopes;
@@ -1556,7 +1557,12 @@ void BlendPositionedOverlays(const OverlayDraw* const* draws, size_t count, int 
         left = (std::min)(left, int(draw.bounds.left));
         right = (std::max)(right, int(draw.bounds.right));
     }
-    const size_t width = scopes.empty() ? 0 : right - left;
+    if (scopes.empty())
+    {
+        for (size_t i = 0; i < count; ++i) draws[i]->Blend(top, bottom);
+        return;
+    }
+    const size_t width = right - left;
     std::vector<float> above(width * scopes.size());
     RasterizerNfo unused{};
     COverlayMixer scalar(&unused, nullptr);

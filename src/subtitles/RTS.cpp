@@ -839,6 +839,10 @@ CWord::CWord(CWord& word)
     m_fLineBreak = word.m_fLineBreak;
     m_fWhiteSpaceChar = word.m_fWhiteSpaceChar;
     isOpaqueBox = word.isOpaqueBox;
+#ifdef _VSMOD
+    if (word.m_distortionDomain)
+        m_distortionDomain = std::make_unique<CRect>(*word.m_distortionDomain);
+#endif
 }
 
 CWord::~CWord()
@@ -1106,12 +1110,19 @@ void CWord::Transform(CPoint org)
         bool is_dist = m_style.mod_distort.enabled;
         if(is_dist)
         {
-            for(int i = 0; i < mPathPoints; i++)
+            if (m_distortionDomain)
             {
-                __m128 __point = _mm_set_ps(mpPathPoints[i].x, mpPathPoints[i].y, 0, 0);
-                __minx = _mm_min_ps(__minx, __point);
-                __max = _mm_max_ps(__max, __point);
+                const auto& plane = *m_distortionDomain;
+                __minx = _mm_set_ps(float(plane.left), float(plane.top), 0, 0);
+                __max = _mm_set_ps(float(plane.right), float(plane.bottom), 0, 0);
             }
+            else
+                for(int i = 0; i < mPathPoints; i++)
+                {
+                    const auto point = _mm_set_ps(float(mpPathPoints[i].x), float(mpPathPoints[i].y), 0, 0);
+                    __minx = _mm_min_ps(__minx, point);
+                    __max = _mm_max_ps(__max, point);
+                }
 
             __m128 __zero = _mm_setzero_ps();
             __max = _mm_sub_ps(__max, __minx); // xsz, ysz, 1, 1
@@ -1353,13 +1364,22 @@ void CWord::Transform(CPoint org)
         bool is_dist = m_style.mod_distort.enabled;
         if(is_dist)
         {
-            for(int i = 0; i < mPathPoints; i++)
+            if (m_distortionDomain)
             {
-                if(minx > mpPathPoints[i].x) minx = mpPathPoints[i].x;
-                if(miny > mpPathPoints[i].y) miny = mpPathPoints[i].y;
-                if(maxx < mpPathPoints[i].x) maxx = mpPathPoints[i].x;
-                if(maxy < mpPathPoints[i].y) maxy = mpPathPoints[i].y;
+                const auto& plane = *m_distortionDomain;
+                minx = plane.left;
+                miny = plane.top;
+                maxx = plane.right;
+                maxy = plane.bottom;
             }
+            else
+                for(int i = 0; i < mPathPoints; i++)
+                {
+                    if(minx > mpPathPoints[i].x) minx = mpPathPoints[i].x;
+                    if(miny > mpPathPoints[i].y) miny = mpPathPoints[i].y;
+                    if(maxx < mpPathPoints[i].x) maxx = mpPathPoints[i].x;
+                    if(maxy < mpPathPoints[i].y) maxy = mpPathPoints[i].y;
+                }
 
             xsz = max(maxx - minx, 0);
             ysz = max(maxy - miny, 0);
@@ -2881,7 +2901,7 @@ class EventBoxPath : public CWord
     }
 
 public:
-    EventBoxPath(STSStyle& style, double sx, double sy) : CWord(style, L".", 0, 0, 0, sx, sy)
+    EventBoxPath(STSStyle& style, double sx, double sy, KfxPaint::Rect plane) : CWord(style, L".", 0, 0, 0, sx, sy)
     {
         isOpaqueBox = true;
         m_style.outlineWidthX = m_style.outlineWidthY = 0;
@@ -2891,6 +2911,9 @@ public:
         m_style.mod_rand.clear();
         m_style.fBlur = 0;
         m_style.fGaussianBlurX = m_style.fGaussianBlurY = 0;
+        if (m_style.mod_distort.enabled)
+            m_distortionDomain = std::make_unique<CRect>(LONG(std::lround(plane.left * 8)),
+                LONG(std::lround(plane.top * 8)), LONG(std::lround(plane.right * 8)), LONG(std::lround(plane.bottom * 8)));
 #ifdef _LUA
         m_style.LuaBeforeTransformHandler.Empty();
         m_style.LuaCustomTransformHandler.Empty();
@@ -2980,7 +3003,7 @@ void CSubtitle::CreateEventBox(int borderStyle, int time, bool scaledBorder)
     const auto expand = [&](double x, double y) {
         return KfxPaint::Rect{rect.left-x, rect.top-y, rect.right+x, rect.bottom+y};
     };
-    auto fill = std::make_unique<EventBoxPath>(style, m_scalex, m_scaley);
+    auto fill = std::make_unique<EventBoxPath>(style, m_scalex, m_scaley, rect);
     fill->AddContour(rect, radiusX, radiusY, false);
     m_eventBox.push_back(std::move(fill));
     double x = 0, y = 0;
@@ -2991,7 +3014,7 @@ void CSubtitle::CreateEventBox(int borderStyle, int time, bool scaledBorder)
             const double outerX = bounded(x + layer.x * sx);
             const double outerY = bounded(y + layer.x * sy);
             if (outerX == x && outerY == y) continue;
-            auto ring = std::make_unique<EventBoxPath>(style, m_scalex, m_scaley);
+            auto ring = std::make_unique<EventBoxPath>(style, m_scalex, m_scaley, rect);
             ring->AddContour(expand(outerX, outerY), radiusX + outerX, radiusY + outerY, false);
             ring->AddContour(expand(x, y), radiusX + x, radiusY + y, true);
             auto& paint = ring->m_style;
@@ -4002,6 +4025,16 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
         for(WCHAR c = str[++j]; c && c != '(' && c != '\\'; cmd += c, c = str[++j]);
         cmd.Trim();
         if(cmd.IsEmpty()) continue;
+#ifdef _VSMOD
+        if (cmd[0] >= 128)
+        {
+            const wchar_t* start = cmd;
+            const auto* next = start;
+            const int number = ReadDecimalDigit(next);
+            if (number >= 0)
+                cmd = CStringW(wchar_t(L'0' + number)) + CStringW(next);
+        }
+#endif
 
         std::vector<CStringW> params;
         bool parenthesized = false;
@@ -4438,21 +4471,27 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         CStringW p = params.size() > 0 ? params[0] : L"";
 
 #ifdef _VSMOD
-        if (!p.IsEmpty() && (p[0] == L'~' || p[0] >= 128 ||
-            (tag.parenthesized && ExtendedNumber(p)) ||
-            ((p[0] == L'+' || p[0] == L'-') && p.GetLength() > 1 && p[1] >= 128)))
+        const wchar_t first = p.IsEmpty() ? 0 : p[0];
+        const bool unicodeNumber = (first >= 128 || first == L'+' || first == L'-' ||
+            (first >= L'0' && first <= L'9')) && AssNumeric::HasNonAscii(p);
+        if (unicodeNumber && (cmd == L"an" || cmd == L"a" || cmd == L"kt" || cmd == L"k" || cmd == L"kO" ||
+            cmd == L"K" || cmd == L"kf" || cmd == L"ko" || cmd == L"p" || cmd == L"q"))
+            p = NormalizeNumericDigits(p);
+        if (first == L'~' || unicodeNumber || (first && tag.parenthesized && ExtendedNumber(p)))
         {
             AssNumeric::Operand operand;
             bool handled = false;
-            const auto scalar = [&](double& current, double units = 1., bool nonnegative = false) {
+            const auto scalar = [&](double& current, double units = 1., bool nonnegative = false,
+                double limit = (std::numeric_limits<double>::max)()) {
                 if (!readOperand(p, false, false, operand)) return;
                 const double target = operand.Resolve(current / units) * units;
                 const double value = CalcAnimation(target, current, fAnimate);
-                current = nonnegative ? (std::max)(0., value) : value;
+                if (std::isfinite(value))
+                    current = (std::min)(limit, nonnegative ? (std::max)(0., value) : value);
             };
             if (cmd == L"fs")
             {
-                scalar(style.fontSize);
+                scalar(style.fontSize, 1., false, 4096.);
                 if (style.fontSize <= 0) style.fontSize = org.fontSize;
             }
             else if (cmd == L"fscx") scalar(style.fontScaleX, 1., true);
@@ -4466,10 +4505,28 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             else if (cmd == L"frx") scalar(style.fontAngleX);
             else if (cmd == L"fry") scalar(style.fontAngleY);
             else if (cmd == L"z") scalar(style.mod_z, 80.);
+            else if (cmd == L"frs" || cmd == L"pbo")
+            {
+                auto& current = cmd == L"frs" ? style.mod_fontOrient : m_polygonBaselineOffset;
+                double value = current;
+                scalar(value, cmd == L"frs" ? 10. : 1.);
+                current = int(value);
+            }
+            else if (cmd == L"rnd" || cmd == L"rndx" || cmd == L"rndy" || cmd == L"rndz")
+            {
+                auto apply = [&](int& current) {
+                    double value = current;
+                    scalar(value, 8.);
+                    current = int(value);
+                };
+                if (cmd == L"rnd" || cmd == L"rndx") apply(style.mod_rand.X);
+                if (cmd == L"rnd" || cmd == L"rndy") apply(style.mod_rand.Y);
+                if (cmd == L"rnd" || cmd == L"rndz") apply(style.mod_rand.Z);
+            }
             else if (cmd == L"bord" || cmd == L"xbord" || cmd == L"ybord")
             {
-                if (cmd != L"ybord") scalar(style.outlineWidthX, 1., true);
-                if (cmd != L"xbord") scalar(style.outlineWidthY, 1., true);
+                if (cmd != L"ybord") scalar(style.outlineWidthX, 1., true, 256.);
+                if (cmd != L"xbord") scalar(style.outlineWidthY, 1., true, 256.);
             }
             else if (cmd == L"shad" || cmd == L"xshad" || cmd == L"yshad")
             {
@@ -4478,8 +4535,8 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             }
             else if (cmd == L"blur" || cmd == L"xblur" || cmd == L"yblur")
             {
-                if (cmd != L"yblur") scalar(style.fGaussianBlurX, 1., true);
-                if (cmd != L"xblur") scalar(style.fGaussianBlurY, 1., true);
+                if (cmd != L"yblur") scalar(style.fGaussianBlurX, 1., true, 100.);
+                if (cmd != L"xblur") scalar(style.fGaussianBlurY, 1., true, 100.);
             }
             else if (cmd == L"be")
             {
@@ -4506,7 +4563,8 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 
         bool decorationAlpha;
         CStringW decorationArgument;
-        if (ReadDecorationScalar(cmd, decorationAlpha, decorationArgument))
+        if (cmd.GetLength() >= 2 && (cmd[0] == L'5' || cmd[0] >= 128) &&
+            ReadDecorationScalar(cmd, decorationAlpha, decorationArgument))
         {
             using namespace KfxPaint;
             if (params.size() > 1 || (!params.empty() && !decorationArgument.IsEmpty())) continue;
@@ -5486,7 +5544,8 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             AssNumeric::Operand operand;
             if (p.IsEmpty()) style.softScale = 100;
             else if (readOperand(p, true, false, operand))
-                style.softScale = (std::max)(0., CalcAnimation(operand.Resolve(style.softScale), style.softScale, fAnimate));
+                style.softScale = (std::max)(0., (std::min)(10000., CalcAnimation(
+                    operand.Resolve(style.softScale), style.softScale, fAnimate)));
 #else
             style.fontScaleX = org.fontScaleX;
             style.fontScaleY = org.fontScaleY;
@@ -5498,7 +5557,8 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             AssNumeric::Operand operand;
             if (p.IsEmpty()) style.objectScale = 100;
             else if (readOperand(p, true, false, operand))
-                style.objectScale = (std::max)(0., CalcAnimation(operand.Resolve(style.objectScale), style.objectScale, fAnimate));
+                style.objectScale = (std::max)(0., (std::min)(10000., CalcAnimation(
+                    operand.Resolve(style.objectScale), style.objectScale, fAnimate)));
         }
 #endif
         else if(cmd == L"fsp")
@@ -5620,6 +5680,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #ifdef _LUA
         else if(cmd == L"lua")
         {
+            if (sub->m_measuringLayout) continue;
             if(params.size() > 0)
             {
                 if(LuaHasFunction(L, params[0]))
@@ -5784,6 +5845,46 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #endif
         else if(cmd == L"move") // {\move(x1=param[0], y1=param[1], x2=param[2], y2=param[3][, t1=t[0], t2=t[1]])}
         {
+#ifdef _VSMOD
+            if (sub->m_motion && (sub->m_motion->shifted || sub->m_motion->hasMove))
+                continue;
+            if ((params.size() == 4 || params.size() == 6) && !sub->m_effects[EF_MOVE] &&
+                std::any_of(params.begin(), params.end(), ExtendedNumber))
+            {
+                AssMotion::Move move{};
+                AssNumeric::Operand* args[] = {&move.x1, &move.y1, &move.x2, &move.y2};
+                bool valid = true;
+                for (int i = 0; i < 4; ++i)
+                {
+                    valid = readOperand(params[i], false, false, *args[i]);
+                    if (!valid) break;
+                    args[i]->value *= i % 2 ? sub->m_scaley * (args[i]->relative ? -8 : 8) : sub->m_scalex * 8;
+                }
+                if (!valid) continue;
+                move.end = m_delay;
+                if (params.size() == 6)
+                {
+                    AssNumeric::Operand start, end;
+                    if (!readOperand(params[4], false, true, start) || !readOperand(params[5], false, true, end) ||
+                        start.relative || end.relative || start.value < INT_MIN || end.value < INT_MIN ||
+                        start.value > INT_MAX || end.value > INT_MAX)
+                        continue;
+                    move.start = int(start.value);
+                    move.end = int(end.value);
+                    if (move.start > move.end) std::swap(move.start, move.end);
+                    if (move.end <= 0)
+                    {
+                        move.start = 0;
+                        move.end = m_delay;
+                    }
+                }
+                if (!sub->m_motion) sub->m_motion = std::make_unique<AssMotion::Track>();
+                sub->m_motion->hasMove = true;
+                sub->m_motion->move = move;
+                sub->m_fAnimated = true;
+                continue;
+            }
+#endif
             if((params.size() == 4 || params.size() == 6) && !sub->m_effects[EF_MOVE])
             {
                 if(Effect* e = DNew Effect)
@@ -5815,6 +5916,27 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         else if(cmd == L"org") // {\org(x=param[0], y=param[1])}
         {
 #ifdef _VSMOD // patch f003. moving \org for some karaoke effects. part 1
+            if (params.size() == 2 && (ExtendedNumber(params[0]) || ExtendedNumber(params[1])))
+            {
+                std::array<AssNumeric::Operand, 2> next;
+                if (!readOperand(params[0], false, false, next[0]) || !readOperand(params[1], false, false, next[1]))
+                    continue;
+                if ((sub->m_origin || sub->m_effects[EF_ORG]) && !next[0].relative && !next[1].relative)
+                    continue;
+                next[0].value *= sub->m_scalex * 8;
+                next[1].value *= sub->m_scaley * (next[1].relative ? -8 : 8);
+                if (!sub->m_origin)
+                    sub->m_origin = std::make_unique<std::array<AssNumeric::Operand, 2>>(next);
+                else
+                    for (int i = 0; i < 2; ++i)
+                    {
+                        auto& previous = (*sub->m_origin)[i];
+                        if (next[i].relative) previous.value += next[i].value;
+                        else previous = next[i];
+                    }
+                continue;
+            }
+            if (sub->m_origin) continue;
             if((params.size() == 2 || params.size() == 4 || params.size() == 6) && !sub->m_effects[EF_ORG])
             {
                 if(Effect* e = new Effect)
@@ -5877,7 +5999,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     else sub->m_motion->Translate(x, y);
                     continue;
                 }
-                if (!sub->m_effects[EF_MOVE] && (!sub->m_motion || !sub->m_motion->shifted))
+                if (!sub->m_effects[EF_MOVE] && (!sub->m_motion || (!sub->m_motion->shifted && !sub->m_motion->hasMove)))
                 {
                     auto* e = new Effect;
                     e->param[0] = 0;
@@ -5888,7 +6010,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 }
                 continue;
             }
-            if (sub->m_motion && sub->m_motion->shifted)
+            if (sub->m_motion && (sub->m_motion->shifted || sub->m_motion->hasMove))
                 continue;
 #endif
             if(params.size() == 2 && !sub->m_effects[EF_MOVE])
@@ -6305,7 +6427,7 @@ double CRenderedTextSubtitle::CalcAnimation(double dst, double src, bool fAnimat
         if(m_time < s) dst = src;
         else if(s <= m_time && m_time < e)
         {
-            const double fraction = 1.0 * (m_time - s) / (e - s);
+            const double fraction = (double(m_time) - s) / (double(e) - s);
             const double t = m_animAccel == 1.0 ? fraction : pow(fraction, m_animAccel);
             dst = (1 - t) * src + t * dst;
         }
@@ -6363,9 +6485,20 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
                         rect.OffsetRect(motion->param[1] - x, motion->param[2] - y);
                     }
                 AssNumeric::Context bounds{};
-                bounds[AssNumeric::Left] = rect.left / (baseline->m_scalex * 8);
+                const int baseX = baseline->m_scrAlignment % 3 == 1 ? rect.left :
+                    baseline->m_scrAlignment % 3 == 2 ? rect.CenterPoint().x : rect.right;
+                int left = INT_MAX, right = INT_MIN;
+                POSITION lines = baseline->GetHeadPosition();
+                while (lines)
+                {
+                    const auto* line = baseline->GetNext(lines);
+                    const int x = baseline->LineLeft(*line, baseX);
+                    left = (std::min)(left, x);
+                    right = (std::max)(right, x + line->m_width);
+                }
+                bounds[AssNumeric::Left] = left / (baseline->m_scalex * 8);
                 bounds[AssNumeric::Top] = rect.top / (baseline->m_scaley * 8);
-                bounds[AssNumeric::Right] = rect.right / (baseline->m_scalex * 8);
+                bounds[AssNumeric::Right] = right / (baseline->m_scalex * 8);
                 bounds[AssNumeric::Bottom] = rect.bottom / (baseline->m_scaley * 8);
                 bounds[AssNumeric::Width] = bounds[AssNumeric::Right] - bounds[AssNumeric::Left];
                 bounds[AssNumeric::Height] = bounds[AssNumeric::Bottom] - bounds[AssNumeric::Top];
@@ -7365,7 +7498,11 @@ try
             fPosOverride = true;
         }
 #endif
-        if(!fPosOverride && !fOrgOverride && !s->m_fAnimated)
+        if(!fPosOverride && !fOrgOverride && !s->m_fAnimated
+#ifdef _VSMOD
+            && !s->m_origin
+#endif
+            )
             r = m_sla.AllocRect(s, segment, entry, stse.layer, m_collisions);
 
         CPoint org;
@@ -7373,6 +7510,14 @@ try
         org.y = s->m_scrAlignment <= 3 ? r.bottom : s->m_scrAlignment <= 6 ? r.CenterPoint().y : r.top;
 
         if(!fOrgOverride) org2 = org;
+#ifdef _VSMOD
+        if (s->m_origin)
+        {
+            const CPoint frameOrigin = s->m_relativeTo == 1 ? m_vidrect.TopLeft() : CPoint(0, 0);
+            org2.x = LONG((*s->m_origin)[0].Resolve(org2.x - frameOrigin.x)) + frameOrigin.x;
+            org2.y = LONG((*s->m_origin)[1].Resolve(org2.y - frameOrigin.y)) + frameOrigin.y;
+        }
+#endif
 
         const int eventTime = m_time;
         if (parallel && !captureOverlays)

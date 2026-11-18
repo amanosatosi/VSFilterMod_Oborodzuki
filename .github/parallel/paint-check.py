@@ -59,6 +59,22 @@ legacy = write("animated-scenes-solid", [
     for i in range(20)
 ])
 
+combined = None
+if ROUND2:
+    combined = write("combined-extensions", [
+        (140 + (i % 4) * 330, 150 + (i // 4) * 130,
+         r"\bs5\bord($height/30)\2bs5\2bgrd(30,$white,$black)\2bga(90,$0,$150)"
+         r"\t(0,25%,\2bs~+2\2bgrd(90,$black,$white))\grds($width/4)"
+         r"\pgrd(100,100,1600,900,40,&H00FF00&,$white)\t(300,800,\pos(~+15,~-8))"
+         r"\pgrdalpha(100,100,1600,900,20,$0,$120)"
+         r"\fad(400,250,&HFF0000&+a,$black)\p1"
+         if i % 2 else r"\bs4\boxp(7,9,8,12)\boxr10\bbs4\bbgrd(65,$white,$black)"
+                       r"\4a$0\t(200,850,\frz20\scale90)\1grd(45,$white,$black)\p1",
+         BOX)
+        for i in range(16)
+    ])
+paint_scenes = [legacy, heavy] + ([combined] if combined else [])
+
 
 def benchmark(dll, scenario, workers, mode):
     env = dict(os.environ, OBORODZUKI_WORKERS=str(workers), OBORODZUKI_BENCH_ITERATION="1")
@@ -73,7 +89,7 @@ def benchmark(dll, scenario, workers, mode):
 if sys.argv[1:] == ["--profile"]:
     results = [dict(benchmark(Path("bundle/renderer.dll").resolve(), scene, n, "animation"),
                     scene=scene[0].stem, workers=n)
-               for scene in (legacy, heavy) for n in (1, 2, 4)]
+               for scene in paint_scenes for n in (1, 2, 4)]
     for result in results:
         band_plan = next(stage for stage in result["profile"] if stage["name"] == "band_plan")
         if bool(band_plan["calls"]) != (result["workers"] > 1):
@@ -288,6 +304,11 @@ if ROUND2:
         (120, 90, r"\1c$white\bord($height/20)\3c&H0000FF&\3a$0\2bs~+3"
                   r"\2bc&H00FF00&\t(0,25%,\2bs~+4)\p1", BOX),
     ])
+    script = numeric[0].read_text(encoding="utf-8-sig")
+    numeric[0].write_text(script.replace("PlayResX: 1920", "PlayResX: ၁၉၂၀")
+                          .replace("Default,Arial,48,", "Default,Arial,၄၈,")
+                          .replace("0:00:01.00,0:00:05.00", "０:００:０１.００,０:００:０５.００"),
+                          encoding="utf-8-sig")
     playback("csri", CANDIDATE, numeric, ROOT / "numeric")
     evaluated = captures(ROOT / "numeric", {"numbers": (120, 90)})
     for frame, x, color in [
@@ -404,22 +425,7 @@ for x in (25, 100, 175):
         assert new(90, "legacy", x, y) == previous(90, "legacy", x, y)
 
 print("Analytic and Mangetsu pixel checks passed.", flush=True)
-scenes = [heavy]
-if ROUND2:
-    combined = write("combined-extension-seeks", [
-        (140 + (i % 4) * 330, 150 + (i // 4) * 130,
-         r"\bs5\bord($height/30)\2bs5\2bgrd(30,$white,$black)\2bga(90,$0,$150)"
-         r"\t(0,25%,\2bs~+2\2bgrd(90,$black,$white))\grds($width/4)"
-         r"\pgrd(100,100,1600,900,40,&H00FF00&,$white)\t(300,800,\pos(~+15,~-8))"
-         r"\pgrdalpha(100,100,1600,900,20,$0,$120)"
-         r"\fad(400,250,&HFF0000&+a,$black)\p1"
-         if i % 2 else r"\bs4\boxp(7,9,8,12)\boxr10\bbs4\bbgrd(65,$white,$black)"
-                       r"\4a$0\t(200,850,\frz20\scale90)\1grd(45,$white,$black)\p1",
-         BOX)
-        for i in range(16)
-    ])
-    scenes.append(combined)
-for scene in scenes:
+for scene in paint_scenes[1:]:
     expected_hashes = benchmark(CANDIDATE, scene, 1, "regression")["hashes"]
     for n in (2, 4, 6, 8):
         hashes = benchmark(CANDIDATE, scene, n, "regression")["hashes"]
@@ -427,7 +433,7 @@ for scene in scenes:
 
 print("Backward seeks and five worker budgets produced identical hashes.", flush=True)
 results = []
-settings = [(scene, n) for n in (1, 2, 4) for scene in (legacy, heavy)]
+settings = [(scene, n) for n in (1, 2, 4) for scene in paint_scenes]
 for trial in range(3):
     for scene, n in settings if trial % 2 == 0 else reversed(settings):
         results.append(dict(benchmark(CANDIDATE, scene, n, "animation"),

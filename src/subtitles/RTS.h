@@ -63,6 +63,9 @@ class CWord : public Rasterizer
 protected:
     double m_scalex, m_scaley;
     CStringW m_str;
+#ifdef _VSMOD
+    std::unique_ptr<CRect> m_distortionDomain;
+#endif
 
     void MeasureSelectedFont();
     virtual bool CreatePath() = 0;
@@ -243,6 +246,7 @@ public:
     std::unique_ptr<AssNumeric::Context> m_layoutVariables;
     bool m_measuringLayout = false;
     std::unique_ptr<AssMotion::Track> m_motion;
+    std::unique_ptr<std::array<AssNumeric::Operand, 2>> m_origin;
     double m_clipOffsetX = 0, m_clipOffsetY = 0;
     bool m_hasRectClip = false;
     struct LineAlignment { int first, inherited; };
