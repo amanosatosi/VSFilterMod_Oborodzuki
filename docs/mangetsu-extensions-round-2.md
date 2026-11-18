@@ -176,3 +176,13 @@ workload at one worker, projection and stop sampling accounted for 15.97
 and 18.11 ms per frame of instrumented time. Those timings include profiler
 overhead and are separate from the uninstrumented latency table.
 [Profiler artifact](https://github.com/amanosatosi/VSFilterMod_Oborodzuki/actions/runs/44308826064/artifacts/14430331049)
+
+### Cached override dispatch
+
+Revision `0cebabc` cached extension-tag classification and numeric detection
+alongside the existing override tokens. On its same-runner focused KFX trials,
+Round 1 measured median frame latencies of 13.585, 8.070 and 6.946 ms at
+1, 2 and 4 workers. The cached-dispatch renderer measured 13.602, 8.159 and
+7.008 ms, increases of 0.1%, 1.1% and 0.9%. The combined feature pixels,
+backward seeks and five worker settings passed.
+[Focused performance run](https://github.com/amanosatosi/VSFilterMod_Oborodzuki/actions/runs/44315095865)

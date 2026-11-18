@@ -7,7 +7,7 @@ on:
         type: boolean
         default: true
   push:
-    branches: [feature/parallel-event-rendering, codex/kfx-paint-extensions, codex/mangetsu-extensions-round-2]
+    branches: [feature/parallel-event-rendering, codex/kfx-paint-extensions, codex/mangetsu-extensions-round-2, codex/mangetsu-extensions-round-3]
     paths: ['src/**', '.github/parallel/**', '.github/workflows/parallel-renderer.yml']
 permissions:
   contents: read
@@ -15,7 +15,8 @@ permissions:
 env:
   PARALLEL_FULL: "${{ inputs.full || contains(github.event.head_commit.message, 'Parallel-KFX full') }}"
   PARALLEL_QUICK: "${{ contains(github.event.head_commit.message, 'Parallel-KFX quick') }}"
-  KFX_ROUND2: "${{ github.ref_name == 'codex/mangetsu-extensions-round-2' }}"
+  KFX_ROUND2: "${{ github.ref_name == 'codex/mangetsu-extensions-round-2' || github.ref_name == 'codex/mangetsu-extensions-round-3' }}"
+  KFX_ROUND3: "${{ github.ref_name == 'codex/mangetsu-extensions-round-3' }}"
 jobs:
   build:
     runs-on: windows-2022
@@ -61,8 +62,8 @@ jobs:
       - name: Download the previous parallel renderer
         uses: actions/download-artifact@v4
         with:
-          name: parallel-hosts-${{ env.KFX_ROUND2 == 'true' && 'f81f31adac460894914aeab362b9906ce50d603a' || (github.ref_name == 'codex/kfx-paint-extensions' && '20c6174b9cc15292f77ea99605f22df39faf539c' || 'b110ccac5d1b9b55410b1d50df46dfaf29468503') }}
-          run-id: ${{ env.KFX_ROUND2 == 'true' && '44218421620' || (github.ref_name == 'codex/kfx-paint-extensions' && '44199501549' || '44151605518') }}
+          name: parallel-hosts-${{ env.KFX_ROUND3 == 'true' && '0cebabc6047579cd9a15ef8a658c21b80e1e1b9c' || (env.KFX_ROUND2 == 'true' && 'f81f31adac460894914aeab362b9906ce50d603a' || (github.ref_name == 'codex/kfx-paint-extensions' && '20c6174b9cc15292f77ea99605f22df39faf539c' || 'b110ccac5d1b9b55410b1d50df46dfaf29468503')) }}
+          run-id: ${{ env.KFX_ROUND3 == 'true' && '44315095865' || (env.KFX_ROUND2 == 'true' && '44218421620' || (github.ref_name == 'codex/kfx-paint-extensions' && '44199501549' || '44151605518')) }}
           github-token: ${{ github.token }}
           path: threading-baseline
       - name: Record actual runner hardware

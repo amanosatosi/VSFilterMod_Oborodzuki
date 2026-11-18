@@ -2,7 +2,7 @@ name: Renderer benchmarks
 
 on:
   push:
-    branches: [develop/oborodzuki, feature/parallel-event-rendering, codex/kfx-paint-extensions, codex/mangetsu-extensions-round-2]
+    branches: [develop/oborodzuki, feature/parallel-event-rendering, codex/kfx-paint-extensions, codex/mangetsu-extensions-round-2, codex/mangetsu-extensions-round-3]
     paths:
       - 'src/**'
       - 'include/**'
