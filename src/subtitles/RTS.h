@@ -26,6 +26,8 @@
 #include "Rasterizer.h"
 #include "NumericExpression.h"
 #include "AssMotion.h"
+#include "RenderGeometry.h"
+#include "ShapedText.h"
 #include "..\SubPic\ISubPic.h"
 
 class CMyFont : public CFont
@@ -65,6 +67,14 @@ protected:
     CStringW m_str;
 #ifdef _VSMOD
     std::unique_ptr<CRect> m_distortionDomain;
+    struct LayoutPlacement
+    {
+        CPoint offset;
+        double cosine = 1, sine = 0, center = 0, baseline = 0;
+        bool rotate = false;
+    };
+    std::unique_ptr<LayoutPlacement> m_layoutPlacement;
+    void RotateLayoutOutline();
 #endif
 
     void MeasureSelectedFont();
@@ -96,6 +106,9 @@ public:
     }
 
 #ifdef _VSMOD
+    CPoint LayoutPosition(CPoint flat) const;
+    void PlaceLayout(CPoint offset, double cosine, double sine, double center, double baseline);
+    bool m_wrapAfter = false;
     bool HasNativeOutline() const;
     CRect DrawNativeOutline(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int y, int time, int fade,
         MOD_MOVEVC& vectorClip);
@@ -247,6 +260,11 @@ public:
     bool m_measuringLayout = false;
     std::unique_ptr<AssMotion::Track> m_motion;
     std::unique_ptr<std::array<AssNumeric::Operand, 2>> m_origin;
+    std::shared_ptr<const RenderGeometry::Curve> m_curve;
+    double m_curveX = 0, m_curveY = 0, m_curveScale = 1;
+    int m_curveAnchor = 0;
+    bool m_curveShapeFailed = false;
+    void CurveLines();
     double m_clipOffsetX = 0, m_clipOffsetY = 0;
     bool m_hasRectClip = false;
     struct LineAlignment { int first, inherited; };
@@ -315,6 +333,10 @@ class CRenderedTextSubtitle : public CSimpleTextSubtitle, public ISubPicProvider
     std::unique_ptr<TextGeometryCache> m_textGeometry;
     std::unique_ptr<TextDeviceContext> m_textDC;
     std::unique_ptr<EventWorkerPool> m_eventWorkers;
+#ifdef _VSMOD
+    std::unique_ptr<ShapedText::Context> m_shaper;
+    bool ParseShapedString(CSubtitle* sub, const CStringW& text, STSStyle& style, bool verticalVariants);
+#endif
 
     CScreenLayoutAllocator m_sla;
 

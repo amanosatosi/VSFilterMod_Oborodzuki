@@ -610,6 +610,38 @@ bool CWord::HasNativeOutline() const
     return false;
 }
 
+CPoint CWord::LayoutPosition(CPoint flat) const
+{
+    return m_layoutPlacement ? flat + m_layoutPlacement->offset : flat;
+}
+
+void CWord::PlaceLayout(CPoint offset, double cosine, double sine, double center, double baseline)
+{
+    m_layoutPlacement = std::make_unique<LayoutPlacement>();
+    m_layoutPlacement->offset = offset;
+    m_layoutPlacement->cosine = cosine;
+    m_layoutPlacement->sine = sine;
+    m_layoutPlacement->center = center;
+    m_layoutPlacement->baseline = baseline;
+    m_layoutPlacement->rotate = true;
+}
+
+void CWord::RotateLayoutOutline()
+{
+    const auto& pose = *m_layoutPlacement;
+    const double sx = m_style.fontScaleX / 100;
+    const double sy = m_style.fontScaleY / 100;
+    if (!sx || !sy) return;
+    for (size_t i = 0; i < mPathPoints; ++i)
+    {
+        auto& p = mpPathPoints[i];
+        const double x = p.x * sx - pose.center;
+        const double y = p.y * sy - pose.baseline;
+        p.x = LONG(std::lround((x * pose.cosine - y * pose.sine) / sx));
+        p.y = LONG(std::lround((x * pose.sine + y * pose.cosine) / sy));
+    }
+}
+
 bool CWord::CreateNativeOutline()
 {
     const auto& style = *m_style.nativeOutline;
@@ -842,6 +874,9 @@ CWord::CWord(CWord& word)
 #ifdef _VSMOD
     if (word.m_distortionDomain)
         m_distortionDomain = std::make_unique<CRect>(*word.m_distortionDomain);
+    if (word.m_layoutPlacement)
+        m_layoutPlacement = std::make_unique<LayoutPlacement>(*word.m_layoutPlacement);
+    m_wrapAfter = word.m_wrapAfter;
 #endif
 }
 
@@ -881,6 +916,10 @@ void CWord::Paint(CPoint p, CPoint org)
     {
         if(!CreatePath()) return;
 
+#ifdef _VSMOD
+        if (m_layoutPlacement && m_layoutPlacement->rotate)
+            RotateLayoutOutline();
+#endif
         CPoint morg = CPoint((org.x - p.x) * 8, (org.y - p.y) * 8);
 #if defined (_VSMOD) && defined(_LUA)
         if(m_style.LuaBeforeTransformHandler.GetLength() > 0) CustomTransform(morg, m_style.LuaBeforeTransformHandler, Layer);
@@ -1595,6 +1634,56 @@ bool CText::Append(CWord* w)
     return(dynamic_cast<CText*>(w) && CWord::Append(w));
 }
 
+#ifdef _VSMOD
+namespace
+{
+class ShapedWord : public CWord
+{
+    std::shared_ptr<const ShapedText::Run> run;
+    size_t cluster;
+
+    bool CreatePath() override
+    {
+        const auto& source = run->clusters[cluster];
+        std::vector<POINT> points;
+        std::vector<BYTE> types;
+        for (const auto& glyph : source.glyphs)
+        {
+            points.insert(points.end(), glyph.points.begin(), glyph.points.end());
+            types.insert(types.end(), glyph.types.begin(), glyph.types.end());
+        }
+        return !points.empty() && CopyPath(points.data(), types.data(), points.size());
+    }
+
+public:
+    ShapedWord(STSStyle& style, CStringW text, std::shared_ptr<const ShapedText::Run> source, size_t index,
+        int type, int start, int end, double sx, double sy)
+        : CWord(style, std::move(text), type, start, end, sx, sy), run(std::move(source)), cluster(index)
+    {
+        const auto& part = run->clusters[index];
+        m_fWhiteSpaceChar = part.whitespace;
+        m_wrapAfter = part.breakAfter;
+        m_width = int(std::lround((part.advance * 8 + style.fontSpacing / 8) * style.fontScaleX / 100));
+        m_ascent = int(std::lround(run->ascent * 8 * style.fontScaleY / 100));
+        m_descent = int(std::lround(run->descent * 8 * style.fontScaleY / 100));
+    }
+
+    CWord* Copy() override { return new ShapedWord(*this); }
+    bool Append(CWord*) override { return false; }
+
+    template<class Visit>
+    void OutlinePoints(Visit visit) const
+    {
+        const double sx = m_style.fontScaleX / 100 / 8;
+        const double sy = m_style.fontScaleY / 100 / 8;
+        for (const auto& glyph : run->clusters[cluster].glyphs)
+            for (const auto& point : glyph.points)
+                visit(RenderGeometry::Point{point.x * sx, point.y * sy});
+    }
+};
+}
+#endif
+
 bool CText::CreatePath()
 {
     PROFILE_RENDER_STAGE(GlyphPath);
@@ -2244,6 +2333,9 @@ CRect CLine::PaintShadow(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPo
             int x = p.x - w->m_style.mod_horizontalSpace + (int)(w->m_style.shadowDepthX + 0.5);
             // patch m001. Vertical fontspacing
             int y = p.y - w->m_style.mod_verticalSpace + m_ascent - w->m_ascent + (int)(w->m_style.shadowDepthY + 0.5);
+            const auto placed = w->LayoutPosition(CPoint(x, y));
+            x = placed.x;
+            y = placed.y;
 #else
             int x = p.x + (int)(w->m_style.shadowDepthX + 0.5);
             int y = p.y + m_ascent - w->m_ascent + (int)(w->m_style.shadowDepthY + 0.5);
@@ -2328,6 +2420,9 @@ CRect CLine::PaintOutline(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CP
             int x = p.x - w->m_style.mod_horizontalSpace;
             // patch m001. Vertical fontspacing
             int y = p.y - w->m_style.mod_verticalSpace + m_ascent - w->m_ascent;
+            const auto placed = w->LayoutPosition(CPoint(x, y));
+            x = placed.x;
+            y = placed.y;
 #else
             int x = p.x;
             int y = p.y + m_ascent - w->m_ascent;
@@ -2406,6 +2501,9 @@ CRect CLine::PaintBody(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoin
         int x = p.x - w->m_style.mod_horizontalSpace;
         // patch m001. Vertical fontspacing
         int y = p.y - w->m_style.mod_verticalSpace + m_ascent - w->m_ascent;
+        const auto placed = w->LayoutPosition(CPoint(x, y));
+        x = placed.x;
+        y = placed.y;
 #else
         int x = p.x;
         int y = p.y + m_ascent - w->m_ascent;
@@ -2656,13 +2754,20 @@ CLine* CSubtitle::GetNextLine(POSITION& pos, int maxwidth)
 
         int width = w->m_width;
         POSITION pos2 = pos;
-        while(pos2)
+        bool mayWrap = false;
+#ifdef _VSMOD
+        mayWrap = w->m_wrapAfter;
+#endif
+        while(pos2 && !mayWrap)
         {
             if(m_words.GetAt(pos2)->m_fWhiteSpaceChar != fWSC
                || m_words.GetAt(pos2)->m_fLineBreak) break;
 
             CWord* w2 = m_words.GetNext(pos2);
             width += w2->m_width;
+#ifdef _VSMOD
+            mayWrap = w2->m_wrapAfter;
+#endif
         }
 
         if((ret->m_width += width) <= maxwidth || ret->IsEmpty())
@@ -3033,6 +3138,78 @@ void CSubtitle::CreateEventBox(int borderStyle, int time, bool scaledBorder)
             y = outerY;
         }
 }
+
+void CSubtitle::CurveLines()
+{
+    if (!m_curve || m_curveShapeFailed || IsEmpty()) return;
+    using namespace RenderGeometry;
+    const auto fraction = [](int align) { return align == 1 ? 0. : align == 2 ? .5 : 1.; };
+    const int attach = m_curveAnchor ? m_curveAnchor : m_scrAlignment;
+    const double fx = fraction(attach % 3);
+    const double fy = attach <= 3 ? 1. : attach <= 6 ? .5 : 0.;
+    const double sx = m_scalex * m_curveScale * 8, sy = m_scaley * m_curveScale * 8;
+    if (sx <= 0 || sy <= 0) return;
+    const double at = fx * m_curve->ArcLength() + m_curveX;
+    const auto sample = [&](double distance) {
+        const auto raw = m_curve->At(distance);
+        const Point direction{raw.tangent.x * sx, raw.tangent.y * sy};
+        return Curve::Sample{{raw.point.x * sx, raw.point.y * sy}, direction * (1. / Length(direction))};
+    };
+    const auto anchor = sample(at);
+    const auto normal = Normal(anchor.tangent);
+    struct Placement { ShapedWord* word; Point position, tangent, flat; double center; };
+    std::vector<Placement> placed;
+    double lowX = 1e30, lowY = 1e30, highX = -1e30, highY = -1e30;
+    const int top = m_scrAlignment <= 3 ? -m_rect.Height() : m_scrAlignment <= 6 ? -m_rect.Height() / 2 : 0;
+    int baseline = GetHead()->m_ascent;
+    int y = 0;
+    POSITION lines = GetHeadPosition();
+    while (lines)
+    {
+        auto* line = GetNext(lines);
+        const int align = line->m_horizontalAnchor >= 0 ? line->m_horizontalAnchor :
+            m_textAnchor >= 0 ? m_textAnchor : m_scrAlignment % 3;
+        const double left = fraction(align) * (m_textWidth - line->m_width) - fx * m_textWidth;
+        const double rise = y + line->m_ascent - baseline + m_curveY * sy;
+        int x = 0;
+        POSITION words = line->GetHeadPosition();
+        while (words)
+        {
+            auto* word = dynamic_cast<ShapedWord*>(line->GetNext(words));
+            if (!word) return;
+            const double center = word->m_width * .5;
+            const auto point = sample(at + (left + x + center) / sx);
+            const auto localNormal = Normal(point.tangent);
+            const auto position = point.point + localNormal * rise;
+            placed.push_back({word, position, point.tangent,
+                {double(LineLeft(*line, 0) + x), double(top + y + line->m_ascent - word->m_ascent)}, center});
+            word->OutlinePoints([&](Point raw) {
+                const auto mapped = position + point.tangent * (raw.x - center) + localNormal * (raw.y - word->m_ascent);
+                const auto u = Dot(mapped, anchor.tangent), v = Dot(mapped, normal);
+                lowX = (std::min)(lowX, u); highX = (std::max)(highX, u);
+                lowY = (std::min)(lowY, v); highY = (std::max)(highY, v);
+            });
+            x += word->m_width;
+        }
+        y += line->m_ascent + line->m_descent;
+    }
+    if (lowX > highX || lowY > highY) return;
+    const Point shift = anchor.point + normal * (m_curveY * sy) -
+        (anchor.tangent * (lowX + (highX - lowX) * fx) + normal * (lowY + (highY - lowY) * fy));
+    for (const auto& place : placed)
+    {
+        const auto offset = place.position + shift - place.flat;
+        if (!std::isfinite(offset.x) || !std::isfinite(offset.y) || std::abs(offset.x) > 1000000 ||
+            std::abs(offset.y) > 1000000)
+            return;
+    }
+    for (const auto& place : placed)
+    {
+        const auto offset = place.position + shift - place.flat;
+        place.word->PlaceLayout(CPoint(LONG(std::lround(offset.x)), LONG(std::lround(offset.y))),
+            place.tangent.x, place.tangent.y, place.center * 8, place.word->m_ascent * 8.);
+    }
+}
 #endif
 
 // CScreenLayoutAllocator
@@ -3155,6 +3332,17 @@ struct OverrideTagCache {
 #ifdef _VSMOD
     std::array<std::map<CStringW, AssNumeric::Program>, 2> programs;
     std::map<int, AssNumeric::Context> layout;
+    std::map<CStringW, std::shared_ptr<const RenderGeometry::Curve>> curves;
+
+    std::shared_ptr<const RenderGeometry::Curve> Curve(const CStringW& path)
+    {
+        const auto found = curves.find(path);
+        if (found != curves.end()) return found->second;
+        auto curve = std::make_shared<RenderGeometry::Curve>();
+        if (!curve->Parse(path)) curve.reset();
+        if (curves.size() >= 128) curves.clear();
+        return curves.emplace(path, std::move(curve)).first->second;
+    }
 
     const AssNumeric::Program& Expression(const CStringW& source, bool timing)
     {
@@ -3268,6 +3456,9 @@ void CRenderedTextSubtitle::Deinit()
     m_overrideTags.reset();
     m_textGeometry.reset();
     m_textDC.reset();
+#ifdef _VSMOD
+    m_shaper.reset();
+#endif
     POSITION pos = m_subtitleCache.GetStartPosition();
     while(pos)
     {
@@ -3342,6 +3533,15 @@ void CRenderedTextSubtitle::ParseString(CSubtitle* sub, CStringW str, STSStyle& 
 {
     PROFILE_RENDER_STAGE(Layout);
     if(!sub) return;
+#ifdef _VSMOD
+    if (sub->m_curve && !sub->m_curveShapeFailed)
+    {
+        if (sub->m_words.IsEmpty()) sub->m_curveScale = style.objectScale / 100;
+        if (ParseShapedString(sub, str, style, false))
+            return;
+        sub->m_curveShapeFailed = true;
+    }
+#endif
 
     str.Replace(L"\\N", L"\n");
     str.Replace(L"\\n", (sub->m_wrapStyle < 2 || sub->m_wrapStyle == 3) ? L" " : L"\n");
@@ -3403,6 +3603,63 @@ void CRenderedTextSubtitle::ParseString(CSubtitle* sub, CStringW str, STSStyle& 
 
     return;
 }
+
+#ifdef _VSMOD
+bool CRenderedTextSubtitle::ParseShapedString(CSubtitle* sub, const CStringW& text, STSStyle& style, bool vertical)
+{
+    if (!m_shaper) m_shaper = std::make_unique<ShapedText::Context>();
+    CStringW str = text;
+    str.Replace(L"\\N", L"\n");
+    str.Replace(L"\\n", (sub->m_wrapStyle < 2 || sub->m_wrapStyle == 3) ? L" " : L"\n");
+    str.Replace(L"\\h", L"\x00A0");
+    std::vector<std::pair<CStringW, std::shared_ptr<const ShapedText::Run>>> lines;
+    int start = 0;
+    do
+    {
+        int end = str.Find(L'\n', start);
+        if (end < 0) end = str.GetLength();
+        CStringW line = str.Mid(start, end - start);
+        if (!line.IsEmpty())
+        {
+            auto shaped = m_shaper->Shape(line, line.GetLength(), style.fontName, float(style.fontSize / 64),
+                style.fontWeight, style.fItalic, vertical);
+            if (!shaped) return false;
+            lines.emplace_back(std::move(line), std::move(shaped));
+        }
+        if (end == str.GetLength()) break;
+        lines.emplace_back(CStringW(), nullptr);
+        start = end + 1;
+    } while (start <= str.GetLength());
+    for (const auto& line : lines)
+    {
+        if (!line.second)
+        {
+            sub->AppendWord(new CText(style, CStringW(), m_ktype, m_kstart, m_kend, sub->m_scalex, sub->m_scaley));
+            continue;
+        }
+        const int karaokeStart = m_kstart;
+        for (size_t i = 0; i < line.second->clusters.size(); ++i)
+        {
+            const auto& c = line.second->clusters[i];
+            const auto startTime = m_ktype == 1 ? karaokeStart + int((m_kend-karaokeStart) *
+                c.left / (std::max)(.001f, line.second->width)) : karaokeStart;
+            const auto endTime = m_ktype == 1 ? karaokeStart + int((m_kend-karaokeStart) *
+                (c.left+c.advance) / (std::max)(.001f, line.second->width)) : m_kend;
+            auto* word = new ShapedWord(style, line.first.Mid(c.start, c.length), line.second, i,
+                m_ktype, startTime, endTime, sub->m_scalex, sub->m_scaley);
+#if defined(_LUA)
+            word->L = L;
+            word->LuaLog = LuaLog;
+            word->m_entry = m_entry;
+            word->LuaRendererHandler = style.LuaRendererHandler;
+#endif
+            sub->AppendWord(word);
+        }
+        m_kstart = m_kend;
+    }
+    return true;
+}
+#endif
 
 void CRenderedTextSubtitle::ParsePolygon(CSubtitle* sub, CStringW str, STSStyle& style)
 {
@@ -4183,6 +4440,16 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
 #endif
         else if(!cmd.Find(L"clip"))
             ;
+#ifdef _VSMOD
+        else if(!cmd.Find(L"ctan"))
+            params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
+        else if(!cmd.Find(L"ctx") || !cmd.Find(L"cty"))
+            params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+        else if(cmd == L"ct")
+        {
+            // The event-wide path has been selected before the text pass.
+        }
+#endif
         else if(!cmd.Find(L"c"))
             params.push_back(cmd.Mid(1).Trim(L"&H")), cmd = cmd.Left(1);
 #ifdef _VSMOD // patch m008. distort
@@ -4511,6 +4778,24 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         CStringW p = params.size() > 0 ? params[0] : L"";
 
 #ifdef _VSMOD
+        if (cmd == L"ct" || cmd == L"ctan" || cmd == L"ctx" || cmd == L"cty")
+        {
+            if (cmd == L"ctan" && !fAnimate && !sub->m_curveAnchor)
+            {
+                const wchar_t* value = p;
+                const int digit = ReadDecimalDigit(value);
+                if (digit >= 1 && digit <= 9 && !*value) sub->m_curveAnchor = digit;
+            }
+            else if (cmd == L"ctx" || cmd == L"cty")
+            {
+                AssNumeric::Operand operand;
+                auto& current = cmd == L"ctx" ? sub->m_curveX : sub->m_curveY;
+                if (p.IsEmpty()) current = 0;
+                else if (readOperand(p, false, false, operand))
+                    current = CalcAnimation(operand.Resolve(current), current, fAnimate);
+            }
+            continue;
+        }
         if (tag.unicodeNumber && (cmd == L"an" || cmd == L"a" || cmd == L"kt" || cmd == L"k" || cmd == L"kO" ||
             cmd == L"K" || cmd == L"kf" || cmd == L"ko" || cmd == L"p" || cmd == L"q"))
             p = NormalizeNumericDigits(p);
@@ -6132,7 +6417,12 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         else if(cmd == L"r")
         {
 #ifdef _VSMOD
-            if (!fAnimate) sub->m_boxMode = -1;
+            if (!fAnimate)
+            {
+                sub->m_boxMode = -1;
+                sub->m_curveAnchor = 0;
+                sub->m_curveX = sub->m_curveY = 0;
+            }
 #endif
 #ifdef _VSMOD
             if (slides()) editSlides() = {};
@@ -6639,6 +6929,29 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
     }
 #endif
     ParseEffect(sub, GetAt(entry).effect);
+#ifdef _VSMOD
+    if (str.Find(L"\\ct(") >= 0 && !sub->m_effects[EF_SCROLL] && !sub->m_effects[EF_BANNER]
+#ifdef _LUA
+        && !hasExternalLua
+#endif
+        )
+    {
+        if (!m_overrideTags) m_overrideTags = std::make_unique<OverrideTagCache>();
+        for (int left = 0; !sub->m_curve && (left = str.Find(L'{', left)) >= 0;)
+        {
+            const int right = str.Find(L'}', left + 1);
+            if (right < 0) break;
+            const auto tags = m_overrideTags->Get(str.Mid(left + 1, right - left - 1));
+            for (const auto& tag : *tags)
+                if (tag.command == L"ct" && tag.parenthesized && tag.parameters.size() == 1)
+                {
+                    sub->m_curve = m_overrideTags->Curve(tag.parameters[0]);
+                    if (sub->m_curve) break;
+                }
+            left = right + 1;
+        }
+    }
+#endif
 
     while(!str.IsEmpty())
     {
@@ -6766,6 +7079,9 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
     }
 #endif
     sub->MakeLines(m_size, marginRect);
+#ifdef _VSMOD
+    sub->CurveLines();
+#endif
     if (measuringLayout)
         return owned.release();
 #ifdef _VSMOD
@@ -6875,6 +7191,7 @@ static std::function<void()> PrepareEventGeometry(CSubtitle* subtitle, CPoint or
             CPoint position(x, y + line->m_ascent - word->m_ascent);
             int layer = 1;
 #ifdef _VSMOD
+            position = word->LayoutPosition(position);
             position.x -= style.mod_horizontalSpace;
             position.y -= style.mod_verticalSpace;
             position += word->m_style.mod_jitter.getOffset(timestamp);

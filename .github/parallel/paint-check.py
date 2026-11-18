@@ -16,6 +16,7 @@ BENCH = Path("hosts/render-bench.exe").resolve()
 CANDIDATE = Path("renderer/renderer.dll").resolve()
 MANG = Path("mangetsu-paint/renderer.dll").resolve()
 ROUND2 = os.environ.get("KFX_ROUND2") == "true"
+ROUND3 = os.environ.get("KFX_ROUND3") == "true"
 
 
 def gd(angle, *stops):
@@ -447,6 +448,41 @@ if ROUND2:
 for frame, color in [(60, 2), (120, 0)]:
     assert sum(new(frame, "karaoke", x, y)[color] > 200
                for x in range(250) for y in range(85)) > 100, "karaoke channel unavailable"
+
+if ROUND3:
+    curved = write("native-curved-text", [
+        (340, 270, r"\fs56\1c$white\ctan5\ct(m -160 0 l 160 0)\t(0,1000,\ctx100)", "MMMM"),
+        (760, 270, r"\fs56\1c$white\ctan5\ct(m 0 -160 l 0 160)", "MMMM"),
+        (1290, 270, r"\fs44\fnMyanmar Text\1c$white\ctan5\ct(m -250 0 b -160 -130 160 -130 250 0)",
+         "မြန်မာစာ သင်္ချာ ကြိုဆိုပါတယ်"),
+        (340, 710, r"\fs56\1c$white\ct(m 0 0 l 0 0)", "MMMM"),
+        (760, 710, r"\fs56\1c$white", "MMMM"),
+    ])
+    centers = {"line": (340,270), "upright": (760,270), "myanmar": (1290,270),
+               "invalid": (340,710), "flat": (760,710)}
+    playback("csri", CANDIDATE, curved, ROOT / "curved")
+    playback("rgba", MANG, curved, ROOT / "curved-reference")
+    actual = captures(ROOT / "curved", centers)
+    reference = captures(ROOT / "curved-reference", centers)
+
+    def ink_bounds(getter, frame, case, left=-220, right=220, top=-180, bottom=160):
+        ink = [(x, y) for y in range(top, bottom) for x in range(left, right)
+               if min(getter(frame, case, x, y)) >= 200]
+        assert len(ink) >= 120, f"Missing shaped ink for {case} at frame {frame}"
+        return min(x for x, _ in ink), min(y for _, y in ink), max(x for x, _ in ink), max(y for _, y in ink)
+
+    for getter in (actual, reference):
+        h0 = ink_bounds(getter, 60, "line", right=280)
+        h1 = ink_bounds(getter, 90, "line", right=280)
+        v = ink_bounds(getter, 60, "upright")
+        assert h0[2] - h0[0] > 2 * (h0[3] - h0[1]), h0
+        assert 46 <= h1[0] - h0[0] <= 54, (h0, h1)
+        assert v[3] - v[1] > 2 * (v[2] - v[0]), v
+        ink_bounds(getter, 60, "myanmar")
+    assert ink_bounds(actual, 60, "invalid", left=0, top=0) == ink_bounds(actual, 60, "flat", left=0, top=0)
+    expected = benchmark(CANDIDATE, curved, 1, "regression")["hashes"]
+    for workers in (2, 4, 6, 8):
+        assert benchmark(CANDIDATE, curved, workers, "regression")["hashes"] == expected
 
 # Check old corner math against the validated VSFilterMod path rather than
 # requiring its different legacy bitmap geometry to agree with libass.
