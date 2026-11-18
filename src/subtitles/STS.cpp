@@ -4078,7 +4078,8 @@ MOD_GRADIENT::MOD_GRADIENT()
 
 bool MOD_GRADIENT::operator == (MOD_GRADIENT& mg)
 {
-    return (color[0][0] == mg.color[0][0] // T.T
+    return (paint == mg.paint && (!paint || legacyParts == mg.legacyParts)
+            && color[0][0] == mg.color[0][0]
             && color[1][0] == mg.color[1][0]
             && color[2][0] == mg.color[2][0]
             && color[3][0] == mg.color[3][0]
@@ -4140,6 +4141,8 @@ void MOD_GRADIENT::clear()
     bodyIsGradAlpha = false;
     img_alpha = 0;
     clipDiff = 0;
+    paint.reset();
+    legacyParts = 0;
 }
 
 #include <math.h>

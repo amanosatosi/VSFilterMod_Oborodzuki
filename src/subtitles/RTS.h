@@ -189,6 +189,8 @@ public:
     enum eftype type;
     int param[9];
     int t[4];
+    DWORD fadeColors[2]{};
+    bool hasFadeColor[2]{};
 };
 
 #if defined (_VSMOD) && defined(_LUA)
@@ -203,6 +205,8 @@ class CSubtitle : public CAtlList<CLine*>
     CLine* GetNextLine(POSITION& pos, int maxwidth);
 
 public:
+    unsigned m_paintSegments = 0;
+    std::unique_ptr<KfxPaint::SlideSettings> m_slideSettings;
     int m_scrAlignment;
     int m_wrapStyle;
     bool m_fAnimated;
@@ -287,7 +291,8 @@ class CRenderedTextSubtitle : public CSimpleTextSubtitle, public ISubPicProvider
     void ParseEffect(CSubtitle* sub, CString str);
     void ParseString(CSubtitle* sub, CStringW str, STSStyle& style);
     void ParsePolygon(CSubtitle* sub, CStringW str, STSStyle& style);
-    bool ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org, bool fAnimate = false);
+    bool ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org, bool fAnimate = false,
+        const KfxPaint::SlideSettings* inheritedSlides = nullptr);
     bool ParseHtmlTag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org);
 
 #if defined(_VSMOD) && defined(_LUA)

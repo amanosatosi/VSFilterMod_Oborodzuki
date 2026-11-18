@@ -25,6 +25,7 @@
 #include <wxutil.h>
 #include "TextFile.h"
 #include "GFN.h"
+#include "PaintExtensions.h"
 
 unsigned SubtitleFontRevision();
 
@@ -168,6 +169,8 @@ public:
     MOD_PNGIMAGE	b_images[4];
 
     int clipDiff;
+    std::shared_ptr<const KfxPaint::Sources> paint;
+    unsigned legacyParts = 0;
 
     MOD_GRADIENT();
     bool operator == (MOD_GRADIENT& mg);

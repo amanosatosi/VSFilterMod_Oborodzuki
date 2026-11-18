@@ -2049,7 +2049,10 @@ CRect CLine::PaintOutline(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CP
             if(w->m_style.borderStyle == 0)
             {
 #ifdef _VSMOD // patch m004. gradient colors
-                bbox |= w->Draw(spd, clipRect, pAlphaMask, x, y, sw, !w->m_style.alpha[0] && !w->m_style.alpha[1] && !alpha && !w->m_style.mod_grad.bodyIsGradAlpha, true, 2, w->m_style.mod_grad, mod_vc, w->m_style.mod_blendMode);
+                const auto& paint = w->m_style.mod_grad.paint;
+                const bool opaqueFill = !w->m_style.alpha[0] && !w->m_style.alpha[1] && !alpha &&
+                    !w->m_style.mod_grad.bodyIsGradAlpha && !(paint && (paint->parts[1] || paint->parts[3]));
+                bbox |= w->Draw(spd, clipRect, pAlphaMask, x, y, sw, opaqueFill, true, 2, w->m_style.mod_grad, mod_vc, w->m_style.mod_blendMode);
 #else
                 bbox |= w->Draw(spd, clipRect, pAlphaMask, x, y, sw, !w->m_style.alpha[0] && !w->m_style.alpha[1] && !alpha, true);
 #endif
@@ -2104,6 +2107,7 @@ CRect CLine::PaintBody(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoin
         COLORREF secondary = revcolor(w->m_style.colors[1]) | ((0xff - asecondary) << 24);
 
         DWORD sw[6] = {primary, 0, secondary};
+        bool reversePaint = false;
 
         // karaoke
 
@@ -2123,6 +2127,7 @@ CRect CLine::PaintBody(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoin
                 double angle = fmod(w->m_style.fontAngleZ, 360.0);
                 if(angle > 90 && angle < 270)
                 {
+                    reversePaint = true;
                     t = 1 - t;
                     COLORREF tmp = sw[0];
                     sw[0] = sw[2];
@@ -2168,7 +2173,7 @@ CRect CLine::PaintBody(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoin
         sw[3] = (int)(w->m_style.outlineWidthX + t * w->getOverlayWidth() + t * bluradjust) >> 3;
 
 #ifdef _VSMOD // patch m004. gradient colors
-        bbox |= w->Draw(spd, clipRect, pAlphaMask, x, y, sw, true, false, 0, w->m_style.mod_grad, mod_vc, w->m_style.mod_blendMode);
+        bbox |= w->Draw(spd, clipRect, pAlphaMask, x, y, sw, true, false, 0, w->m_style.mod_grad, mod_vc, w->m_style.mod_blendMode, reversePaint);
 #else
         bbox |= w->Draw(spd, clipRect, pAlphaMask, x, y, sw, true, false);
 #endif
@@ -3054,6 +3059,215 @@ void CRenderedTextSubtitle::ParseLuaTable(CSubtitle* sub, STSStyle& style)
 }
 #endif
 
+#ifdef _VSMOD
+namespace
+{
+struct PaintTag
+{
+    int part;
+    bool slide;
+    CStringW argument;
+};
+
+bool ReadPaintTag(const CStringW& name, PaintTag& tag)
+{
+    const wchar_t* p = name;
+    const int channel = *p >= L'1' && *p <= L'4' ? *p++ - L'0' : 0;
+    if (*p != L'g' && *p != L'v') return false;
+    const bool color = !wcsncmp(p, L"grd", 3);
+    const bool alpha = !wcsncmp(p, L"gra", 3);
+    if (color || (alpha && channel))
+    {
+        p += 3;
+        tag.slide = *p == L's';
+        if (tag.slide) ++p;
+        tag.part = !channel && tag.slide ? -1 : ((channel ? channel : 1) - 1) * 2 + int(alpha);
+    }
+    else if (!wcsncmp(p, L"vcs", 3) || !wcsncmp(p, L"vas", 3))
+    {
+        tag.slide = true;
+        tag.part = ((channel ? channel : 1) - 1) * 2 + int(p[1] == L'a');
+        p += 3;
+    }
+    else return false;
+    tag.argument = p;
+    tag.argument.Trim();
+    return true;
+}
+
+std::vector<CStringW> PaintArguments(const CStringW& text)
+{
+    std::vector<CStringW> args;
+    if (text.IsEmpty())
+        return args;
+    int start = 0;
+    do
+    {
+        int end = text.Find(L',', start);
+        if (end < 0) end = text.GetLength();
+        args.push_back(text.Mid(start, end - start).Trim());
+        start = end + 1;
+    } while (start <= text.GetLength() && args.size() <= 2 * KfxPaint::MaxStops - 1);
+    return args;
+}
+
+bool ReadPaintNumber(const CStringW& text, double& value)
+{
+    if (text.IsEmpty() || text.FindOneOf(L"xXpP") >= 0)
+        return false;
+    wchar_t* end;
+    value = wcstod(text, &end);
+    return end == text.GetString() + text.GetLength() && std::isfinite(value);
+}
+
+bool ReadPaintValue(const CStringW& text, bool alpha, KfxPaint::Value& result)
+{
+    if (!alpha)
+    {
+        if (!text.CompareNoCase(L"$white") || !text.CompareNoCase(L"$shiro") ||
+            !text.CompareNoCase(L"$siro"))
+        {
+            result = 0xFFFFFF;
+            return true;
+        }
+        if (!text.CompareNoCase(L"$black") || !text.CompareNoCase(L"$kuro"))
+        {
+            result = 0;
+            return true;
+        }
+    }
+    const wchar_t* p = text;
+    const bool decimal = alpha && *p == L'$';
+    if (decimal) ++p;
+    else
+    {
+        while (*p == L'&' || *p == L'H' || *p == L'h') ++p;
+    }
+    const auto* first = p;
+    unsigned value = 0;
+    const unsigned limit = alpha ? 255 : 0xFFFFFF;
+    for (; *p && *p != L'&'; ++p)
+    {
+        unsigned digit;
+        if (*p >= L'0' && *p <= L'9') digit = *p - L'0';
+        else if (!decimal && *p >= L'A' && *p <= L'F') digit = 10 + *p - L'A';
+        else if (!decimal && *p >= L'a' && *p <= L'f') digit = 10 + *p - L'a';
+        else return false;
+        value = value * (decimal ? 10 : 16) + digit;
+        if (value > limit) return false;
+    }
+    if (p == first || (*p && (decimal || p[1])))
+        return false;
+    result = alpha ? value : KfxPaint::Value(revcolor(value));
+    return true;
+}
+
+bool ReadPaintField(const std::vector<CStringW>& args, bool alpha, KfxPaint::Paint& paint)
+{
+    if (args.size() < 3 || !(args.size() % 2) || args.size() > 2 * KfxPaint::MaxStops - 1 ||
+        !ReadPaintNumber(args[0], paint.angle))
+        return false;
+    paint.angle = std::fmod(paint.angle, 360.0);
+    paint.kind = KfxPaint::Paint::Kind::Field;
+    double position = 0;
+    for (size_t i = 1; i + 1 < args.size(); i += 2)
+    {
+        KfxPaint::Value value;
+        if (!ReadPaintValue(args[i], alpha, value)) return false;
+        paint.stops.push_back({position, value});
+        if (i + 2 == args.size()) break;
+        CStringW percent = args[i + 1];
+        double next;
+        if (percent.IsEmpty() || percent[percent.GetLength() - 1] != L'%' ||
+            !ReadPaintNumber(percent.Left(percent.GetLength() - 1).Trim(), next) ||
+            next < 0 || next > 100 || next / 100 < position)
+            return false;
+        position = next / 100;
+    }
+    KfxPaint::Value last;
+    if (!ReadPaintValue(args.back(), alpha, last)) return false;
+    paint.stops.push_back({1, last});
+    return true;
+}
+
+KfxPaint::Paint PaintCorners(const STSStyle& style, int channel, bool alpha)
+{
+    KfxPaint::Paint paint;
+    paint.kind = KfxPaint::Paint::Kind::Corners;
+    for (int i = 0; i < 4; ++i)
+        paint.stops.push_back({0, alpha ? KfxPaint::Value(style.mod_grad.alpha[channel][i]) :
+                                        KfxPaint::Value(style.mod_grad.color[channel][i])});
+    return paint;
+}
+
+void SetPaintPart(STSStyle& style, int part, KfxPaint::Source source)
+{
+    auto state = style.mod_grad.paint ? std::make_shared<KfxPaint::Sources>(*style.mod_grad.paint) :
+                                       std::make_shared<KfxPaint::Sources>();
+    state->parts[part] = std::move(source);
+    style.mod_grad.paint = std::move(state);
+}
+
+void ApplyPaintPart(CSubtitle& subtitle, STSStyle& style, int part, KfxPaint::Paint target,
+                    double progress, double width)
+{
+    using namespace KfxPaint;
+    const bool alpha = (part & 1) != 0;
+    const int channel = part / 2;
+    Source old = style.mod_grad.paint ? style.mod_grad.paint->parts[part] : Source{};
+    const Value solid = alpha ? Value(style.alpha[channel]) : Value(revcolor(style.colors[channel]));
+    const bool legacy = (style.mod_grad.legacyParts & (1u << part)) != 0;
+    if (progress <= 0)
+        return;
+
+    if (progress < 1 && width >= 0)
+    {
+        if (!old)
+        {
+            Paint fallback;
+            fallback.solid = solid;
+            if (legacy) fallback = PaintCorners(style, channel, alpha);
+            old = std::make_shared<const Paint>(std::move(fallback));
+        }
+        if (old->depth == MaxSlides) return;
+        Paint slide;
+        slide.kind = Paint::Kind::Slide;
+        slide.angle = target.kind == Paint::Kind::Field ? target.angle : old->angle;
+        slide.width = width;
+        slide.progress = progress;
+        slide.depth = old->depth + 1;
+        slide.from = old;
+        slide.to = std::make_shared<const Paint>(std::move(target));
+        target = std::move(slide);
+    }
+    else if (progress < 1)
+    {
+        if (old && old->kind == Paint::Kind::Slide)
+            old = old->to;
+        const Paint* field = old && old->kind == Paint::Kind::Field ? old.get() : nullptr;
+        if (target.kind == Paint::Kind::Field)
+            target = Interpolate(field, target, solid, progress, alpha);
+        else if (target.kind == Paint::Kind::Solid && field)
+        {
+            const auto value = target.solid;
+            target = *field;
+            for (auto& stop : target.stops)
+                stop.value = Mix(stop.value, value, progress, alpha, false);
+        }
+    }
+
+    if (target.kind == Paint::Kind::Solid || target.kind == Paint::Kind::Corners)
+        SetPaintPart(style, part, {});
+    else
+    {
+        target.segment = target.kind == Paint::Kind::Field && old && old->segment &&
+            progress < 1 ? old->segment : ++subtitle.m_paintSegments;
+        SetPaintPart(style, part, std::make_shared<const Paint>(std::move(target)));
+    }
+}
+}
+#endif
+
 static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& str)
 {
     auto result = std::make_shared<OverrideTags>();
@@ -3079,6 +3293,24 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
             }
             param.Trim();
 
+#ifdef _VSMOD
+            PaintTag paint{};
+            if (ReadPaintTag(cmd, paint) || cmd == L"fad")
+            {
+                auto fields = PaintArguments(param);
+                if (cmd == L"fad" && fields.size() != 4)
+                    fields.clear();
+                else
+                {
+                    if (str[j] == L')')
+                    {
+                        const int count = int(fields.size());
+                        result->push_back({cmd, cmd, std::move(fields), count});
+                    }
+                    continue;
+                }
+            }
+#endif
             while(!param.IsEmpty())
             {
                 int i = param.Find(','), j = param.Find('\\');
@@ -3270,7 +3502,8 @@ std::shared_ptr<const OverrideTags> OverrideTagCache::Get(const CStringW& text)
     return tags;
 }
 
-bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org, bool fAnimate)
+bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org, bool fAnimate,
+    const KfxPaint::SlideSettings* inheritedSlides)
 {
     PROFILE_RENDER_STAGE(Overrides);
     if (!sub)
@@ -3280,6 +3513,23 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         m_overrideTags = std::make_unique<OverrideTagCache>();
     // A nested transform can rotate the cache while this block is being applied.
     const auto tags = m_overrideTags->Get(str);
+#ifdef _VSMOD
+    std::unique_ptr<KfxPaint::SlideSettings> localSlides;
+    const auto slides = [&]() {
+        return fAnimate ? (localSlides ? localSlides.get() : inheritedSlides) : sub->m_slideSettings.get();
+    };
+    const auto editSlides = [&]() -> KfxPaint::SlideSettings& {
+        auto& owner = fAnimate ? localSlides : sub->m_slideSettings;
+        if (!owner)
+        {
+            const auto* previous = slides();
+            owner = previous ? std::make_unique<KfxPaint::SlideSettings>(*previous) :
+                std::make_unique<KfxPaint::SlideSettings>();
+        }
+        return *owner;
+    };
+    const auto paintProgress = [&]() { return fAnimate ? KfxPaint::Unit(CalcAnimation(1, 0, true)) : 1.0; };
+#endif
     for (const auto& tag : *tags)
     {
         const auto& cmd = tag.command;
@@ -3344,6 +3594,109 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #endif
         CStringW p = params.size() > 0 ? params[0] : L"";
 
+#ifdef _VSMOD
+        PaintTag paint{};
+        if (ReadPaintTag(cmd, paint))
+        {
+            if (paint.slide)
+            {
+                if (params.size() > 1 || (!params.empty() && !paint.argument.IsEmpty())) continue;
+                const CStringW& argument = params.empty() ? paint.argument : p;
+                double setting = 0;
+                if (argument == L"off") setting = -2;
+                else if (!argument.IsEmpty())
+                {
+                    if (!ReadPaintNumber(argument, setting) || setting < 0) continue;
+                    if (setting == 0) setting = -1;
+                }
+                auto& state = editSlides();
+                (paint.part < 0 ? state.global : state.channels[paint.part]) = setting;
+            }
+            else if (params.empty() && (paint.argument.IsEmpty() || paint.argument == L"0"))
+            {
+                if (!fAnimate)
+                {
+                    style.mod_grad.legacyParts &= ~(1u << paint.part);
+                    SetPaintPart(style, paint.part, {});
+                }
+            }
+            else if (paint.argument.IsEmpty())
+            {
+                KfxPaint::Paint field;
+                if (ReadPaintField(params, (paint.part & 1) != 0, field))
+                {
+                    const auto progress = paintProgress();
+                    ApplyPaintPart(*sub, style, paint.part, std::move(field), progress,
+                                   fAnimate && slides() ? slides()->Width(paint.part) : -1);
+                    if (progress > 0)
+                    {
+                        style.mod_grad.legacyParts &= ~(1u << paint.part);
+                        if (!(paint.part & 1) && style.mod_grad.mode[paint.part / 2] == 2)
+                            style.mod_grad.mode[paint.part / 2] = 0;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Feed ordinary paint tags into a transform only when extended paint
+        // or an explicit slide setting already participates in that channel.
+        const bool numbered = cmd.GetLength() >= 2 && cmd[0] >= L'1' && cmd[0] <= L'4';
+        if (style.mod_grad.paint || slides())
+        {
+            const bool scalarColor = cmd == L"c" || (numbered && cmd.GetLength() == 2 && cmd[1] == L'c');
+            const bool allAlpha = cmd == L"alpha";
+            const bool scalarAlpha = allAlpha || (numbered && cmd.GetLength() == 2 && cmd[1] == L'a');
+            if (scalarColor || scalarAlpha)
+            {
+                const int first = numbered ? cmd[0] - L'1' : 0;
+                const auto progress = paintProgress();
+                for (int channel = first; channel < (allAlpha ? 4 : first + 1); ++channel)
+                {
+                    const int part = channel * 2 + int(scalarAlpha);
+                    const double width = fAnimate && slides() ? slides()->Width(part) : -1;
+                    const auto& state = style.mod_grad.paint;
+                    if ((!state || !state->parts[part]) &&
+                        (width < 0 || !(style.mod_grad.legacyParts & (1u << part))))
+                        continue;
+                    KfxPaint::Paint solid;
+                    solid.solid = scalarAlpha ? KfxPaint::Value(p.IsEmpty() ? org.alpha[channel] : wcstol(p, nullptr, 16) & 255) :
+                        KfxPaint::Value(revcolor(p.IsEmpty() ? org.colors[channel] : wcstol(p, nullptr, 16) & 0xFFFFFF));
+                    ApplyPaintPart(*sub, style, part, std::move(solid), progress, width);
+                }
+                if (progress <= 0)
+                    continue;
+            }
+            if (numbered && cmd.GetLength() == 3 && cmd[1] == L'v' &&
+                (cmd[2] == L'a' || cmd[2] == L'c') && params.size() >= 4)
+            {
+                const bool inverseAlpha = cmd[2] == L'a';
+                const int part = (cmd[0] - L'1') * 2 + int(inverseAlpha);
+                const auto progress = paintProgress();
+                if (progress <= 0) continue;
+                const double width = fAnimate && slides() ? slides()->Width(part) : -1;
+                if (width >= 0 && progress < 1)
+                {
+                    KfxPaint::Paint corners;
+                    corners.kind = KfxPaint::Paint::Kind::Corners;
+                    for (int i = 0; i < 4; ++i)
+                    {
+                        KfxPaint::Value value;
+                        if (!ReadPaintValue(params[i], inverseAlpha, value)) break;
+                        corners.stops.push_back({0, value});
+                    }
+                    if (corners.stops.size() == 4)
+                    {
+                        ApplyPaintPart(*sub, style, part, std::move(corners), progress, width);
+                        continue;
+                    }
+                }
+                else if (style.mod_grad.paint && style.mod_grad.paint->parts[part])
+                    SetPaintPart(style, part, {});
+            }
+        }
+#endif
+
         if(cmd == "1c" || cmd == L"2c" || cmd == L"3c" || cmd == L"4c")
         {
             int i = cmd[0] - '1';
@@ -3356,9 +3709,10 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                               : org.colors[i];
 #ifdef _VSMOD // patch m004. gradient colors
             style.mod_grad.colors[i] = style.colors[i];
+            style.mod_grad.legacyParts &= ~(1u << (2 * i));
             if(!fAnimate)
             {
-                style.mod_grad.mode[i] = 0;
+                style.mod_grad.mode[i] = style.mod_grad.paint && (style.mod_grad.legacyParts & (2u << (2 * i))) ? 1 : 0;
                 for(int j = 0; j < 4; j++)
                 {
                     style.mod_grad.color[i][j] = !p.IsEmpty()
@@ -3389,6 +3743,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                              : org.alpha[i];
 #ifdef _VSMOD // patch m004. gradient colors
             style.mod_grad.alphas[i] = style.alpha[i];
+            style.mod_grad.legacyParts &= ~(2u << (2 * i));
             style.mod_grad.b_images[i].alpha = 255 - style.alpha[i];
             if(!fAnimate)
             {
@@ -3482,6 +3837,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 
             if(params.size() >= 4)
             {
+                style.mod_grad.legacyParts |= 1u << (2 * i);
                 DWORD c;
                 for(int j = 0; j < 4; j++)
                 {
@@ -3512,6 +3868,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 
             if(params.size() >= 4)
             {
+                style.mod_grad.legacyParts |= 2u << (2 * i);
                 int a;
                 for(int j = 0; j < 4; j++)
                 {
@@ -3546,6 +3903,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                                  : org.alpha[i];
 #ifdef _VSMOD // patch m004. gradient colors
                 style.mod_grad.alphas[i] = style.alpha[i];
+                style.mod_grad.legacyParts &= ~(2u << (2 * i));
                 if(!fAnimate)
                 {
                     //style.mod_grad.mode[i] = 0;
@@ -3678,9 +4036,10 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                               : org.colors[0];
 #ifdef _VSMOD // patch m004. gradient colors
             style.mod_grad.colors[0] = style.colors[0];
+            style.mod_grad.legacyParts &= ~1u;
             if(!fAnimate)
             {
-                style.mod_grad.mode[0] = 0;
+                style.mod_grad.mode[0] = style.mod_grad.paint && (style.mod_grad.legacyParts & 2u) ? 1 : 0;
                 for(int j = 0; j < 4; j++)
                 {
                     style.mod_grad.color[0][j] = !p.IsEmpty()
@@ -3736,7 +4095,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     sub->m_effects[EF_FADE] = e;
                 }
             }
-            else if(params.size() == 2 && !sub->m_effects[EF_FADE]) // {\fad(t1=t[1], t2=t[2])
+            else if((params.size() == 2 || (cmd == L"fad" && params.size() == 4)) && !sub->m_effects[EF_FADE])
             {
                 if(Effect* e = DNew Effect)
                 {
@@ -3745,6 +4104,25 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     for(ptrdiff_t i = 1; i < 3; i++)
                         e->t[i] = wcstol(params[i-1], NULL, 10);
                     e->t[0] = e->t[3] = -1; // will be substituted with "start" and "end"
+#ifdef _VSMOD
+                    if (params.size() == 4)
+                    {
+                        for (int side = 0; side < 2; ++side)
+                        {
+                            CStringW argument = params[side + 2];
+                            const int length = argument.GetLength();
+                            const bool combine = length >= 2 && !argument.Right(2).CompareNoCase(L"+a");
+                            if (combine) argument = argument.Left(length - 2).Trim();
+                            KfxPaint::Value color;
+                            if (ReadPaintValue(argument, false, color))
+                            {
+                                e->fadeColors[side] = color;
+                                e->hasFadeColor[side] = true;
+                                if (!combine) e->param[side * 2] = 0;
+                            }
+                        }
+                    }
+#endif
 
                     sub->m_effects[EF_FADE] = e;
                 }
@@ -4258,6 +4636,9 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #endif
         else if(cmd == L"r")
         {
+#ifdef _VSMOD
+            if (slides()) editSlides() = {};
+#endif
             STSStyle* val;
             style = (!p.IsEmpty() && m_styles.Lookup(CString(p), val) && val) ? *val : org;
         }
@@ -4310,7 +4691,11 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 p = params[3];
             }
 
+#ifdef _VSMOD
+            ParseSSATag(sub, p, style, org, true, slides());
+#else
             ParseSSATag(sub, p, style, org, true);
+#endif
 
             sub->m_fAnimated = true;
         }
@@ -5106,6 +5491,9 @@ try
         bool fPosOverride = false, fOrgOverride = false;
 
         int alpha = 0x00;
+#ifdef _VSMOD
+        KfxPaint::Fade paintFade;
+#endif
 
         CPoint org2;
 
@@ -5319,6 +5707,7 @@ try
             break;
             case EF_FADE: // {\fade(a1=param[0], a2=param[1], a3=param[2], t1=t[0], t2=t[1], t3=t[2], t4=t[3]) or {\fad(t1=t[1], t2=t[2])
             {
+                const auto* effect = s->m_effects[k];
                 int t1 = s->m_effects[k]->t[0];
                 int t2 = s->m_effects[k]->t[1];
                 int t3 = s->m_effects[k]->t[2];
@@ -5344,6 +5733,21 @@ try
                     alpha = (int)(s->m_effects[k]->param[1] * (1 - t) + s->m_effects[k]->param[2] * t);
                 }
                 else if(m_time >= t4) alpha = s->m_effects[k]->param[2];
+#ifdef _VSMOD
+                if (effect->hasFadeColor[0] || effect->hasFadeColor[1])
+                {
+                    const bool start = m_time < t2;
+                    const int side = start ? 0 : 1;
+                    if (effect->hasFadeColor[side])
+                    {
+                        paintFade.color = effect->fadeColors[side];
+                        if (start)
+                            paintFade.amount = m_time < t1 ? 1.0 : 1.0 - double(m_time - t1) / (t2 - t1);
+                        else if (m_time >= t3)
+                            paintFade.amount = m_time >= t4 ? 1.0 : double(m_time - t3) / (t4 - t3);
+                    }
+                }
+#endif
             }
             break;
             case EF_BANNER: // Banner;delay=param[0][;leftoright=param[1];fadeawaywidth=param[2]]
@@ -5573,6 +5977,39 @@ try
         }
         return bbox2;
         };
+#ifdef _VSMOD
+        if (s->m_paintSegments || paintFade.amount > 0)
+        {
+            bool collectSegments = s->m_paintSegments != 0;
+#ifdef _LUA
+            // A Lua pixel callback can read the destination during the draw.
+            collectSegments = collectSegments && !hasExternalLua &&
+                !(m_doOverrideStyle && m_pStyleOverride && !m_pStyleOverride->LuaRendererHandler.IsEmpty());
+#endif
+            auto paintExtended = [=]() mutable {
+                const OverlayPaintScope context(paintFade, s->m_scalex, s->m_scaley);
+                if (!collectSegments || IsCapturingOverlays())
+                    return paint();
+                OverlayDrawList overlays;
+                CRect bounds;
+                {
+                    const OverlayCaptureScope capture(overlays);
+                    bounds = paint();
+                }
+                for (const auto& draw : overlays.draws)
+                    draw.Blend(draw.bounds.top, draw.bounds.bottom);
+                return bounds;
+            };
+            if (parallel)
+                compositions.push_back({std::move(paintExtended), entry});
+            else
+            {
+                bbox2 |= paintExtended();
+                clearLuaData(entry);
+            }
+            continue;
+        }
+#endif
         if (parallel)
             compositions.push_back({std::move(paint), entry});
         else

@@ -22,6 +22,7 @@
 #pragma once
 
 #include <memory>
+#include <map>
 #include <vector>
 #include "..\SubPic\ISubPic.h"
 #ifdef _VSMOD // patch m004. gradient colors
@@ -84,6 +85,11 @@ struct OverlayDraw
     int colorType;
     MOD_GRADIENT gradient;
     MOD_MOVEVC maskPosition;
+    const std::map<unsigned, CRect>* paintSegments = nullptr;
+    CRect paintBounds{0, 0, 0, 0};
+    KfxPaint::Fade paintFade;
+    double paintScaleX = 1, paintScaleY = 1;
+    bool reversePaint = false;
 #else
     int maskPitch;
 #endif
@@ -97,7 +103,23 @@ struct OverlayDrawList
     // A word can replace its coverage mask between the shadow and outline.
     // Keep earlier phases alive until all bands have read them.
     std::vector<std::unique_ptr<BYTE[]>> retiredMasks;
+    std::map<unsigned, CRect> paintSegments;
 };
+
+#ifdef _VSMOD
+class OverlayPaintScope
+{
+    const OverlayPaintScope* previous;
+
+public:
+    const KfxPaint::Fade fade;
+    const double scaleX, scaleY;
+    OverlayPaintScope(KfxPaint::Fade fade, double sx, double sy);
+    ~OverlayPaintScope();
+};
+
+bool IsCapturingOverlays();
+#endif
 
 class OverlayCaptureScope
 {
@@ -184,7 +206,7 @@ public:
     bool Rasterize(int xsub, int ysub, int fBlur, double fGaussianBlurX, double fGaussianBlurY);
     int getOverlayWidth();
 #ifdef _VSMOD // patch m004. gradient colors
-    CRect Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int xsub, int ysub, const DWORD* switchpts, bool fBody, bool fBorder, int typ, MOD_GRADIENT& mod_grad, MOD_MOVEVC& mod_vc, MOD_BLEND mod_blendMode);
+    CRect Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int xsub, int ysub, const DWORD* switchpts, bool fBody, bool fBorder, int typ, MOD_GRADIENT& mod_grad, MOD_MOVEVC& mod_vc, MOD_BLEND mod_blendMode, bool reversePaint = false);
 #else
     CRect Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int xsub, int ysub, const DWORD* switchpts, bool fBody, bool fBorder);
 #endif

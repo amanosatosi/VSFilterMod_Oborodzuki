@@ -7,7 +7,7 @@ on:
         type: boolean
         default: true
   push:
-    branches: [feature/parallel-event-rendering]
+    branches: [feature/parallel-event-rendering, codex/kfx-paint-extensions]
     paths: ['src/**', '.github/parallel/**', '.github/workflows/parallel-renderer.yml']
 permissions:
   contents: read
@@ -56,8 +56,8 @@ jobs:
       - name: Download the previous parallel renderer
         uses: actions/download-artifact@v4
         with:
-          name: parallel-hosts-b110ccac5d1b9b55410b1d50df46dfaf29468503
-          run-id: 44151605518
+          name: parallel-hosts-${{ github.ref_name == 'codex/kfx-paint-extensions' && '20c6174b9cc15292f77ea99605f22df39faf539c' || 'b110ccac5d1b9b55410b1d50df46dfaf29468503' }}
+          run-id: ${{ github.ref_name == 'codex/kfx-paint-extensions' && '44199501549' || '44151605518' }}
           github-token: ${{ github.token }}
           path: threading-baseline
       - name: Record actual runner hardware
