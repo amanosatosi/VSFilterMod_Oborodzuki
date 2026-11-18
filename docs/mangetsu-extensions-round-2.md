@@ -130,3 +130,49 @@ line and the latest valid value carries across subsequent `\N` breaks.
 The Windows Actions suite checks selected analytic and Mangetsu pixels on
 equivalent drawings, actual decorated text, backward seeks, and exact
 Oborodzuki hashes across 1, 2, 4, 6 and 8 workers.
+
+## Full correctness and performance checkpoint
+
+The `b02403e` renderer matched the validated Round 1 `f81f31a` reference
+on every one of the 5,400 KFX frames at 1, 2, 4, 6 and 8 workers. All
+combined-feature and seek checks passed. The Windows x86 and x64 smoke builds,
+separate renderer regressions, and instrumented runs passed.
+[Full timeline](https://github.com/amanosatosi/VSFilterMod_Oborodzuki/actions/runs/44308826064)
+[Windows builds](https://github.com/amanosatosi/VSFilterMod_Oborodzuki/actions/runs/44308826171)
+[Renderer regressions](https://github.com/amanosatosi/VSFilterMod_Oborodzuki/actions/runs/44308825938)
+
+Both versions ran on the same Windows Intel Xeon Platinum 8573C VM with
+two physical cores and four logical processors. The table averages two
+alternating trials per comparable worker count and takes peak memory across
+those trials. Efficiency uses each revision's one-worker mean.
+
+| Workers | Mean ms Round 1 → Round 2 | Median ms | p95 ms | Render FPS | CPU s | Peak MiB | Efficiency |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 10.027 → 10.392 | 9.454 → 9.832 | 21.631 → 22.198 | 99.7 → 96.2 | 53.56 → 56.46 | 33.16 → 33.16 | 100% → 100% |
+| 2 | 5.981 → 6.265 | 5.602 → 5.884 | 12.145 → 12.699 | 167.2 → 159.6 | 55.55 → 56.95 | 35.41 → 35.42 | 83.8% → 82.9% |
+| 4 | 5.189 → 5.444 | 4.901 → 5.153 | 10.265 → 10.786 | 192.7 → 183.7 | 80.98 → 83.70 | 38.59 → 38.95 | 48.3% → 47.7% |
+
+Round 2 mean latency increased by 3.6%, 4.8% and 4.9% respectively.
+Four-worker speedup moved from 1.93× to 1.91×. The worst four-worker
+candidate frame was 15.482 ms, and neither trial exceeded 16.67 ms.
+Six- and eight-worker passes verified pixels on oversubscribed hardware.
+[Per-frame logs and results](https://github.com/amanosatosi/VSFilterMod_Oborodzuki/actions/runs/44308826064/artifacts/14431597294)
+
+The combined-effects fixture mixes mitered native rings, event boxes,
+stationary color and opacity, relative motion, expressions, and color fades.
+Values are medians of three alternating trials with 120 frames each.
+
+| Workers | Mean ms | Median ms | p95 ms | FPS | CPU s | Peak MiB |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 18.778 | 18.591 | 19.781 | 53.3 | 2.23 | 30.12 |
+| 2 | 11.456 | 11.614 | 12.165 | 87.3 | 2.63 | 31.26 |
+| 4 | 10.043 | 10.186 | 10.602 | 99.6 | 4.06 | 32.56 |
+
+The unchanged 600-frame KFX window recorded zero extended bounds, projection,
+or stop samples. It retained 23,280 text-metric cache hits out of 23,420
+requests at every measured worker count. Geometry-path hits were 23,280,
+23,141 and 22,871 at 1, 2 and 4 workers. On the instrumented combined
+workload at one worker, projection and stop sampling accounted for 15.97
+and 18.11 ms per frame of instrumented time. Those timings include profiler
+overhead and are separate from the uninstrumented latency table.
+[Profiler artifact](https://github.com/amanosatosi/VSFilterMod_Oborodzuki/actions/runs/44308826064/artifacts/14430331049)
