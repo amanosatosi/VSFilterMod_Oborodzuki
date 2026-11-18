@@ -91,3 +91,38 @@ later packs.
 The semantic reference is Mangetsu 60e06ef. [Gradient targets and slides](https://github.com/amanosatosi/libassmod/blob/60e06ef0d4535c5403f446fd46b996df4d0d2560/docs/gradient-support.md)
 [RGBA sampling](https://github.com/amanosatosi/libassmod/blob/60e06ef0d4535c5403f446fd46b996df4d0d2560/docs/rgba-rendering.md)
 [Color fades](https://github.com/amanosatosi/libassmod/blob/60e06ef0d4535c5403f446fd46b996df4d0d2560/docs/fad-color-fade.md)
+
+## Validated Round 1 checkpoint
+
+The renderer in `4c0c034` rendered all 5,400 frames of the unchanged 1080p60
+KFX script at 1, 2, 4, 6 and 8 workers with zero RGB differences against the
+validated `20c6174` renderer. The two implementations ran alternating trials at
+1, 2 and 4 workers on the same Windows runner with two physical cores and four
+logical processors. Values below average the two trials. Six and eight workers
+were tested for correctness. [Full acceptance run](https://github.com/amanosatosi/VSFilterMod_Oborodzuki/actions/runs/44218018689)
+
+| Workers | Mean ms before → after | Median ms before → after | p95 ms before → after | FPS before → after | CPU s before → after | Peak MiB before → after | Efficiency before → after |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 9.384 → 9.340 | 8.943 → 8.894 | 20.394 → 20.238 | 106.5 → 107.1 | 51.52 → 50.41 | 32.9 → 32.9 | 100% → 100% |
+| 2 | 5.441 → 5.445 | 5.106 → 5.102 | 11.154 → 11.224 | 183.8 → 183.7 | 51.69 → 50.86 | 35.6 → 34.8 | 86.2% → 85.8% |
+| 4 | 4.725 → 4.724 | 4.451 → 4.442 | 9.440 → 9.463 | 211.7 → 211.7 | 75.91 → 76.06 | 38.4 → 38.8 | 49.7% → 49.4% |
+
+Neither four-worker candidate trial had a frame over 16.67 ms. The full
+workflow artifact includes per-frame timings and hashes, p99, worst frames
+and slow-frame counts. Windows x86/x64 smoke tests and the standard renderer
+benchmark regression checks also passed. [Windows builds](https://github.com/amanosatosi/VSFilterMod_Oborodzuki/actions/runs/44218018725)
+[Standard renderer checks](https://github.com/amanosatosi/VSFilterMod_Oborodzuki/actions/runs/44218018873)
+
+The `f81f31a` checkpoint has identical renderer source and verifies requested
+worker settings in the focused paint benchmark. Selected vector-drawing pixels
+matched analytic expectations and the pinned Mangetsu samples. Oborodzuki hashes
+matched at all five worker settings and after backward seeks. [Focused verification](https://github.com/amanosatosi/VSFilterMod_Oborodzuki/actions/runs/44218421620)
+
+On the 20-event vector-clipped paint workload, the median of three mean
+latencies was 53.223, 29.071 and 23.374 ms with the new effects at 1, 2 and 4
+workers. The solid-paint control measured 30.888, 17.391 and 14.347 ms.
+Instrumented runs attributed most of the paint-specific cost to per-pixel
+projection and stop sampling. Vector-mask sample counts stayed the same in
+both variants. The unchanged 600-frame KFX profiling window recorded zero
+extended paint bounds or stop evaluations and 23,280 text-metric cache hits
+out of 23,420 requests at each worker count.
