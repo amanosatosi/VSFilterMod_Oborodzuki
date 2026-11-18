@@ -64,6 +64,7 @@ class CWord : public Rasterizer
     std::unique_ptr<Rasterizer> m_decorationMask;
     virtual std::unique_ptr<CWord> CreateUndecoratedWord() { return {}; }
     bool RasterizeDecorations(CPoint p, CPoint org);
+    bool NeedsDecorationMask() const;
 #endif
 
 protected:
@@ -337,6 +338,7 @@ public:
     int m_warpedAnchor = 0;
     CPoint m_warpedShift = CPoint(0, 0);
     void ConfigureDistortion();
+    std::unique_ptr<KfxPaint::Cycles> m_cycles;
     double m_clipOffsetX = 0, m_clipOffsetY = 0;
     bool m_hasRectClip = false;
     struct LineAlignment { int first, inherited, full; };

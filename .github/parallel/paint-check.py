@@ -660,12 +660,57 @@ if ROUND3:
         assert min(getter(120, "to-six", 12, 2)) > 220
         assert min(getter(60, "relative", 12, 2)) > 220
         assert max(getter(120, "relative", 12, 2)) < 15
-        top = ink_bounds(getter, 60, "top", left=-395, right=430, top=-100, bottom=220)
+        top = ink_bounds(getter, 60, "top", left=-395, right=390, top=-100, bottom=220)
         bottom = ink_bounds(getter, 60, "bottom", left=-395, right=430, top=-220, bottom=100)
         assert -4 <= top[1] <= 10 and -10 <= bottom[3] <= 4, (top, bottom)
     expected = benchmark(CANDIDATE, warp, 1, "regression")["hashes"]
     for workers in (2, 4, 6, 8):
         assert benchmark(CANDIDATE, warp, workers, "regression")["hashes"] == expected
+
+    patterns = write("cycling-and-polka", [
+        (170, 160, rf"\fs74\cyc(1,{RED},{GREEN},{BLUE})", "MM MM MM"),
+        (680, 160, rf"\fs74\cyc(1,{RED},{GREEN})", rf"MM{{\1c{BLUE}}}MM{{\1cyc(1,{GREEN},{RED})}}MM"),
+        (1200, 160, rf"\fs80\cyc(2,{RED},{GREEN},{BLUE})\fnMyanmar Text", "ကိ မြို့"),
+        (170, 420, rf"\fs82\fnArial Black\1c{WHITE}\polc{RED}\pols11", "MMMM"),
+        (680, 420, rf"\fs82\fnArial Black\1c{WHITE}\polc{RED}\pols0\polsp20"
+         rf"\t(0,1000,\pols12\polc{BLUE})", "MMMM"),
+        (1200, 420, rf"\fs76\fnArial Black\1c{WHITE}\bord4\2bs7\3cyc(1,{GREEN})"
+         rf"\2bcyc(1,{BLUE},{GREEN})\polc{RED}\pols9\polsp17\zpol1\2bpc{WHITE}\2bps7\2bsp15", "MMMM"),
+        (170, 760, rf"\fs74\cyc(1,{RED},{GREEN})", "<漢字|かんじ>"),
+        (680, 760, rf"\fs74\1c{WHITE}\cyc(1,{RED},{BLUE})\polc{GREEN}\pols20\p1", BOX),
+        (1200, 760, rf"\fs90\fnMyanmar Text\cyc(1,{RED},{GREEN},{BLUE})", "ကိ"),
+    ])
+    centers = {"cycle": (170, 160), "reset": (680, 160), "glyph": (1200, 160),
+               "dots": (170, 420), "dot-animation": (680, 420), "rings": (1200, 420),
+               "ruby": (170, 760), "drawing": (680, 760), "cluster": (1200, 760)}
+    playback("csri", CANDIDATE, patterns, ROOT / "patterns")
+    playback("rgba", MANG, patterns, ROOT / "patterns-reference")
+    for getter in (captures(ROOT / "patterns", centers), captures(ROOT / "patterns-reference", centers)):
+        def colors_at(frame, case, top=0, bottom=110):
+            counts = [0, 0, 0]
+            for y in range(top, bottom):
+                for x in range(-20, 450):
+                    pixel = getter(frame, case, x, y)
+                    for channel in range(3):
+                        if pixel[channel] > 200 and sum(pixel) - pixel[channel] < 70:
+                            counts[channel] += 1
+            return counts
+
+        assert all(count > 120 for count in colors_at(60, "cycle"))
+        assert all(count > 120 for count in colors_at(60, "reset"))
+        assert sum(count > 12 for count in colors_at(60, "glyph", bottom=145)) >= 2
+        red, green, blue = colors_at(60, "cluster", bottom=145)
+        assert red > 70 and green == blue == 0, (red, green, blue)
+        assert colors_at(60, "dots")[0] > 100
+        assert colors_at(60, "dot-animation") == [0, 0, 0]
+        assert colors_at(120, "dot-animation")[2] > 100
+        assert all(count > 40 for count in colors_at(60, "rings", top=-22, bottom=112))
+        red, green, blue = colors_at(60, "ruby", top=-110, bottom=0)
+        assert red > 60 and green == blue == 0, (red, green, blue)
+        close(getter(60, "drawing", 80, 50), (255, 255, 255), tolerance=2)
+    expected = benchmark(CANDIDATE, patterns, 1, "regression")["hashes"]
+    for workers in (2, 4, 6, 8):
+        assert benchmark(CANDIDATE, patterns, workers, "regression")["hashes"] == expected
 
 # Check old corner math against the validated VSFilterMod path rather than
 # requiring its different legacy bitmap geometry to agree with libass.

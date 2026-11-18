@@ -170,6 +170,9 @@ public:
             if (verticalVariants)
                 run->fontFace->QueryInterface(__uuidof(IDWriteFontFace1), reinterpret_cast<void**>(&variants));
             const bool rtl = (run->bidiLevel & 1) != 0;
+            DWRITE_FONT_METRICS metrics{};
+            run->fontFace->GetMetrics(&metrics);
+            const float designScale = metrics.designUnitsPerEm ? run->fontEmSize / metrics.designUnitsPerEm : 0;
             for (size_t i = 0; i < clusters.size(); ++i)
             {
                 const auto& range = clusters[i];
@@ -186,6 +189,10 @@ public:
                     cluster.whitespace &= iswspace(description->string[c]) != 0 || description->string[c] == 0xa0;
                 const size_t boundary = cluster.start + cluster.length;
                 cluster.breakAfter = boundary < wrap.size() && wrap[boundary];
+                cluster.underline = y - metrics.underlinePosition * designScale;
+                cluster.underlineThickness = metrics.underlineThickness * designScale;
+                cluster.strike = y - metrics.strikethroughPosition * designScale;
+                cluster.strikeThickness = metrics.strikethroughThickness * designScale;
                 if (!cluster.whitespace)
                 {
                     for (unsigned g = first; g < end; ++g)

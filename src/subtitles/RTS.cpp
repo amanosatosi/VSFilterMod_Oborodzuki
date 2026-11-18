@@ -814,7 +814,7 @@ bool CWord::PrepareProjectedPath(const RenderGeometry::Perspective& projection, 
     if (m_style.borderStyle == 1 && (!CreateOpaqueBox() ||
             !m_pOpaqueBox->PrepareProjectedPath(projection, relativeOrigin, position, areaBudget)))
         return false;
-    if (m_style.decoration && m_style.decoration->Active() && (m_style.fUnderline || m_style.fStrikeOut))
+    if (NeedsDecorationMask())
     {
         m_undecoratedGlyphs = CreateUndecoratedWord();
         if (m_undecoratedGlyphs &&
@@ -845,11 +845,17 @@ bool CWord::CreateNativeOutline()
         auto mask = std::make_unique<Rasterizer>();
         targets.push_back({roundedX, roundedY, mask.get()});
         std::shared_ptr<const KfxPaint::Sources> paint;
-        if (layer && layer->number && (layer->paint[0] || layer->paint[1]))
+        const auto* face = m_style.mod_grad.paint.get();
+        if (layer && layer->number && (layer->paint[0] || layer->paint[1] || (face && face->dots)))
         {
             auto parts = std::make_shared<KfxPaint::Sources>();
             parts->parts[4] = layer->paint[0];
             parts->parts[5] = layer->paint[1];
+            if (face)
+            {
+                parts->dots = face->dots;
+                parts->dotTarget = int(layer->number + 2);
+            }
             paint = std::move(parts);
         }
         masks->rings.push_back({layer, std::move(mask), std::move(paint)});
@@ -926,7 +932,13 @@ CRect CWord::DrawNativeOutline(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, 
             const double angle = std::remainder(m_style.fontAngleZ, 360.0);
             const bool reversed = std::abs(angle) > 90;
             const int edge = (x + int((reversed ? 1 - progress : progress) * m_width)) >> 3;
-            if (reversed)
+            if (m_verticalWord)
+            {
+                const LONG verticalEdge = VerticalPaintSplit(y, progress);
+                active.bottom = (std::min)(verticalEdge, active.bottom);
+                inactive.top = (std::max)(verticalEdge, inactive.top);
+            }
+            else if (reversed)
             {
                 active.left = (std::max)(LONG(edge), active.left);
                 inactive.right = (std::min)(LONG(edge), inactive.right);
@@ -942,6 +954,7 @@ CRect CWord::DrawNativeOutline(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, 
         auto parts = paint.paint ? std::make_shared<KfxPaint::Sources>(*paint.paint) :
             std::make_shared<KfxPaint::Sources>();
         parts->parts[4] = layer->waitingPaint;
+        parts->dots.reset();
         waitingPaint.paint = std::move(parts);
         waitingPaint.legacyParts &= ~(1u << 4);
         draw(inactive, layer->waitingColor >= 0 ? DWORD(layer->waitingColor) : rgb, waitingPaint);
@@ -979,6 +992,13 @@ bool CWord::RasterizeDecorations(CPoint p, CPoint org)
     return m_decorationMask->Rasterize(p.x, p.y, m_style.fBlur, m_style.fGaussianBlurX, m_style.fGaussianBlurY);
 }
 
+bool CWord::NeedsDecorationMask() const
+{
+    return (m_style.fUnderline || m_style.fStrikeOut) &&
+        ((m_style.decoration && m_style.decoration->Active()) ||
+            (m_style.mod_grad.paint && m_style.mod_grad.paint->dots));
+}
+
 CRect CWord::DrawBodyPaint(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int y, const DWORD* colors,
     MOD_MOVEVC& vectorClip, bool reverse, int channel)
 {
@@ -988,10 +1008,12 @@ CRect CWord::DrawBodyPaint(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int 
 
     auto bounds = m_undecoratedGlyphs->Draw(spd, clip, mask, x, y, colors, true, false, channel,
         style, vectorClip, m_style.mod_blendMode, reverse);
-    const auto& deco = *m_style.decoration;
+    const KfxPaint::DecorationPaint plain;
+    const auto& deco = m_style.decoration ? *m_style.decoration : plain;
     auto gradient = style;
     auto sources = style.paint ? std::make_shared<KfxPaint::Sources>(*style.paint) :
         std::make_shared<KfxPaint::Sources>();
+    sources->dots.reset();
     DWORD palette[4];
     std::copy_n(colors, 4, palette);
     for (int i = 0; i < 2; ++i)
@@ -1147,7 +1169,7 @@ void CWord::Paint(CPoint p, CPoint org)
         if (!projected)
         {
             m_undecoratedGlyphs.reset();
-            if (m_style.decoration && m_style.decoration->Active() && (m_style.fUnderline || m_style.fStrikeOut))
+            if (NeedsDecorationMask())
                 m_undecoratedGlyphs = CreateUndecoratedWord();
         }
         if (HasNativeOutline())
@@ -1866,18 +1888,41 @@ class ShapedWord : public CWord
 {
     std::shared_ptr<const ShapedText::Run> run;
     size_t cluster;
+    int selectedGlyph = -1, naturalAdvance = 0;
+    bool clusterContinues = false;
 
     bool CreatePath() override
     {
         const auto& source = run->clusters[cluster];
         std::vector<POINT> points;
         std::vector<BYTE> types;
-        for (const auto& glyph : source.glyphs)
+        for (size_t i = 0; i < source.glyphs.size(); ++i)
         {
+            if (selectedGlyph >= 0 && size_t(selectedGlyph) != i) continue;
+            const auto& glyph = source.glyphs[i];
             points.insert(points.end(), glyph.points.begin(), glyph.points.end());
             types.insert(types.end(), glyph.types.begin(), glyph.types.end());
         }
+        if (!clusterContinues)
+        {
+            const auto addDecoration = [&](float position, float size) {
+                if (size <= 0 || source.advance <= 0) return;
+                const LONG x = LONG(std::lround(source.advance * 64));
+                const LONG top = LONG(std::lround(position * 64));
+                const LONG bottom = (std::max)(top + 1, LONG(std::lround((position + size) * 64)));
+                points.insert(points.end(), {{0, top}, {x, top}, {x, bottom}, {0, bottom}});
+                types.insert(types.end(), {PT_MOVETO, PT_LINETO, PT_LINETO, PT_LINETO | PT_CLOSEFIGURE});
+            };
+            if (m_style.fUnderline) addDecoration(source.underline, source.underlineThickness);
+            if (m_style.fStrikeOut) addDecoration(source.strike, source.strikeThickness);
+        }
         return !points.empty() && CopyPath(points.data(), types.data(), points.size());
+    }
+    std::unique_ptr<CWord> CreateUndecoratedWord() override
+    {
+        auto word = std::make_unique<ShapedWord>(*this);
+        word->m_style.fUnderline = word->m_style.fStrikeOut = false;
+        return word;
     }
 
 public:
@@ -1889,6 +1934,7 @@ public:
         m_fWhiteSpaceChar = part.whitespace;
         m_wrapAfter = part.breakAfter;
         m_width = int(std::lround((part.advance * 8 + style.fontSpacing / 8) * style.fontScaleX / 100));
+        naturalAdvance = m_width;
         m_ascent = int(std::lround(run->ascent * 8 * style.fontScaleY / 100));
         m_descent = int(std::lround(run->descent * 8 * style.fontScaleY / 100));
     }
@@ -1896,17 +1942,50 @@ public:
     CWord* Copy() override { return new ShapedWord(*this); }
     bool Append(CWord*) override { return false; }
     const CStringW& Text() const { return m_str; }
+    int Advance() const { return naturalAdvance; }
+    bool SameClusterFollows() const { return clusterContinues; }
+    void SelectGlyph(size_t index)
+    {
+        selectedGlyph = int(index);
+        clusterContinues = index + 1 < run->clusters[cluster].glyphs.size();
+        if (clusterContinues)
+        {
+            m_width = 0;
+            m_wrapAfter = false;
+        }
+    }
 
     template<class Visit>
     void OutlinePoints(Visit visit) const
     {
         const double sx = m_style.fontScaleX / 100 / 8;
         const double sy = m_style.fontScaleY / 100 / 8;
-        for (const auto& glyph : run->clusters[cluster].glyphs)
-            for (const auto& point : glyph.points)
+        const auto& glyphs = run->clusters[cluster].glyphs;
+        for (size_t i = 0; i < glyphs.size(); ++i)
+            if (selectedGlyph < 0 || size_t(selectedGlyph) == i)
+            for (const auto& point : glyphs[i].points)
                 visit(RenderGeometry::Point{point.x * sx, point.y * sy});
     }
 };
+
+std::vector<KfxPaint::CycleIndices> StartCycles(KfxPaint::Cycles* cycles, const ShapedText::Run& run)
+{
+    if (!cycles || !cycles->active) return {};
+    std::vector<size_t> order(run.clusters.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return run.clusters[a].start < run.clusters[b].start;
+    });
+    std::vector<KfxPaint::CycleIndices> first(order.size());
+    for (const auto index : order)
+    {
+        const auto& cluster = run.clusters[index];
+        first[index] = cycles->Take(cluster.glyphs.size(), cluster.whitespace);
+    }
+    return first;
+}
+
+void ApplyCycleColors(STSStyle& style, const KfxPaint::CycleIndices& colors);
 }
 #endif
 
@@ -1977,6 +2056,14 @@ CPolygon::CPolygon(STSStyle& style, CStringW str, int ktype, int kstart, int ken
     : CWord(style, str, ktype, kstart, kend, scalex, scaley)
     , m_scalex(scalex), m_scaley(scaley), m_baseline(baseline)
 {
+#ifdef _VSMOD
+    if (m_style.mod_grad.paint && m_style.mod_grad.paint->dots)
+    {
+        auto sources = std::make_shared<KfxPaint::Sources>(*m_style.mod_grad.paint);
+        sources->dots.reset();
+        m_style.mod_grad.paint = std::move(sources);
+    }
+#endif
     CMyFont font(m_style);
     HFONT oldFont = SelectFont(g_hDC, font);
     MeasureSelectedFont();
@@ -3548,9 +3635,10 @@ VerticalUnit MeasureVerticalUnit(const std::vector<ShapedWord*>& words, size_t s
     const int profile = preferred ? preferred : CjkVerticalForm(c) ? 1 : Myanmar(c) ? 3 : 2;
     const bool sideways = profile == 1 && c >= 0x21 && c != 0xa0 && !CjkVerticalForm(c) && !Myanmar(c);
     size_t end = start + 1;
+    while (end < words.size() && words[end] && words[end - 1]->SameClusterFollows()) ++end;
     if (Myanmar(c))
         while (end < words.size() && words[end] && words[end]->m_rubyGroup == words[start]->m_rubyGroup &&
-                MyanmarContinuation(words, end))
+                (words[end - 1]->SameClusterFollows() || MyanmarContinuation(words, end)))
             ++end;
     InkBox ink;
     double emX = 1, emY = 1, pen = 0;
@@ -4252,7 +4340,7 @@ void CSubtitle::CurveLines()
         {
             auto* word = dynamic_cast<ShapedWord*>(line->GetNext(words));
             if (!word) return;
-            const double center = word->m_width * .5;
+            const double center = word->Advance() * .5;
             const auto point = sample(at + (left + x + center) / sx);
             const auto localNormal = Normal(point.tangent);
             const auto position = point.point + localNormal * rise;
@@ -4564,7 +4652,15 @@ CRect CScreenLayoutAllocator::AllocRect(CSubtitle* s, int segment, int entry, in
 
 // CRenderedTextSubtitle
 
-enum class ExtensionTag : unsigned char { None, Box, Outline, Gradient, Decoration };
+enum class ExtensionTag : unsigned char { None, Box, Outline, Gradient, Decoration, Pattern };
+
+struct PatternTag
+{
+    enum Kind : unsigned char { None, Cycle, DotColor, DotDiameter, DotSpacing, Propagate };
+    Kind kind = None;
+    unsigned target = 0;
+    int prefix = 0;
+};
 
 struct OverrideTag {
     CStringW rawCommand;
@@ -4576,6 +4672,7 @@ struct OverrideTag {
     bool unicodeNumber = false;
     bool extendedScalar = false;
     bool extendedArguments = false;
+    PatternTag pattern;
 };
 
 using OverrideTags = std::vector<OverrideTag>;
@@ -4790,7 +4887,8 @@ void CRenderedTextSubtitle::ParseString(CSubtitle* sub, CStringW str, STSStyle& 
     PROFILE_RENDER_STAGE(Layout);
     if(!sub) return;
 #ifdef _VSMOD
-    if ((sub->m_curve || sub->m_vertical || sub->m_columns) && !sub->m_curveShapeFailed)
+    if ((sub->m_curve || sub->m_vertical || sub->m_columns || (sub->m_cycles && sub->m_cycles->active)) &&
+        !sub->m_curveShapeFailed)
     {
         if (sub->m_words.IsEmpty()) sub->m_curveScale = style.objectScale / 100;
         if (ParseShapedString(sub, str, style, sub->m_vertical && sub->m_verticalProfile <= 1))
@@ -4897,6 +4995,9 @@ bool CRenderedTextSubtitle::ParseShapedString(CSubtitle* sub, const CStringW& te
             continue;
         }
         const int karaokeStart = m_kstart;
+        auto* cycles = sub->m_cycles.get();
+        const auto indices = StartCycles(cycles, *line.second);
+        const bool splitGlyphs = cycles && cycles->PerGlyph();
         for (size_t i = 0; i < line.second->clusters.size(); ++i)
         {
             const auto& c = line.second->clusters[i];
@@ -4904,16 +5005,32 @@ bool CRenderedTextSubtitle::ParseShapedString(CSubtitle* sub, const CStringW& te
                 c.left / (std::max)(.001f, line.second->width)) : karaokeStart;
             const auto endTime = m_ktype == 1 ? karaokeStart + int((m_kend-karaokeStart) *
                 (c.left+c.advance) / (std::max)(.001f, line.second->width)) : m_kend;
-            auto* word = new ShapedWord(style, line.first.Mid(c.start, c.length), line.second, i,
-                sub->m_columns ? 0 : m_ktype, sub->m_columns ? 0 : startTime,
-                sub->m_columns ? 0 : endTime, sub->m_scalex, sub->m_scaley);
+            const auto append = [&](STSStyle& selected, size_t glyph, bool split) {
+                auto word = std::make_unique<ShapedWord>(selected, line.first.Mid(c.start, c.length), line.second, i,
+                    sub->m_columns ? 0 : m_ktype, sub->m_columns ? 0 : startTime,
+                    sub->m_columns ? 0 : endTime, sub->m_scalex, sub->m_scaley);
+                if (split) word->SelectGlyph(glyph);
 #if defined(_LUA)
-            word->L = L;
-            word->LuaLog = LuaLog;
-            word->m_entry = m_entry;
-            word->LuaRendererHandler = style.LuaRendererHandler;
+                word->L = L;
+                word->LuaLog = LuaLog;
+                word->m_entry = m_entry;
+                word->LuaRendererHandler = selected.LuaRendererHandler;
 #endif
-            sub->AppendWord(word);
+                sub->AppendWord(word.get());
+                word.release();
+            };
+            if (indices.empty() || c.whitespace)
+                append(style, 0, false);
+            else
+            {
+                const bool split = splitGlyphs && c.glyphs.size() > 1;
+                for (size_t glyph = 0; glyph < (split ? c.glyphs.size() : 1); ++glyph)
+                {
+                    STSStyle selected(style);
+                    ApplyCycleColors(selected, cycles->Colors(indices[i], glyph));
+                    append(selected, glyph, split);
+                }
+            }
         }
         if (!sub->m_keepRubyKaraoke && !sub->m_columns) m_kstart = m_kend;
     }
@@ -4932,6 +5049,10 @@ bool CRenderedTextSubtitle::ParseFurigana(CSubtitle* sub, Furigana::Fields& fiel
     struct Timing { int offset, type, start, end; bool explicitTag; };
     Timing current{0, m_ktype, m_kstart, m_kend, false};
     bool changedKaraoke = false;
+    auto cycles = sub->m_cycles && sub->m_cycles->active ?
+        std::make_unique<KfxPaint::Cycles>(*sub->m_cycles) : nullptr;
+    KfxPaint::CycleIndices inherited;
+    inherited.fill(-1);
     std::array<std::vector<std::unique_ptr<CWord>>, 3> output;
     for (unsigned side = 0; side < fields.text.size(); ++side)
     {
@@ -4943,7 +5064,12 @@ bool CRenderedTextSubtitle::ParseFurigana(CSubtitle* sub, Furigana::Fields& fiel
         {
             if (field[i] != L'{')
             {
-                plain.AppendChar(field[i]);
+                if (field[i] == L'\\' && field[i + 1] == L'h')
+                {
+                    plain.AppendChar(L'\x00a0');
+                    ++i;
+                }
+                else plain.AppendChar(field[i]);
                 continue;
             }
             const int close = field.Find(L'}', i + 1);
@@ -4975,17 +5101,35 @@ bool CRenderedTextSubtitle::ParseFurigana(CSubtitle* sub, Furigana::Fields& fiel
             i = close;
         }
         if (plain.IsEmpty()) continue;
-        plain.Replace(L"\\h", L"\x00a0");
         auto run = m_shaper->Shape(plain, plain.GetLength(), style.fontName, float(style.fontSize / 64),
             style.fontWeight, style.fItalic, verticalVariants);
         if (!run) return false;
         STSStyle glyphStyle = style;
+        const auto indices = side == 0 ? StartCycles(cycles.get(), *run) : std::vector<KfxPaint::CycleIndices>{};
+        if (!indices.empty())
+        {
+            unsigned first = unsigned(plain.GetLength());
+            for (size_t i = 0; i < run->clusters.size(); ++i)
+                if (!run->clusters[i].whitespace && run->clusters[i].start < first)
+                {
+                    first = run->clusters[i].start;
+                    inherited = cycles->Colors(indices[i], 0);
+                }
+        }
         if (side)
         {
             glyphStyle.fontScaleX *= group.options.scaleX / 100;
             glyphStyle.fontScaleY *= group.options.scaleY / 100;
             glyphStyle.fontSpacing = sub->m_vertical ? 0 : group.options.spacing * sub->m_scalex * 64;
             glyphStyle.mod_distort = MOD_DISTORT();
+            if (cycles) ApplyCycleColors(glyphStyle, inherited);
+            if (glyphStyle.mod_grad.paint && glyphStyle.mod_grad.paint->dots &&
+                !glyphStyle.mod_grad.paint->dots->propagate)
+            {
+                auto sources = std::make_shared<KfxPaint::Sources>(*glyphStyle.mod_grad.paint);
+                sources->dots.reset();
+                glyphStyle.mod_grad.paint = std::move(sources);
+            }
         }
         for (size_t i = 0; i < run->clusters.size(); ++i)
         {
@@ -4993,7 +5137,9 @@ bool CRenderedTextSubtitle::ParseFurigana(CSubtitle* sub, Furigana::Fields& fiel
             auto segment = std::upper_bound(timing.begin(), timing.end(), int(cluster.start),
                 [](int offset, const Timing& value) { return offset < value.offset; });
             if (segment != timing.begin()) --segment;
-            auto word = std::make_unique<ShapedWord>(glyphStyle, plain.Mid(cluster.start, cluster.length), run, i,
+            STSStyle selected(glyphStyle);
+            if (!indices.empty()) ApplyCycleColors(selected, cycles->Colors(indices[i], 0));
+            auto word = std::make_unique<ShapedWord>(selected, plain.Mid(cluster.start, cluster.length), run, i,
                 segment->type, segment->start, segment->end, sub->m_scalex, sub->m_scaley);
             word->m_isRubyReading = side != 0;
             const double width = word->m_fWhiteSpaceChar ? 0 : (std::max)(1, word->m_width);
@@ -5025,6 +5171,7 @@ bool CRenderedTextSubtitle::ParseFurigana(CSubtitle* sub, Furigana::Fields& fiel
     group.annotations[0] = std::move(output[1]);
     group.annotations[1] = std::move(output[2]);
     sub->m_rubyGroups.push_back(std::move(group));
+    if (cycles) sub->m_cycles = std::move(cycles);
     for (auto& word : output[0])
     {
         sub->AppendWord(word.get());
@@ -5259,6 +5406,45 @@ struct OutlineTag
 };
 
 using AssNumeric::ReadDecimalDigit;
+
+PatternTag ReadPatternTag(const CStringW& name)
+{
+    const wchar_t* begin = name;
+    const wchar_t* p = begin;
+    unsigned target = 0, number = 0;
+    if (p[0] >= L'1' && p[0] <= L'9')
+    {
+        number = unsigned(*p++ - L'0');
+        if (number == 1 && *p == L'0') { number = 10; ++p; }
+    }
+    const bool ring = number && *p == L'b';
+    if (ring)
+    {
+        target = number + 1;
+        ++p;
+    }
+    else if (number <= 3) target = number ? number - 1 : 0;
+    else return {};
+    const int prefix = int(p - begin);
+    using P = PatternTag;
+    if (!wcscmp(p, L"cyc")) return {P::Cycle, target, prefix + 3};
+    if (!number && !wcscmp(p, L"scyc")) return {P::Cycle, 1, 4};
+    if (!number && !wcsncmp(p, L"zpol", 4)) return {P::Propagate, 0, 4};
+    if (ring)
+    {
+        if (!wcsncmp(p, L"pc", 2)) return {P::DotColor, target, prefix + 2};
+        if (!wcsncmp(p, L"ps", 2)) return {P::DotDiameter, target, prefix + 2};
+        if (!wcsncmp(p, L"sp", 2)) return {P::DotSpacing, target, prefix + 2};
+    }
+    else if (!wcsncmp(p, L"pol", 3))
+    {
+        p += 3;
+        if (*p == L'c') return {P::DotColor, target, prefix + 4};
+        if (*p == L's') return p[1] == L'p' ? PatternTag{P::DotSpacing, target, prefix + 5} :
+            PatternTag{P::DotDiameter, target, prefix + 4};
+    }
+    return {};
+}
 
 bool ReadPaintTag(const CStringW& name, PaintTag& tag)
 {
@@ -5657,6 +5843,25 @@ KfxPaint::OutlineLayer& EditOutlineLayer(KfxPaint::OutlineStyle& state, unsigned
     layer.number = number;
     return *state.layers.insert(pos, std::move(layer));
 }
+
+void ApplyCycleColors(STSStyle& style, const KfxPaint::CycleIndices& colors)
+{
+    for (unsigned i = 0; i < 3; ++i)
+        if (colors[i] >= 0)
+            style.colors[i] = revcolor(colors[i]);
+    std::shared_ptr<KfxPaint::OutlineStyle> rings;
+    for (unsigned i = 3; i < colors.size(); ++i)
+        if (colors[i] >= 0 && style.nativeOutline)
+        {
+            const auto& layers = style.nativeOutline->layers;
+            const auto found = std::find_if(layers.begin(), layers.end(),
+                [&](const KfxPaint::OutlineLayer& layer) { return layer.number == i - 2; });
+            if (found == layers.end()) continue;
+            if (!rings) rings = std::make_shared<KfxPaint::OutlineStyle>(*style.nativeOutline);
+            rings->layers[found - layers.begin()].color = colors[i];
+        }
+    if (rings) style.nativeOutline = std::move(rings);
+}
 }
 #endif
 
@@ -5675,7 +5880,9 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
         OutlineTag outline;
         bool inverse;
         CStringW argument;
-        if (EventBoxTag(cmd))
+        if (tag.pattern.kind != PatternTag::None)
+            tag.extension = ExtensionTag::Pattern;
+        else if (EventBoxTag(cmd))
             tag.extension = ExtensionTag::Box;
         else if (ReadOutlineTag(cmd, outline))
             tag.extension = ExtensionTag::Outline;
@@ -5714,6 +5921,7 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
             if (number >= 0)
                 cmd = CStringW(wchar_t(L'0' + number)) + CStringW(next);
         }
+        const auto pattern = ReadPatternTag(cmd);
 #endif
 
         std::vector<CStringW> params;
@@ -5734,9 +5942,22 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
             parenthesized = str[j] == L')';
 
 #ifdef _VSMOD
+            if (pattern.kind != PatternTag::None)
+            {
+                if (parenthesized)
+                {
+                    auto fields = PaintArguments(param);
+                    const int count = int(fields.size());
+                    OverrideTag tag{cmd, cmd, std::move(fields), count, true};
+                    tag.pattern = pattern;
+                    append(std::move(tag));
+                }
+                continue;
+            }
             PaintTag paint{};
             OutlineTag outline;
-            if (ReadPaintTag(cmd, paint) || ReadOutlineTag(cmd, outline) || EventBoxTag(cmd) || cmd == L"fad")
+            if (ReadPaintTag(cmd, paint) || ReadOutlineTag(cmd, outline) || EventBoxTag(cmd) ||
+                cmd == L"fad" || cmd == L"distort" || cmd == L"mpersp")
             {
                 auto fields = PaintArguments(param);
                 if (cmd == L"fad" && fields.size() != 4)
@@ -5774,6 +5995,13 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
         const CStringW rawCommand = cmd;
         const int rawCount = static_cast<int>(params.size());
 #ifdef _VSMOD
+        if (pattern.kind != PatternTag::None)
+        {
+            OverrideTag tag{cmd, cmd, std::move(params), rawCount};
+            tag.pattern = pattern;
+            append(std::move(tag));
+            continue;
+        }
         OutlineTag outline;
         PaintTag paint{};
         if (EventBoxTag(cmd) || ReadOutlineTag(cmd, outline) ||
@@ -6046,6 +6274,11 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         return *owner;
     };
     const auto paintProgress = [&]() { return fAnimate ? KfxPaint::Unit(CalcAnimation(1, 0, true)) : 1.0; };
+    const auto stopCycle = [&](unsigned target) {
+        if (sub->m_cycles && target < KfxPaint::PatternTargets &&
+            (sub->m_cycles->active & (1u << target)) && paintProgress() > 0)
+            sub->m_cycles->Set(target, 0, {});
+    };
     const auto readOperand = [&](CStringW input, bool signedRelative, bool timing, AssNumeric::Operand& operand) {
         input.Trim();
         if (input.IsEmpty()) return false;
@@ -6197,6 +6430,78 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         CStringW p = params.size() > 0 ? params[0] : L"";
 
 #ifdef _VSMOD
+        if (tag.extension == ExtensionTag::Pattern)
+        {
+            using P = PatternTag;
+            using namespace KfxPaint;
+            const auto& pattern = tag.pattern;
+            const auto suffix = cmd.Mid(pattern.prefix).Trim();
+            const auto& value = tag.parenthesized ? p : suffix;
+            if ((tag.parenthesized && !suffix.IsEmpty()) ||
+                (pattern.kind != P::Cycle && params.size() > 1))
+                continue;
+            if (pattern.kind == P::Cycle)
+            {
+                if (fAnimate || !tag.parenthesized || params.size() < 2 || params.size() > 33) continue;
+                const wchar_t* modeValue = p;
+                const int mode = ReadDecimalDigit(modeValue);
+                if ((mode != 1 && mode != 2) || *modeValue) continue;
+                std::vector<Value> palette;
+                for (size_t i = 1; i < params.size(); ++i)
+                {
+                    Value rgb;
+                    if (!ReadPaintValue(params[i], false, rgb)) break;
+                    palette.push_back(rgb);
+                }
+                if (palette.size() + 1 != params.size()) continue;
+                if (!sub->m_cycles) sub->m_cycles = std::make_unique<Cycles>();
+                sub->m_cycles->Set(pattern.target, mode, std::move(palette));
+                if (pattern.target < 3)
+                {
+                    const unsigned part = pattern.target * 2;
+                    if (style.mod_grad.paint || style.mod_grad.mode[pattern.target] == 1)
+                        SetPaintPart(style, part, {});
+                    style.mod_grad.legacyParts &= ~(1u << part);
+                    if (style.mod_grad.mode[pattern.target] == 2) style.mod_grad.mode[pattern.target] = 0;
+                }
+                else if (style.nativeOutline)
+                {
+                    auto rings = copyOutline(style.nativeOutline);
+                    EditOutlineLayer(*rings, pattern.target - 2).paint[0].reset();
+                    style.nativeOutline = std::move(rings);
+                }
+                continue;
+            }
+            auto shade = style.mod_grad.paint ? std::make_shared<Sources>(*style.mod_grad.paint) :
+                std::make_shared<Sources>();
+            auto dots = shade->dots ? std::make_shared<DotState>(*shade->dots) : std::make_shared<DotState>();
+            auto& layer = dots->layers[pattern.target];
+            if (pattern.kind == P::Propagate)
+            {
+                if (fAnimate || (!value.IsEmpty() && value != L"0" && value != L"1")) continue;
+                dots->propagate = value != L"0";
+            }
+            else if (pattern.kind == P::DotColor)
+            {
+                Value rgb;
+                if (!ReadPaintValue(value, false, rgb)) continue;
+                layer.color = layer.color < 0 ? int(rgb) :
+                    int(Mix(Value(layer.color), rgb, paintProgress(), false, false));
+            }
+            else
+            {
+                AssNumeric::Operand number;
+                if (!readOperand(value, false, false, number)) continue;
+                auto& dimension = pattern.kind == P::DotDiameter ? layer.diameter : layer.spacing;
+                const auto current = (std::max)(0., dimension);
+                const auto target = number.Resolve(current);
+                if (!std::isfinite(target) || target > 10000) continue;
+                dimension = CalcAnimation((std::max)(0., target), current, fAnimate);
+            }
+            shade->dots = std::move(dots);
+            style.mod_grad.paint = std::move(shade);
+            continue;
+        }
         if (cmd == L"wtan")
         {
             const wchar_t* value = p;
@@ -6308,6 +6613,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         }
         if (cmd == L"mpersp")
         {
+            if (!tag.parenthesized) continue;
             auto pins = RenderGeometry::IdentityPins();
             if (params.size() == pins.size())
             {
@@ -6612,6 +6918,8 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     }
                     if (target.stops.size() != 4) continue;
                 }
+                if (!outline.box && !inverse && !waitingField && !reset)
+                    stopCycle(outline.layer + 2);
                 if (waitingField)
                 {
                     auto state = copyOutline(ringState);
@@ -6654,6 +6962,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 const bool reset = argument.IsEmpty();
                 Value value = inverse ? org.alpha[channel] : revcolor(org.colors[channel]);
                 if (!reset && !ReadPaintValue(argument, inverse, value)) continue;
+                if (!outline.box && property == P::Color) stopCycle(outline.layer + 2);
                 if (base && property != P::Waiting)
                 {
                     const Value from = inverse ? style.alpha[2] : revcolor(style.colors[2]);
@@ -6822,6 +7131,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 KfxPaint::Paint field;
                 if (readField(params, (paint.part & 1) != 0, paint.positioned, field))
                 {
+                    if (!(paint.part & 1)) stopCycle(unsigned(paint.part / 2));
                     const auto progress = paintProgress();
                     ApplyPaintPart(*sub, style, paint.part, std::move(field), progress,
                                    fAnimate && slides() ? slides()->Width(paint.part) : -1, fAnimate);
@@ -6871,6 +7181,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 const int part = (cmd[0] - L'1') * 2 + int(inverseAlpha);
                 const auto progress = paintProgress();
                 if (progress <= 0) continue;
+                if (!inverseAlpha) stopCycle(unsigned(part / 2));
                 const double width = fAnimate && slides() ? slides()->Width(part) : -1;
                 if (width >= 0 && progress < 1)
                 {
@@ -6897,6 +7208,9 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         if(cmd == "1c" || cmd == L"2c" || cmd == L"3c" || cmd == L"4c")
         {
             int i = cmd[0] - '1';
+#ifdef _VSMOD
+            stopCycle(unsigned(i));
+#endif
 
             DWORD c = wcstol(p, NULL, 16);
             style.colors[i] = !p.IsEmpty()
@@ -6999,6 +7313,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     if(t_init)
                     {
                         style.mod_grad.mode[i] = 2;
+                        stopCycle(unsigned(i));
                     }
                     else
                     {
@@ -7007,6 +7322,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                         if(t_temp.initImage(params[0])) // absolute path or default directory
                         {
                             style.mod_grad.mode[i] = 2;
+                            stopCycle(unsigned(i));
                             style.mod_grad.b_images[i] = t_temp;
                             mod_images.Add(t_temp);
                         }
@@ -7014,6 +7330,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                         if(t_temp.initImage(fpath + params[0])) // path + relative path
                         {
                             style.mod_grad.mode[i] = 2;
+                            stopCycle(unsigned(i));
                             style.mod_grad.b_images[i] = t_temp;
                             mod_images.Add(t_temp);
                         }
@@ -7038,6 +7355,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 
             if(params.size() >= 4)
             {
+                stopCycle(unsigned(i));
                 style.mod_grad.legacyParts |= 1u << (2 * i);
                 DWORD c;
                 for(int j = 0; j < 4; j++)
@@ -7272,6 +7590,9 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         }
         else if(cmd == L"c")
         {
+#ifdef _VSMOD
+            stopCycle(0);
+#endif
             DWORD c = wcstol(p, NULL, 16);
             style.colors[0] = !p.IsEmpty()
                               ? (((int)CalcAnimation(c & 0xff, style.colors[0] & 0xff, fAnimate)) & 0xff
@@ -8022,6 +8343,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 sub->m_curveX = sub->m_curveY = 0;
                 sub->m_rubyOptions = Furigana::Options{};
                 sub->m_warpedAnchor = 0;
+                sub->m_cycles.reset();
             }
 #endif
 #ifdef _VSMOD

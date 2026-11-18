@@ -15,6 +15,7 @@ struct Cluster
 {
     unsigned start = 0, length = 0;
     float left = 0, advance = 0;
+    float underline = 0, underlineThickness = 0, strike = 0, strikeThickness = 0;
     bool whitespace = false, breakAfter = false;
     std::vector<Outline> glyphs;
 };

@@ -1334,6 +1334,21 @@ class COverlayKfxPaint : public COverlayGetter
 {
     const OverlayDraw& draw;
     KfxPaint::Sampler samplers[2][2];
+    struct DotGrid
+    {
+        DWORD color = 0;
+        int period = 0, rows = 0, radius = 0;
+        bool Sample(int x, int y) const
+        {
+            if (!period) return false;
+            const int py = y * 16 + 8;
+            const int row = py / rows;
+            const int dy = py % rows - rows / 2;
+            const int px = x * 16 + 8 + ((row & 1) ? period / 2 : 0);
+            const int dx = px % period - period / 2;
+            return int64_t(dx) * dx + int64_t(dy) * dy <= int64_t(radius) * radius;
+        }
+    } dots[2];
 
     int Channel(int slice) const
     {
@@ -1371,6 +1386,8 @@ class COverlayKfxPaint : public COverlayGetter
             if (alpha.Active())
                 opacity = ((255 - alpha.At(px, py, u, v)) * (255 - gradient.fadalpha) + 127) / 255;
         }
+        if (dots[slice].Sample(gradient.xoffset + x, gradient.yoffset + draw.info.h - 1 - y))
+            color = dots[slice].color;
         if (draw.paintFade.amount > 0)
             color = KfxPaint::Mix(color, draw.paintFade.color, draw.paintFade.amount, false, false);
         return color | (opacity << 24);
@@ -1381,10 +1398,22 @@ public:
     {
         if (!draw.gradient.paint)
             return;
+        const auto& paint = *draw.gradient.paint;
+        if (paint.dots && draw.colorType < 3)
+            for (int slice = 0; slice < (draw.colorType ? 1 : 2); ++slice)
+            {
+                const unsigned target = paint.dotTarget >= 0 ? paint.dotTarget : Channel(slice);
+                const auto layer = paint.dots->Layer(target);
+                const auto period = (layer.spacing < 0 ? 2.5 * layer.diameter : layer.spacing) * draw.paintScaleY;
+                if (layer.color >= 0 && layer.diameter > 0 && period > 0)
+                    dots[slice] = {DWORD(layer.color), (std::max)(1, int(std::lround(period * 16))),
+                        (std::max)(1, int(std::lround(period * 13.8564064606))),
+                        (std::max)(1, int(std::lround(layer.diameter * draw.paintScaleY * 8)))};
+            }
         for (int slice = 0; slice < (draw.colorType ? 1 : 2); ++slice)
             for (int component = 0; component < 2; ++component)
             {
-                const auto& source = draw.gradient.paint->parts[Channel(slice) * 2 + component];
+                const auto& source = paint.parts[Channel(slice) * 2 + component];
                 if (!source) continue;
                 CRect rect = draw.paintBounds;
                 if (draw.paintSegments)

@@ -79,13 +79,94 @@ struct Paint
     double width = 0, progress = 0;
 };
 
+struct DotState;
+
 struct Sources
 {
     // Two independent slots per target: RGB, then inverse alpha.
     std::array<Source, 8> parts{};
+    std::shared_ptr<const DotState> dots;
+    int dotTarget = -1;
 };
 
 constexpr unsigned MaxOutlineLayers = 10;
+
+constexpr unsigned PatternTargets = 2 + MaxOutlineLayers;
+
+struct Dots
+{
+    int color = -1;
+    double diameter = -1, spacing = -1;
+};
+
+struct DotState
+{
+    std::array<Dots, PatternTargets> layers;
+    bool propagate = false;
+    Dots Layer(unsigned target) const
+    {
+        auto result = layers[target];
+        if (propagate && target)
+        {
+            if (result.color < 0) result.color = layers[0].color;
+            if (result.diameter < 0) result.diameter = layers[0].diameter;
+            if (result.spacing < 0) result.spacing = layers[0].spacing;
+        }
+        return result;
+    }
+};
+
+using CycleIndices = std::array<int, PatternTargets>;
+
+struct Cycles
+{
+    struct Palette
+    {
+        std::vector<Value> colors;
+        unsigned mode = 0, next = 0;
+    };
+    std::array<Palette, PatternTargets> layers;
+    unsigned active = 0;
+
+    void Set(unsigned target, unsigned mode, std::vector<Value> colors)
+    {
+        layers[target] = {std::move(colors), mode, 0};
+        if (mode) active |= 1u << target;
+        else active &= ~(1u << target);
+    }
+    bool PerGlyph() const
+    {
+        for (const auto& pattern : layers) if (pattern.mode == 2) return true;
+        return false;
+    }
+    CycleIndices Take(size_t glyphs, bool whitespace)
+    {
+        CycleIndices indices;
+        indices.fill(-1);
+        if (whitespace || !glyphs) return indices;
+        for (unsigned i = 0; i < layers.size(); ++i)
+        {
+            auto& palette = layers[i];
+            if (!palette.mode) continue;
+            indices[i] = int(palette.next);
+            palette.next = unsigned((palette.next + (palette.mode == 2 ? glyphs : 1)) % palette.colors.size());
+        }
+        return indices;
+    }
+    CycleIndices Colors(const CycleIndices& indices, size_t glyph) const
+    {
+        CycleIndices values;
+        values.fill(-1);
+        for (unsigned i = 0; i < layers.size(); ++i)
+            if (indices[i] >= 0)
+            {
+                const auto& palette = layers[i];
+                const size_t offset = palette.mode == 2 ? glyph : 0;
+                values[i] = int(palette.colors[(indices[i] + offset) % palette.colors.size()]);
+            }
+        return values;
+    }
+};
 
 struct OutlineLayer
 {
