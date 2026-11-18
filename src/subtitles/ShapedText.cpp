@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "ShapedText.h"
+#include "RenderProfile.h"
 #include <dwrite_1.h>
 #include <d2d1.h>
 #include <algorithm>
@@ -236,6 +237,7 @@ Context::~Context() = default;
 std::shared_ptr<const Run> Context::Shape(const wchar_t* text, unsigned length, const wchar_t* family,
     float em, int weight, bool italic, bool verticalVariants)
 {
+    PROFILE_RENDER_STAGE(NativeShape);
     if (!length || length > 8192 || em <= 0 || em > 4096 || !std::isfinite(em)) return {};
     if (!native->factory) return {};
     const auto face = *family == L'@' ? family + 1 : family;
@@ -245,6 +247,7 @@ std::shared_ptr<const Run> Context::Shape(const wchar_t* text, unsigned length, 
                 hit->italic == italic && hit->vertical == verticalVariants && hit->family == face &&
                 std::char_traits<wchar_t>::compare(hit->text.data(), text, length) == 0)
             {
+                PROFILE_RENDER_STAGE(NativeShapeHit);
                 native->cache.splice(native->cache.begin(), native->cache, hit);
                 return hit->run;
             }

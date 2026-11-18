@@ -75,6 +75,26 @@ if ROUND2:
         for i in range(16)
     ])
 paint_scenes = [legacy, heavy] + ([combined] if combined else [])
+if ROUND3:
+    motion = r"\fs37\bord3\shad2\t(0,2500,\frz12\fscx112)\fnMyanmar Text"
+    positions = [(170 + i % 4 * 450, 240 + i // 4 * 245) for i in range(12)]
+    sample = "<漢字|かんじ> မြန်မာနိုင်ငံ"
+    plain = "漢字 မြန်မာနိုင်ငံ"
+    paired = [
+        ("layout-control", [(x, y, motion, plain) for x, y in positions]),
+        ("native-layout-mix", [
+            (x, y, motion + tags, body)
+            for (x, y), (tags, body) in zip(positions, [
+                (r"\furis65\furichangepos2", sample),
+                (r"\vert1\vdir2\furis55", sample),
+                (r"\ct(m -50 0 b 30 -90 150 -90 340 0)\t(0,2500,\ctx50)", plain),
+                (r"\mpersp(0,.1,1,0,.85,1,.1,1)", plain),
+            ] * 3)
+        ]),
+        ("pattern-paint", [(x, y, motion + rf"\cyc(2,{RED},{GREEN},{BLUE})\3polc{WHITE}\3pols5"
+                            rf"\polc{WHITE}\pols7\t(0,2200,\pols13\polsp28)", plain) for x, y in positions]),
+    ]
+    paint_scenes += [write(name, entries) for name, entries in paired]
 
 
 def benchmark(dll, scenario, workers, mode):
@@ -457,9 +477,10 @@ if ROUND3:
          "မြန်မာစာ သင်္ချာ ကြိုဆိုပါတယ်"),
         (340, 710, r"\fs56\1c$white\ct(m 0 0 l 0 0)", "MMMM"),
         (760, 710, r"\fs56\1c$white", "MMMM"),
+        (1290, 710, rf"\fs90\1c{RED}\2c{BLUE}\kf100\ctan5\ct(m 0 -140 l 0 140)", "M"),
     ])
     centers = {"line": (340,270), "upright": (760,270), "myanmar": (1290,270),
-               "invalid": (340,710), "flat": (760,710)}
+               "invalid": (340,710), "flat": (760,710), "curve-karaoke": (1290,710)}
     playback("csri", CANDIDATE, curved, ROOT / "curved")
     playback("rgba", MANG, curved, ROOT / "curved-reference")
     actual = captures(ROOT / "curved", centers)
@@ -479,6 +500,15 @@ if ROUND3:
         assert 46 <= h1[0] - h0[0] <= 54, (h0, h1)
         assert v[3] - v[1] > 2 * (v[2] - v[0]), v
         ink_bounds(getter, 60, "myanmar")
+    top, bottom = [], []
+    for y in range(-100, 100):
+        for x in range(-100, 100):
+            r, _, b = actual(90, "curve-karaoke", x, y)
+            if r > 200 and b < 60:
+                top.append(y)
+            if b > 200 and r < 60:
+                bottom.append(y)
+    assert top and bottom and max(top) <= min(bottom) + 2, (len(top), len(bottom))
     assert ink_bounds(actual, 60, "invalid", left=0, top=0) == ink_bounds(actual, 60, "flat", left=0, top=0)
     expected = benchmark(CANDIDATE, curved, 1, "regression")["hashes"]
     for workers in (2, 4, 6, 8):
@@ -582,6 +612,22 @@ if ROUND3:
     expected = benchmark(CANDIDATE, ruby, 1, "regression")["hashes"]
     for workers in (2, 4, 6, 8):
         assert benchmark(CANDIDATE, ruby, workers, "regression")["hashes"] == expected
+
+    escapes = write("ruby-escapes-and-recovery", [
+        (220, 860, rf"\fs42\1c{WHITE}", r"\<A|B\>"),
+        (630, 860, rf"\fs42\1c{WHITE}", r"<A\|\B>"),
+        (1040, 860, rf"\fs42\1c{WHITE}", r"<A|B||>"),
+        (1450, 860, rf"\fs42\1c{WHITE}\furi0", r"<A|B>"),
+    ])
+    centers = {"escaped": (220, 860), "no-separator": (630, 860),
+               "malformed": (1040, 860), "literal": (1450, 860)}
+    playback("csri", CANDIDATE, escapes, ROOT / "ruby-escapes")
+    getter = captures(ROOT / "ruby-escapes", centers)
+    for y in range(-10, 80):
+        for x in range(210):
+            assert getter(60, "escaped", x, y) == getter(60, "literal", x, y)
+            assert getter(60, "no-separator", x, y) == getter(60, "literal", x, y)
+    assert ink_bounds(getter, 60, "malformed", top=-10, right=260, bottom=120)[2] > 90
 
     vertical_ruby = write("native-vertical-ruby", [
         (240, 265, rf"\fs54\1c{WHITE}\vert1\vdir1", "<漢字|かんじ>"),

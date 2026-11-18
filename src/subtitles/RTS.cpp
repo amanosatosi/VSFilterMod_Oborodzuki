@@ -632,6 +632,19 @@ void CWord::OffsetLayout(CPoint offset)
     m_layoutPlacement->offset += offset;
 }
 
+KfxPaint::PaintBoundary CWord::CurvePaintBoundary(CPoint position, CPoint origin, double progress) const
+{
+    const auto& pose = *m_layoutPlacement;
+    const double angle = m_style.fontAngleZ * (3.1415 / 180.);
+    const double c = std::cos(angle), s = std::sin(angle);
+    const double nx = c * pose.cosine + s * pose.sine;
+    const double ny = c * pose.sine - s * pose.cosine;
+    const double dx = position.x - origin.x, dy = position.y - origin.y;
+    const double x = (origin.x + c * dx + s * dy) / 8;
+    const double y = (origin.y + c * dy - s * dx) / 8;
+    return {nx, ny, x * nx + y * ny + (2 * progress - 1) * pose.center / 64};
+}
+
 bool CWord::RawOutlineBounds(CRect& rectangle)
 {
     if (!m_rawPathReady) m_rawPathReady = CreatePath();
@@ -648,6 +661,34 @@ bool CWord::RawOutlineBounds(CRect& rectangle)
     return true;
 }
 
+static RenderGeometry::Point WarpPoint(RenderGeometry::Point point, const MOD_DISTORT& warp, const CRect& domain)
+{
+    if (!domain.Width() || !domain.Height()) return point;
+    const double u = (point.x - domain.left) / domain.Width();
+    const double v = (point.y - domain.top) / domain.Height();
+    const double p0 = (1 - u) * (1 - v);
+    return {
+        domain.left + domain.Width() * (u * warp.pointsx[0] + v * warp.pointsx[2] +
+            u * v * (warp.pointsx[1] - warp.pointsx[0] - warp.pointsx[2]) + p0 * warp.x0),
+        domain.top + domain.Height() * (u * warp.pointsy[0] + v * warp.pointsy[2] +
+            u * v * (warp.pointsy[1] - warp.pointsy[0] - warp.pointsy[2]) + p0 * warp.y0)
+    };
+}
+
+bool CWord::WarpBeforeLayout()
+{
+    if (!m_style.mod_distort.enabled || !m_layoutPlacement || !m_layoutPlacement->rotate || !m_distortionDomain)
+        return false;
+    const auto& domain = *m_distortionDomain;
+    for (size_t i = 0; i < mPathPoints; ++i)
+    {
+        auto& point = mpPathPoints[i];
+        const auto warped = WarpPoint({double(point.x), double(point.y)}, m_style.mod_distort, domain);
+        point = {LONG(std::lround(warped.x)), LONG(std::lround(warped.y))};
+    }
+    return true;
+}
+
 void CWord::AddWarpedBounds(CPoint position, RenderGeometry::Point& min, RenderGeometry::Point& max) const
 {
     if (!m_rawPathReady) return;
@@ -657,25 +698,16 @@ void CWord::AddWarpedBounds(CPoint position, RenderGeometry::Point& min, RenderG
     const auto* domain = m_distortionDomain.get();
     for (size_t i = 0; i < mPathPoints; ++i)
     {
-        double x = mpPathPoints[i].x, y = mpPathPoints[i].y;
+        auto point = RenderGeometry::Point{double(mpPathPoints[i].x), double(mpPathPoints[i].y)};
+        if (domain && warp.enabled) point = WarpPoint(point, warp, *domain);
         const auto* pose = m_layoutPlacement.get();
         if (pose && pose->rotate && sx && sy)
         {
-            const double dx = x * sx - pose->center, dy = y * sy - pose->baseline;
-            x = (dx * pose->cosine - dy * pose->sine) / sx;
-            y = (dx * pose->sine + dy * pose->cosine) / sy;
+            const double dx = point.x * sx - pose->center, dy = point.y * sy - pose->baseline;
+            point.x = (dx * pose->cosine - dy * pose->sine) / sx;
+            point.y = (dx * pose->sine + dy * pose->cosine) / sy;
         }
-        if (domain && warp.enabled && domain->Width() && domain->Height())
-        {
-            const double u = (x - domain->left) / domain->Width();
-            const double v = (y - domain->top) / domain->Height();
-            const double p0 = (1 - u) * (1 - v);
-            x = domain->left + domain->Width() * (u * warp.pointsx[0] + v * warp.pointsx[2] +
-                u * v * (warp.pointsx[1] - warp.pointsx[0] - warp.pointsx[2]) + p0 * warp.x0);
-            y = domain->top + domain->Height() * (u * warp.pointsy[0] + v * warp.pointsy[2] +
-                u * v * (warp.pointsy[1] - warp.pointsy[0] - warp.pointsy[2]) + p0 * warp.y0);
-        }
-        const double px = position.x + x * sx / 8, py = position.y + y * sy / 8;
+        const double px = position.x + point.x * sx / 8, py = position.y + point.y * sy / 8;
         min.x = (std::min)(min.x, px);
         min.y = (std::min)(min.y, py);
         max.x = (std::max)(max.x, px);
@@ -733,8 +765,9 @@ bool CWord::PrepareProjectedPath(const RenderGeometry::Perspective& projection, 
     ResetProjectedPath();
     if (!m_rawPathReady && !CreatePath()) return false;
     m_rawPathReady = false;
+    const bool layoutWarped = WarpBeforeLayout();
     if (m_layoutPlacement && m_layoutPlacement->rotate) RotateLayoutOutline();
-    Transform(CPoint(relativeOrigin.x * 8, relativeOrigin.y * 8));
+    Transform(CPoint(relativeOrigin.x * 8, relativeOrigin.y * 8), layoutWarped);
     using namespace RenderGeometry;
     const Point offset{position.x * 8., position.y * 8.};
     std::vector<POINT> points;
@@ -1000,14 +1033,15 @@ bool CWord::NeedsDecorationMask() const
 }
 
 CRect CWord::DrawBodyPaint(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int y, const DWORD* colors,
-    MOD_MOVEVC& vectorClip, bool reverse, int channel)
+    MOD_MOVEVC& vectorClip, bool reverse, int channel, const KfxPaint::PaintBoundary* boundary)
 {
     auto& style = m_style.mod_grad;
     if (!m_decorationMask)
-        return Draw(spd, clip, mask, x, y, colors, true, false, channel, style, vectorClip, m_style.mod_blendMode, reverse);
+        return Draw(spd, clip, mask, x, y, colors, true, false, channel, style, vectorClip, m_style.mod_blendMode,
+            reverse, true, boundary);
 
     auto bounds = m_undecoratedGlyphs->Draw(spd, clip, mask, x, y, colors, true, false, channel,
-        style, vectorClip, m_style.mod_blendMode, reverse);
+        style, vectorClip, m_style.mod_blendMode, reverse, true, boundary);
     const KfxPaint::DecorationPaint plain;
     const auto& deco = m_style.decoration ? *m_style.decoration : plain;
     auto gradient = style;
@@ -1037,7 +1071,7 @@ CRect CWord::DrawBodyPaint(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int 
     }
     gradient.paint = std::move(sources);
     bounds |= m_decorationMask->Draw(spd, clip, mask, x, y, palette, true, false, channel,
-        gradient, vectorClip, m_style.mod_blendMode, reverse);
+        gradient, vectorClip, m_style.mod_blendMode, reverse, true, boundary);
     return bounds;
 }
 #endif
@@ -1138,7 +1172,9 @@ void CWord::Paint(CPoint p, CPoint org)
         if(!CreatePath()) return;
 #endif
 
+        bool layoutWarped = false;
 #ifdef _VSMOD
+        layoutWarped = WarpBeforeLayout();
         if (m_layoutPlacement && m_layoutPlacement->rotate)
             RotateLayoutOutline();
 #endif
@@ -1148,10 +1184,10 @@ void CWord::Paint(CPoint p, CPoint org)
         if(m_style.LuaCustomTransformHandler.GetLength() > 0)
             CustomTransform(morg, m_style.LuaCustomTransformHandler, Layer);
         else
-            Transform(morg);
+            Transform(morg, layoutWarped);
         if(m_style.LuaAfterTransformHandler.GetLength() > 0) CustomTransform(morg, m_style.LuaAfterTransformHandler, Layer);
 #else
-        Transform(CPoint((org.x - p.x) * 8, (org.y - p.y) * 8));
+        Transform(CPoint((org.x - p.x) * 8, (org.y - p.y) * 8), layoutWarped);
 #endif
 #ifdef _VSMOD
         }
@@ -1323,7 +1359,7 @@ void CWord::CustomTransform(CPoint org, CString F, int Layer)
 #endif
 #endif
 
-void CWord::Transform(CPoint org)
+void CWord::Transform(CPoint org, bool layoutWarped)
 {
     PROFILE_RENDER_STAGE(Transform);
     double scalex = isOpaqueBox ? 1 : m_style.fontScaleX / 100;
@@ -1374,7 +1410,7 @@ void CWord::Transform(CPoint org)
         __m128 __minx = _mm_set_ps(INT_MAX, INT_MAX, 0, 0);
         __m128 __max = _mm_set_ps(-INT_MAX, -INT_MAX, 1, 1);
 
-        bool is_dist = m_style.mod_distort.enabled;
+        bool is_dist = m_style.mod_distort.enabled && !layoutWarped;
         const bool additionalPin = m_style.mod_distort.x0 != 0 || m_style.mod_distort.y0 != 0;
         const __m128 zeroPinX = _mm_set_ps1(float(m_style.mod_distort.x0));
         const __m128 zeroPinY = _mm_set_ps1(float(m_style.mod_distort.y0));
@@ -1641,7 +1677,7 @@ void CWord::Transform(CPoint org)
         double dst1x, dst1y, dst2x, dst2y, dst3x, dst3y;
         int minx = INT_MAX, miny = INT_MAX, maxx = -INT_MAX, maxy = -INT_MAX;
 
-        bool is_dist = m_style.mod_distort.enabled;
+        bool is_dist = m_style.mod_distort.enabled && !layoutWarped;
         if(is_dist)
         {
             if (m_distortionDomain)
@@ -2861,7 +2897,7 @@ CRect CLine::PaintBody(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoin
                 double angle = fmod(w->m_style.fontAngleZ, 360.0);
                 if(
 #ifdef _VSMOD
-                    !w->m_verticalWord &&
+                    !w->m_verticalWord && !w->IsOnCurve() &&
 #endif
                     angle > 90 && angle < 270)
                 {
@@ -2912,7 +2948,23 @@ CRect CLine::PaintBody(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoin
         sw[3] = (int)(w->m_style.outlineWidthX + t * w->getOverlayWidth() + t * bluradjust) >> 3;
 
 #ifdef _VSMOD // patch m004. gradient colors
-        if (w->m_verticalWord && w->m_ktype == 1)
+        if (w->IsOnCurve() && w->m_ktype == 1)
+        {
+            sw[1] = 0xffffffff;
+            if (t <= 0)
+            {
+                sw[0] = secondary;
+                bbox |= w->DrawBodyPaint(spd, clipRect, pAlphaMask, x, y, sw, mod_vc, false, 1);
+            }
+            else if (t >= 1)
+                bbox |= w->DrawBodyPaint(spd, clipRect, pAlphaMask, x, y, sw, mod_vc, false);
+            else
+            {
+                const auto boundary = w->CurvePaintBoundary(CPoint(x, y), org, t);
+                bbox |= w->DrawBodyPaint(spd, clipRect, pAlphaMask, x, y, sw, mod_vc, false, 0, &boundary);
+            }
+        }
+        else if (w->m_verticalWord && w->m_ktype == 1)
         {
             sw[1] = 0xffffffff;
             const int split = w->VerticalPaintSplit(y, t);
@@ -3458,8 +3510,8 @@ void CSubtitle::CreateEventBox(int borderStyle, int time, bool scaledBorder)
     const double edgeX = (std::max)(0., style.shadowDepthX) + style.outlineWidthX;
     const double edgeTop = (std::max)(0., style.shadowDepthY) + m_topborder;
     const double edgeBottom = (std::max)(0., style.shadowDepthY) + m_bottomborder;
-    const KfxPaint::Rect rect{left - edgeX - bounded(box.padding[0] * sx), -edgeTop - bounded(box.padding[2] * sy),
-        right + edgeX + bounded(box.padding[1] * sx), m_rect.Height() + edgeBottom + bounded(box.padding[3] * sy)};
+    const KfxPaint::Rect rect{left - m_annotationLeft - edgeX - bounded(box.padding[0] * sx), -edgeTop - bounded(box.padding[2] * sy),
+        right + m_annotationRight + edgeX + bounded(box.padding[1] * sx), m_rect.Height() + edgeBottom + bounded(box.padding[3] * sy)};
     const double radiusX = (std::min)(bounded(box.radius * sx), (rect.right - rect.left) / 2);
     const double radiusY = (std::min)(bounded(box.radius * sy), (rect.bottom - rect.top) / 2);
     const auto expand = [&](double x, double y) {
@@ -3684,6 +3736,7 @@ InkBox VerticalInk(const VerticalGlyph& glyph)
 
 void CSubtitle::PlaceHorizontalRuby()
 {
+    PROFILE_RENDER_STAGE(NativeLayout);
     struct Line
     {
         CLine* words;
@@ -3905,6 +3958,9 @@ void CSubtitle::PlaceHorizontalRuby()
     m_rect.bottom += added - heightShift;
     if (all.valid)
     {
+        const int baseLeft = alignX == 1 ? 0 : alignX == 2 ? -m_rect.Width() / 2 : -m_rect.Width();
+        m_annotationLeft = int(std::ceil((std::max)(0., baseLeft - all.left)));
+        m_annotationRight = int(std::ceil((std::max)(0., all.right - (baseLeft + m_rect.Width()))));
         m_topborder = (std::max)(m_topborder, int(std::ceil(-all.top - top)));
         m_bottomborder = (std::max)(m_bottomborder, int(std::ceil(all.bottom + top - (lineY + added))));
     }
@@ -3912,6 +3968,7 @@ void CSubtitle::PlaceHorizontalRuby()
 
 void CSubtitle::ArrangeColumns()
 {
+    PROFILE_RENDER_STAGE(NativeLayout);
     struct Cell
     {
         size_t first, last;
@@ -4020,6 +4077,7 @@ void CSubtitle::ArrangeColumns()
 bool CSubtitle::MakeVerticalLines(int maxHeight, CSize& bounds)
 {
     if (m_curveShapeFailed || m_words.IsEmpty()) return false;
+    PROFILE_RENDER_STAGE(NativeLayout);
     std::vector<ShapedWord*> words;
     int directionScore = 0, firstDirection = 0;
     for (auto pos = m_words.GetHeadPosition(); pos;)
@@ -4114,6 +4172,7 @@ bool CSubtitle::MakeVerticalLines(int maxHeight, CSize& bounds)
     {
         std::vector<VerticalGlyph> glyphs;
         InkBox band;
+        bool strict = false;
     };
     std::vector<ColumnPlan> plans;
     double columnStart = 0;
@@ -4143,7 +4202,7 @@ bool CSubtitle::MakeVerticalLines(int maxHeight, CSize& bounds)
     }
     double columnShift = 0;
     InkBox block, previous;
-    bool reserve = false;
+    bool reserve = false, previousStrict = false;
     if (!m_rubyGroups.empty())
         for (auto& plan : plans)
         {
@@ -4164,6 +4223,7 @@ bool CSubtitle::MakeVerticalLines(int maxHeight, CSize& bounds)
                 auto& group = m_rubyGroups[groupId - 1];
                 const auto& options = group.options;
                 reserve |= options.placement == 1;
+                plan.strict |= options.placement == 1 || options.placement == 2;
                 const double em = baseWord->m_style.fontSize * baseWord->m_style.fontScaleX / 800;
                 const double gap = (std::max)(8., em * .04) + (!options.manual && options.autoGap ? em * .04 : 0);
                 const double offsetX = options.manual ? options.offsetX * m_scalex * 8 : 0;
@@ -4219,7 +4279,8 @@ bool CSubtitle::MakeVerticalLines(int maxHeight, CSize& bounds)
             if (plan.band.valid)
             {
                 double extra = 0;
-                if (previous.valid)
+                if (previous.valid && (plan.strict || previousStrict ||
+                    (plan.band.top < previous.bottom && plan.band.bottom > previous.top)))
                     extra = leftward ? (std::max)(0., plan.band.right - columnShift - previous.left + 8) :
                         (std::max)(0., previous.right - plan.band.left - columnShift + 8);
                 columnShift += extra;
@@ -4227,19 +4288,28 @@ bool CSubtitle::MakeVerticalLines(int maxHeight, CSize& bounds)
                 for (auto& glyph : plan.glyphs) glyph.x += delta;
                 plan.band.Move(delta, 0);
                 previous = plan.band;
+                previousStrict = plan.strict;
                 block.Add(plan.band);
             }
         }
-    double xOffset = leftward ? columnShift : 0;
-    width += columnShift;
+    double xOffset = 0;
     double yOffset = 0;
     if (reserve && block.valid)
     {
+        if (leftward) xOffset = columnShift;
+        width += columnShift;
         const double left = (std::min)(0., block.left + xOffset);
         width = (std::max)(width, block.right + xOffset) - left;
         xOffset -= left;
         yOffset = (std::max)(0., -block.top);
         height = (std::max)(height, block.bottom) + yOffset;
+    }
+    else if (block.valid)
+    {
+        m_annotationLeft = int(std::ceil((std::max)(0., -block.left)));
+        m_annotationRight = int(std::ceil((std::max)(0., block.right - width)));
+        m_topborder = int(std::ceil((std::max)(0., -block.top)));
+        m_bottomborder = int(std::ceil((std::max)(0., block.bottom - height)));
     }
     if (width > 4000000 || height > 4000000) return false;
     auto line = std::make_unique<CLine>();
@@ -4305,6 +4375,7 @@ bool CSubtitle::MakeVerticalLines(int maxHeight, CSize& bounds)
 void CSubtitle::CurveLines()
 {
     if (m_vertical || !m_curve || m_curveShapeFailed || IsEmpty()) return;
+    PROFILE_RENDER_STAGE(NativeLayout);
     using namespace RenderGeometry;
     const auto fraction = [](int align) { return align == 1 ? 0. : align == 2 ? .5 : 1.; };
     const int attach = m_curveAnchor ? m_curveAnchor : m_scrAlignment;
@@ -4371,6 +4442,7 @@ void CSubtitle::CurveLines()
         const auto offset = place.position + shift - place.flat;
         place.word->PlaceLayout(CPoint(LONG(std::lround(offset.x)), LONG(std::lround(offset.y))),
             place.tangent.x, place.tangent.y, place.center * 8, place.word->m_ascent * 8.);
+        place.word->MarkCurve();
     }
 }
 
@@ -4409,7 +4481,7 @@ void CSubtitle::ConfigurePerspective()
 
 void CSubtitle::ConfigureDistortion()
 {
-    if (!m_hasExtendedWarp && !m_warpedAnchor) return;
+    if (!m_hasExtendedWarp && !m_warpedAnchor && !(m_hasDistortion && (m_curve || m_verticalLaidOut))) return;
     struct Glyph
     {
         CWord* word;
@@ -4513,6 +4585,7 @@ void CSubtitle::PreparePerspective(CPoint anchor, CPoint origin, const CRect& bo
     const CPoint relativeOrigin(origin.x - left, origin.y - bounds.top);
     if (m_perspectiveOrigin == relativeOrigin && (!m_perspectiveJitter || m_perspectiveTime == timestamp))
         return;
+    PROFILE_RENDER_STAGE(NativeProjection);
     m_perspectiveOrigin = relativeOrigin;
     m_perspectiveTime = timestamp;
     int64_t area = 32 * 1024 * 1024;
@@ -4596,17 +4669,22 @@ CRect CScreenLayoutAllocator::AllocRect(CSubtitle* s, int segment, int entry, in
     PROFILE_RENDER_STAGE(Collision);
     // TODO: handle collisions == 1 (reversed collisions)
 
+#ifdef _VSMOD
+    const CRect padding(s->m_annotationLeft, s->m_topborder, s->m_annotationRight, s->m_bottomborder);
+#else
+    const CRect padding(0, s->m_topborder, 0, s->m_bottomborder);
+#endif
     POSITION pos = m_subrects.GetHeadPosition();
     while(pos)
     {
         SubRect& sr = m_subrects.GetNext(pos);
         if(sr.segment == segment && sr.entry == entry)
         {
-            return(sr.r + CRect(0, -s->m_topborder, 0, -s->m_bottomborder));
+            return sr.r - padding;
         }
     }
 
-    CRect r = s->m_rect + CRect(0, s->m_topborder, 0, s->m_bottomborder);
+    CRect r = s->m_rect + padding;
 
     bool fSearchDown = s->m_scrAlignment > 3;
 
@@ -4647,12 +4725,12 @@ CRect CScreenLayoutAllocator::AllocRect(CSubtitle* s, int segment, int entry, in
     sr.layer = layer;
     m_subrects.AddTail(sr);
 
-    return(sr.r + CRect(0, -s->m_topborder, 0, -s->m_bottomborder));
+    return sr.r - padding;
 }
 
 // CRenderedTextSubtitle
 
-enum class ExtensionTag : unsigned char { None, Box, Outline, Gradient, Decoration, Pattern };
+enum class ExtensionTag : unsigned char { None, Box, Outline, Gradient, Decoration, Pattern, Layout };
 
 struct PatternTag
 {
@@ -5412,6 +5490,9 @@ PatternTag ReadPatternTag(const CStringW& name)
     const wchar_t* begin = name;
     const wchar_t* p = begin;
     unsigned target = 0, number = 0;
+    if (!(p[0] >= L'1' && p[0] <= L'9') && p[0] != L'c' && p[0] != L's' &&
+        p[0] != L'p' && p[0] != L'z')
+        return {};
     if (p[0] >= L'1' && p[0] <= L'9')
     {
         number = unsigned(*p++ - L'0');
@@ -5444,6 +5525,21 @@ PatternTag ReadPatternTag(const CStringW& name)
             PatternTag{P::DotDiameter, target, prefix + 4};
     }
     return {};
+}
+
+bool NativeLayoutTag(const CStringW& name)
+{
+    switch (name[0])
+    {
+    case L'c': return name == L"ct" || name == L"ctan" || name == L"ctx" || name == L"cty" ||
+                    name == L"col" || name == L"colan" || name == L"colsp";
+    case L'f': return !name.Find(L"furi");
+    case L'm': return name == L"mpersp";
+    case L'v': return name == L"vert" || name == L"vtype" || name == L"vdir" ||
+                    name == L"vsp" || name == L"vcolsp";
+    case L'w': return name == L"wtan";
+    default: return false;
+    }
 }
 
 bool ReadPaintTag(const CStringW& name, PaintTag& tag)
@@ -5882,6 +5978,8 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
         CStringW argument;
         if (tag.pattern.kind != PatternTag::None)
             tag.extension = ExtensionTag::Pattern;
+        else if (NativeLayoutTag(cmd))
+            tag.extension = ExtensionTag::Layout;
         else if (EventBoxTag(cmd))
             tag.extension = ExtensionTag::Box;
         else if (ReadOutlineTag(cmd, outline))
@@ -5900,7 +5998,8 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
                 (first && tag.parenthesized && ExtendedNumber(p));
             if (cmd == L"t")
                 tag.extendedArguments = std::any_of(tag.parameters.begin(), tag.parameters.end() - 1, ExtendedNumber);
-            else if (cmd == L"clip" || cmd == L"iclip" || cmd == L"pos" || cmd == L"move" || cmd == L"org")
+            else if (cmd == L"clip" || cmd == L"iclip" || cmd == L"pos" || cmd == L"move" ||
+                cmd == L"org" || cmd == L"distort")
                 tag.extendedArguments = std::any_of(tag.parameters.begin(), tag.parameters.end(), ExtendedNumber);
         }
 #endif
@@ -6502,7 +6601,8 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             style.mod_grad.paint = std::move(shade);
             continue;
         }
-        if (cmd == L"wtan")
+        const bool layout = tag.extension == ExtensionTag::Layout;
+        if (layout && cmd == L"wtan")
         {
             const wchar_t* value = p;
             const int digit = ReadDecimalDigit(value);
@@ -6510,7 +6610,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 sub->m_warpedAnchor = digit;
             continue;
         }
-        if (cmd == L"col" || cmd == L"colan" || cmd == L"colsp")
+        if (layout && (cmd == L"col" || cmd == L"colan" || cmd == L"colsp"))
         {
             if (fAnimate || sub->m_vertical) continue;
             if (cmd == L"col")
@@ -6562,7 +6662,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             unsigned fields;
             ~DefaultCapture() { if (snapshot) SemanticColumns::CopyFields(*snapshot, style, fields); }
         } remember{columnFields ? sub->m_columns->SpliceDefault(style, columnFields) : nullptr, style, columnFields};
-        if (!cmd.Find(L"furi"))
+        if (layout && !cmd.Find(L"furi"))
         {
             auto& ruby = sub->m_rubyOptions;
             if (cmd == L"furipos")
@@ -6572,8 +6672,9 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     readOperand(params[1], false, false, y))
                 {
                     ruby.manual = true;
-                    ruby.offsetX = CalcAnimation(x.Resolve(ruby.offsetX), ruby.offsetX, fAnimate);
-                    ruby.offsetY = CalcAnimation(y.Resolve(ruby.offsetY), ruby.offsetY, fAnimate);
+                    const auto bounded = [](double value) { return (std::max)(-10000., (std::min)(10000., value)); };
+                    ruby.offsetX = CalcAnimation(bounded(x.Resolve(ruby.offsetX)), ruby.offsetX, fAnimate);
+                    ruby.offsetY = CalcAnimation(bounded(y.Resolve(ruby.offsetY)), ruby.offsetY, fAnimate);
                 }
                 else if (p.IsEmpty())
                 {
@@ -6611,7 +6712,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             }
             continue;
         }
-        if (cmd == L"mpersp")
+        if (layout && cmd == L"mpersp")
         {
             if (!tag.parenthesized) continue;
             auto pins = RenderGeometry::IdentityPins();
@@ -6636,7 +6737,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             sub->m_perspectivePins = std::make_unique<RenderGeometry::Pins>(pins);
             continue;
         }
-        if (cmd == L"vert" || cmd == L"vtype" || cmd == L"vdir" || cmd == L"vsp" || cmd == L"vcolsp")
+        if (layout && (cmd == L"vert" || cmd == L"vtype" || cmd == L"vdir" || cmd == L"vsp" || cmd == L"vcolsp"))
         {
             if (fAnimate || !sub->m_words.IsEmpty() || sub->m_columns) continue;
             if (cmd == L"vsp" || cmd == L"vcolsp")
@@ -6658,7 +6759,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             }
             continue;
         }
-        if (cmd == L"ct" || cmd == L"ctan" || cmd == L"ctx" || cmd == L"cty")
+        if (layout && (cmd == L"ct" || cmd == L"ctan" || cmd == L"ctx" || cmd == L"cty"))
         {
             if (cmd == L"ctan" && !fAnimate && !sub->m_curveAnchor)
             {
@@ -7640,6 +7741,13 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 const auto apply = [&](CStringW value, double current, double& output) {
                     value.Trim();
                     if (value.IsEmpty()) return true;
+                    if (legacy && !tag.extendedArguments)
+                    {
+                        const double target = std::wcstod(value, nullptr);
+                        if (!std::isfinite(target) || std::abs(target) > 1024) return false;
+                        output = CalcAnimation(target, current, fAnimate);
+                        return true;
+                    }
                     AssNumeric::Operand operand;
                     if (!readOperand(value, false, false, operand)) return false;
                     const double target = operand.Resolve(current);
@@ -7662,6 +7770,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     to.enabled = true;
                     to.extended = extended;
                     style.mod_distort = to;
+                    sub->m_hasDistortion = true;
                     sub->m_hasExtendedWarp |= extended;
                 }
             }
@@ -8855,6 +8964,8 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
 #endif
     ParseEffect(sub, GetAt(entry).effect);
 #ifdef _VSMOD
+    const bool escapedAngles = str.Find(L'<') >= 0 &&
+        (str.Find(L"\\<") >= 0 || str.Find(L"\\>") >= 0 || str.Find(L"\\|\\") >= 0);
     if (str.Find(L"\\ct(") >= 0 && !sub->m_effects[EF_SCROLL] && !sub->m_effects[EF_BANNER]
 #ifdef _LUA
         && !hasExternalLua
@@ -8906,15 +9017,25 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
 
         if(fParsed)
         {
-            i = str.FindOneOf(L"{<");
+#ifdef _VSMOD
+            if (escapedAngles && sub->m_rubyOptions.enabled) i = Furigana::NextOverride(str, 0);
+            else
+#endif
+                i = str.FindOneOf(L"{<");
             if(i < 0) i = str.GetLength();
             if(i == 0) continue;
         }
         else
         {
-            i = str.Mid(1).FindOneOf(L"{<");
-            if(i < 0) i = str.GetLength() - 1;
-            i++;
+#ifdef _VSMOD
+            if (escapedAngles && sub->m_rubyOptions.enabled) i = Furigana::NextOverride(str, 1);
+            else
+#endif
+            {
+                i = str.Mid(1).FindOneOf(L"{<");
+                if(i < 0) i = str.GetLength() - 1;
+                i++;
+            }
         }
 
 #ifdef _VSMOD
@@ -8998,6 +9119,8 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
             auto text = str.Left(i);
 #ifdef _VSMOD
             if (sub->m_columns) text.Replace(L"\\|", L"|");
+            else if (escapedAngles && sub->m_rubyOptions.enabled && text.Find(L'\\') >= 0)
+                Furigana::Unescape(text);
 #endif
             ParseString(sub, text, tmp);
         }

@@ -28,6 +28,10 @@ enum class RenderStage {
     PaintProjection,
     PaintStops,
     PaintClip,
+    NativeShape,
+    NativeShapeHit,
+    NativeLayout,
+    NativeProjection,
     Count
 };
 
@@ -36,7 +40,8 @@ constexpr const char* RenderStageNames[] = {
     "transform", "scan_convert", "widen_outline", "rasterize", "blur", "composite",
     "active_events", "overrides", "animation", "layout", "collision", "mask", "cache",
     "gdi_metrics", "gdi_path", "text_measure_hit", "glyph_path_hit", "event_paint", "band_plan",
-    "paint_bounds", "paint_projection", "paint_stops", "sample_clip"
+    "paint_bounds", "paint_projection", "paint_stops", "sample_clip",
+    "native_shape", "native_shape_hit", "native_layout", "native_projection"
 };
 static_assert(sizeof(RenderStageNames) / sizeof(*RenderStageNames) == static_cast<unsigned>(RenderStage::Count),
     "Missing render stage name");

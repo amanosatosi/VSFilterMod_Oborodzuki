@@ -34,6 +34,40 @@ inline bool HasText(CStringW text)
     return false;
 }
 
+inline int NextOverride(const CStringW& text, int start)
+{
+    for (int i = start; i < text.GetLength(); ++i)
+    {
+        if (text[i] == L'{') return i;
+        if (text[i] != L'<') continue;
+        int slash = i;
+        while (slash && text[slash - 1] == L'\\') --slash;
+        if ((i - slash) % 2 == 0) return i;
+    }
+    return text.GetLength();
+}
+
+inline void Unescape(CStringW& literal)
+{
+    CStringW output;
+    for (int i = 0; i < literal.GetLength(); ++i)
+    {
+        if (literal[i] == L'\\' && i + 1 < literal.GetLength())
+        {
+            const auto escaped = literal[i + 1];
+            if (escaped == L'<' || escaped == L'>' || escaped == L'|' || escaped == L'\\')
+            {
+                output.AppendChar(escaped);
+                ++i;
+                if (escaped == L'|' && i + 1 < literal.GetLength() && literal[i + 1] == L'\\') ++i;
+                continue;
+            }
+        }
+        output.AppendChar(literal[i]);
+    }
+    literal = std::move(output);
+}
+
 inline Fields Read(const CStringW& source)
 {
     Fields fields;
@@ -56,7 +90,7 @@ inline Fields Read(const CStringW& source)
             {
                 fields.text[side].AppendChar(next);
                 ++i;
-                if (next == L'|' && source[i + 1] == L'\\') ++i;
+                if (next == L'|' && i + 1 < source.GetLength() && source[i + 1] == L'\\') ++i;
             }
             else fields.text[side].AppendChar(c);
         }

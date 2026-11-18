@@ -52,7 +52,7 @@ class CWord : public Rasterizer
     void CustomTransform(CPoint org, CString F, int Layer);
 #endif
 
-    void Transform(CPoint org);
+    void Transform(CPoint org, bool layoutWarped = false);
 
     bool CreateOpaqueBox();
 #ifdef _VSMOD
@@ -78,9 +78,11 @@ protected:
         double cosine = 1, sine = 0, center = 0, baseline = 0;
         int clipStart = INT_MIN, clipEnd = INT_MAX;
         bool rotate = false;
+        bool curve = false;
     };
     std::unique_ptr<LayoutPlacement> m_layoutPlacement;
     void RotateLayoutOutline();
+    bool WarpBeforeLayout();
     bool m_projectedPath = false;
     bool m_rawPathReady = false;
 #endif
@@ -123,6 +125,9 @@ public:
     }
     CRect RubyClip(const CRect& clip, int x, int y) const;
     void OffsetLayout(CPoint offset);
+    bool IsOnCurve() const { return m_layoutPlacement && m_layoutPlacement->curve; }
+    void MarkCurve() { m_layoutPlacement->curve = true; }
+    KfxPaint::PaintBoundary CurvePaintBoundary(CPoint position, CPoint origin, double progress) const;
     bool RawOutlineBounds(CRect& bounds);
     void SetDistortionDomain(const CRect& domain) { m_distortionDomain = std::make_unique<CRect>(domain); }
     void AddWarpedBounds(CPoint position, RenderGeometry::Point& min, RenderGeometry::Point& max) const;
@@ -158,7 +163,7 @@ public:
     CRect DrawNativeShadow(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int y, DWORD* colors,
         MOD_MOVEVC& vectorClip);
     CRect DrawBodyPaint(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int y, const DWORD* colors,
-        MOD_MOVEVC& vectorClip, bool reverse, int channel = 0);
+        MOD_MOVEVC& vectorClip, bool reverse, int channel = 0, const KfxPaint::PaintBoundary* boundary = nullptr);
 #endif
 
 #if defined (_VSMOD) && defined(_LUA)
@@ -329,12 +334,13 @@ public:
     };
     std::vector<RubyGroup> m_rubyGroups;
     Furigana::Options m_rubyOptions;
+    int m_annotationLeft = 0, m_annotationRight = 0;
     bool m_keepRubyKaraoke = false;
     void PlaceHorizontalRuby();
     std::vector<std::unique_ptr<SemanticColumns::Block>> m_columnBlocks;
     SemanticColumns::Block* m_columns = nullptr;
     void ArrangeColumns();
-    bool m_hasExtendedWarp = false;
+    bool m_hasDistortion = false, m_hasExtendedWarp = false;
     int m_warpedAnchor = 0;
     CPoint m_warpedShift = CPoint(0, 0);
     void ConfigureDistortion();

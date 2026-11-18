@@ -1357,6 +1357,12 @@ class COverlayKfxPaint : public COverlayGetter
 
     DWORD Sample(int slice, int x, int y) const
     {
+        if (draw.boundary.Active())
+        {
+            const double px = draw.bounds.left + x + .5;
+            const double py = draw.bounds.bottom - y - .5;
+            slice = px * draw.boundary.x + py * draw.boundary.y < draw.boundary.offset ? 0 : 1;
+        }
         const auto& gradient = draw.gradient;
         const auto& rgb = samplers[slice][0];
         const auto& alpha = samplers[slice][1];
@@ -1468,9 +1474,11 @@ void OverlayDraw::Blend(int top, int bottom) const
 #endif
     auto* alpha = alphaMask ? &mask : nullptr;
 #ifdef _VSMOD
-    if (gradient.paint || (legacyShading && paintFade.amount > 0))
+    if (gradient.paint || boundary.Active() || (legacyShading && paintFade.amount > 0))
     {
-        if (gradient.paint && band.sw[1] != 0xffffffff)
+        if (boundary.Active())
+            band.sw[1] = 0xffffffff;
+        else if (gradient.paint && band.sw[1] != 0xffffffff)
         {
             const int64_t split = int64_t(int32_t(band.sw[3])) - band.xo;
             band.sw[3] = split >= 0 ? DWORD(split) : DWORD(-1);
@@ -1665,7 +1673,8 @@ void OverlayDrawList::Blend() const
 // fBorder tells whether to render the border of the subs.
 #ifdef _VSMOD // patch m004. gradient colors
 CRect Rasterizer::Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int xsub, int ysub,
-                       const DWORD* switchpts, bool fBody, bool fBorder, int typ, MOD_GRADIENT& mod_grad, MOD_MOVEVC& mod_vc, MOD_BLEND mod_blendMode, bool reversePaint, bool applyPositionedAlpha)
+                       const DWORD* switchpts, bool fBody, bool fBorder, int typ, MOD_GRADIENT& mod_grad, MOD_MOVEVC& mod_vc, MOD_BLEND mod_blendMode, bool reversePaint, bool applyPositionedAlpha,
+                       const KfxPaint::PaintBoundary* boundary)
 #else
 CRect Rasterizer::Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int xsub, int ysub,
                        const DWORD* switchpts, bool fBody, bool fBorder)
@@ -1783,6 +1792,7 @@ CRect Rasterizer::Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int x
     draw.gradient.yoffset = yo;
     draw.gradient.clipDiff = (std::max)(0, yBeforeClip + mOverlayHeight - int(clipRect.bottom));
     draw.colorType = typ;
+    if (boundary) draw.boundary = *boundary;
     draw.reversePaint = reversePaint && mod_grad.paint;
     if (mod_grad.paint)
     {

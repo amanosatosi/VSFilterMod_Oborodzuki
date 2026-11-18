@@ -81,6 +81,12 @@ struct Paint
 
 struct DotState;
 
+struct PaintBoundary
+{
+    double x = 0, y = 0, offset = 0;
+    bool Active() const { return x != 0 || y != 0; }
+};
+
 struct Sources
 {
     // Two independent slots per target: RGB, then inverse alpha.

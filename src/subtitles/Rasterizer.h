@@ -90,6 +90,7 @@ struct OverlayDraw
     const std::map<unsigned, CRect>* paintSegments = nullptr;
     CRect paintBounds{0, 0, 0, 0};
     KfxPaint::Fade paintFade;
+    KfxPaint::PaintBoundary boundary;
     double paintScaleX = 1, paintScaleY = 1;
     bool reversePaint = false;
     const OverlayDrawList* captureOwner = nullptr;
@@ -237,7 +238,8 @@ public:
         bool separateMask = false);
     int getOverlayWidth();
 #ifdef _VSMOD // patch m004. gradient colors
-    CRect Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int xsub, int ysub, const DWORD* switchpts, bool fBody, bool fBorder, int typ, MOD_GRADIENT& mod_grad, MOD_MOVEVC& mod_vc, MOD_BLEND mod_blendMode, bool reversePaint = false, bool applyPositionedAlpha = true);
+    CRect Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int xsub, int ysub, const DWORD* switchpts, bool fBody, bool fBorder, int typ, MOD_GRADIENT& mod_grad, MOD_MOVEVC& mod_vc, MOD_BLEND mod_blendMode, bool reversePaint = false, bool applyPositionedAlpha = true,
+        const KfxPaint::PaintBoundary* boundary = nullptr);
 #else
     CRect Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int xsub, int ysub, const DWORD* switchpts, bool fBody, bool fBorder);
 #endif
