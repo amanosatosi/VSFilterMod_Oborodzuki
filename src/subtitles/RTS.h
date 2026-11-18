@@ -75,6 +75,7 @@ protected:
     };
     std::unique_ptr<LayoutPlacement> m_layoutPlacement;
     void RotateLayoutOutline();
+    bool m_projectedPath = false;
 #endif
 
     void MeasureSelectedFont();
@@ -113,6 +114,9 @@ public:
     {
         return ((y + mOffsetY + 4) >> 3) + int(progress * mOverlayHeight);
     }
+    bool PrepareProjectedPath(const RenderGeometry::Perspective& projection, CPoint relativeOrigin,
+        CPoint position, int64_t& areaBudget);
+    void ResetProjectedPath();
     bool m_wrapAfter = false;
     bool HasNativeOutline() const;
     CRect DrawNativeOutline(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int y, int time, int fade,
@@ -274,6 +278,14 @@ public:
     int m_verticalProfile = 0, m_verticalDirection = 0, m_verticalAnchor = 0;
     double m_verticalSpacing = 0, m_verticalColumnGap = 0;
     bool MakeVerticalLines(int height, CSize& bounds);
+    std::unique_ptr<RenderGeometry::Pins> m_perspectivePins;
+    std::unique_ptr<RenderGeometry::Perspective> m_perspective;
+    CPoint m_perspectiveOrigin = CPoint(INT_MIN, INT_MIN);
+    int m_perspectiveLeft = 0;
+    REFERENCE_TIME m_perspectiveTime = 0;
+    bool m_perspectiveJitter = false;
+    void ConfigurePerspective();
+    void PreparePerspective(CPoint anchor, CPoint origin, const CRect& bounds, REFERENCE_TIME timestamp);
     double m_clipOffsetX = 0, m_clipOffsetY = 0;
     bool m_hasRectClip = false;
     struct LineAlignment { int first, inherited, full; };

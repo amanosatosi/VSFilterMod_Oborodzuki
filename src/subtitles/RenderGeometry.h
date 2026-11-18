@@ -21,6 +21,66 @@ inline double Cross(Point a, Point b) { return a.x * b.y - a.y * b.x; }
 inline double Length(Point p) { return std::hypot(p.x, p.y); }
 inline Point Normal(Point p) { return {-p.y, p.x}; }
 
+using Pins = std::array<double, 8>;
+
+inline const Pins& IdentityPins()
+{
+    static const Pins corners{{0, 0, 1, 0, 1, 1, 0, 1}};
+    return corners;
+}
+
+class Perspective
+{
+    Point origin, horizontal, vertical;
+    double depthX = 0, depthY = 0, width = 0, height = 0;
+
+public:
+    bool Set(const Pins& pins, double w, double h)
+    {
+        if (!(w > 0 && h > 0)) return false;
+        std::array<Point, 4> p;
+        for (size_t i = 0; i < p.size(); ++i)
+        {
+            p[i] = {pins[2 * i], pins[2 * i + 1]};
+            if (!std::isfinite(p[i].x) || !std::isfinite(p[i].y) ||
+                std::abs(p[i].x) > 16 || std::abs(p[i].y) > 16)
+                return false;
+        }
+        const double orientation = Cross(p[1] - p[0], p[2] - p[1]);
+        if (std::abs(orientation) < 1e-10) return false;
+        for (size_t i = 1; i < p.size(); ++i)
+        {
+            const auto a = p[(i + 1) % 4] - p[i];
+            const auto b = p[(i + 2) % 4] - p[(i + 1) % 4];
+            if (Cross(a, b) * std::copysign(1., orientation) < 1e-10) return false;
+        }
+        const auto a = p[1] - p[2], b = p[3] - p[2], difference = p[0] - p[1] + p[2] - p[3];
+        const double determinant = Cross(a, b);
+        depthX = Cross(difference, b) / determinant;
+        depthY = Cross(a, difference) / determinant;
+        if (1 + depthX < 1e-6 || 1 + depthY < 1e-6 || 1 + depthX + depthY < 1e-6)
+            return false;
+        origin = p[0];
+        horizontal = p[1] * (1 + depthX) - p[0];
+        vertical = p[3] * (1 + depthY) - p[0];
+        width = w;
+        height = h;
+        return true;
+    }
+
+    bool Map(Point in, Point& out) const
+    {
+        const double u = in.x / width, v = in.y / height;
+        const double denominator = 1 + u * depthX + v * depthY;
+        if (!std::isfinite(denominator) || denominator < 1e-6) return false;
+        const auto destination = (origin + horizontal * u + vertical * v) * (1 / denominator);
+        out = {destination.x * width, destination.y * height};
+        return std::abs(out.x) <= 2097152 && std::abs(out.y) <= 2097152;
+    }
+
+    bool Affine() const { return depthX == 0 && depthY == 0; }
+};
+
 class Curve
 {
     std::vector<Point> points;

@@ -642,6 +642,110 @@ void CWord::RotateLayoutOutline()
     }
 }
 
+void CWord::ResetProjectedPath()
+{
+    m_projectedPath = m_fDrawn = false;
+    if (m_pOpaqueBox) m_pOpaqueBox->ResetProjectedPath();
+    m_undecoratedGlyphs.reset();
+}
+
+bool CWord::PrepareProjectedPath(const RenderGeometry::Perspective& projection, CPoint relativeOrigin,
+    CPoint position, int64_t& areaBudget)
+{
+    if (m_fLineBreak || m_fWhiteSpaceChar) return true;
+    ResetProjectedPath();
+    if (!CreatePath()) return false;
+    if (m_layoutPlacement && m_layoutPlacement->rotate) RotateLayoutOutline();
+    Transform(CPoint(relativeOrigin.x * 8, relativeOrigin.y * 8));
+    using namespace RenderGeometry;
+    const Point offset{position.x * 8., position.y * 8.};
+    std::vector<POINT> points;
+    std::vector<BYTE> types;
+    points.reserve(mPathPoints);
+    types.reserve(mPathPoints);
+    LONG left = LONG_MAX, right = LONG_MIN, top = LONG_MAX, bottom = LONG_MIN;
+    const auto append = [&](Point projected, BYTE type) {
+        if (points.size() >= 65536) return false;
+        const POINT p{LONG(std::lround(projected.x - offset.x)), LONG(std::lround(projected.y - offset.y))};
+        left = (std::min)(left, p.x);
+        right = (std::max)(right, p.x);
+        top = (std::min)(top, p.y);
+        bottom = (std::max)(bottom, p.y);
+        points.push_back(p);
+        types.push_back(type);
+        return true;
+    };
+    const auto source = [&](size_t i) {
+        return Point{double(mpPathPoints[i].x), double(mpPathPoints[i].y)} + offset;
+    };
+    const auto distance = [](Point p, Point a, Point b) {
+        const auto chord = b - a;
+        const auto lengthSquared = Dot(chord, chord);
+        const double t = lengthSquared > 0 ?
+            (std::max)(0., (std::min)(1., Dot(p - a, chord) / lengthSquared)) : 0.;
+        return Length(p - (a + chord * t));
+    };
+    const auto cubic = [&](auto&& self, Point a, Point b, Point c, Point d, int depth) -> bool {
+        Point pa, pb, pc, pd;
+        if (!projection.Map(a, pa) || !projection.Map(b, pb) || !projection.Map(c, pc) || !projection.Map(d, pd))
+            return false;
+        if (distance(pb, pa, pd) <= 2 && distance(pc, pa, pd) <= 2)
+            return append(pd, PT_LINETO);
+        if (depth == 14) return false;
+        const auto ab = (a+b)*.5, bc = (b+c)*.5, cd = (c+d)*.5;
+        const auto l = (ab+bc)*.5, r = (bc+cd)*.5, mid = (l+r)*.5;
+        return self(self, a, ab, l, mid, depth+1) && self(self, mid, r, cd, d, depth+1);
+    };
+    for (size_t i = 0; i < mPathPoints; ++i)
+    {
+        const auto type = mpPathTypes[i] & ~PT_CLOSEFIGURE;
+        if (!projection.Affine() && type == PT_BEZIERTO && i && i + 2 < mPathPoints)
+        {
+            if (!cubic(cubic, source(i - 1), source(i), source(i + 1), source(i + 2), 0)) return false;
+            types.back() |= mpPathTypes[i + 2] & PT_CLOSEFIGURE;
+            i += 2;
+        }
+        else if (!projection.Affine() && (type == PT_BSPLINETO || type == PT_BSPLINEPATCHTO))
+        {
+            const size_t lookback = type == PT_BSPLINETO ? 1 : 3;
+            if (i < lookback || i - lookback + 3 >= mPathPoints) return false;
+            const auto start = i - lookback;
+            const auto a = source(start), b = source(start + 1), c = source(start + 2), d = source(start + 3);
+            const auto first = (a + b*4 + c)*(1./6), last = (b + c*4 + d)*(1./6);
+            if (type == PT_BSPLINETO)
+            {
+                Point projected;
+                if (!projection.Map(first, projected) || !append(projected, PT_MOVETO)) return false;
+                i += 2;
+            }
+            if (!cubic(cubic, first, (b*2+c)*(1./3), (b+c*2)*(1./3), last, 0)) return false;
+        }
+        else
+        {
+            Point projected;
+            if (!projection.Map(source(i), projected) || !append(projected, mpPathTypes[i])) return false;
+        }
+    }
+    if (points.empty()) return true;
+    const int64_t rasterWidth = ((int64_t(right) - left) >> 6) + 16;
+    const int64_t rasterHeight = ((int64_t(bottom) - top) >> 6) + 16;
+    areaBudget -= rasterWidth * rasterHeight;
+    if (areaBudget < 0 || rasterWidth > 16384 || rasterHeight > 16384) return false;
+    m_projectedPath = CopyPath(points.data(), types.data(), points.size());
+    if (!m_projectedPath) return false;
+    if (m_style.borderStyle == 1 && (!CreateOpaqueBox() ||
+            !m_pOpaqueBox->PrepareProjectedPath(projection, relativeOrigin, position, areaBudget)))
+        return false;
+    if (m_style.decoration && m_style.decoration->Active() && (m_style.fUnderline || m_style.fStrikeOut))
+    {
+        m_undecoratedGlyphs = CreateUndecoratedWord();
+        if (m_undecoratedGlyphs &&
+            !m_undecoratedGlyphs->PrepareProjectedPath(projection, relativeOrigin, position, areaBudget))
+            return false;
+    }
+    return true;
+}
+
 bool CWord::CreateNativeOutline()
 {
     const auto& style = *m_style.nativeOutline;
@@ -915,6 +1019,12 @@ void CWord::Paint(CPoint p, CPoint org)
 
     if(!m_fDrawn)
     {
+#ifdef _VSMOD
+        const bool projected = m_projectedPath;
+        m_projectedPath = false;
+        if (!projected)
+        {
+#endif
         if(!CreatePath()) return;
 
 #ifdef _VSMOD
@@ -932,6 +1042,9 @@ void CWord::Paint(CPoint p, CPoint org)
 #else
         Transform(CPoint((org.x - p.x) * 8, (org.y - p.y) * 8));
 #endif
+#ifdef _VSMOD
+        }
+#endif
 
 #ifdef _VSMOD
         if(!ScanConvert(m_style.borderStyle == 3)) return;
@@ -942,9 +1055,12 @@ void CWord::Paint(CPoint p, CPoint org)
 #ifdef _VSMOD
         m_nativeMasks.reset();
         m_decorationMask.reset();
-        m_undecoratedGlyphs.reset();
-        if (m_style.decoration && m_style.decoration->Active() && (m_style.fUnderline || m_style.fStrikeOut))
-            m_undecoratedGlyphs = CreateUndecoratedWord();
+        if (!projected)
+        {
+            m_undecoratedGlyphs.reset();
+            if (m_style.decoration && m_style.decoration->Active() && (m_style.fUnderline || m_style.fStrikeOut))
+                m_undecoratedGlyphs = CreateUndecoratedWord();
+        }
         if (HasNativeOutline())
         {
             if (!CreateNativeOutline()) return;
@@ -3479,6 +3595,88 @@ void CSubtitle::CurveLines()
             place.tangent.x, place.tangent.y, place.center * 8, place.word->m_ascent * 8.);
     }
 }
+
+void CSubtitle::ConfigurePerspective()
+{
+    if (!m_perspectivePins || *m_perspectivePins == RenderGeometry::IdentityPins() ||
+        m_effects[EF_SCROLL] || m_effects[EF_BANNER])
+        return;
+    int left = 0, right = 0;
+    for (auto line = GetHeadPosition(); line;)
+    {
+        const auto* words = GetNext(line);
+        const int x = LineLeft(*words, 0);
+        left = (std::min)(left, x);
+        right = (std::max)(right, x + words->m_width);
+        for (auto position = words->GetHeadPosition(); position;)
+        {
+            const auto& style = words->GetNext(position)->m_style;
+            if (style.mod_rand.X || style.mod_rand.Y || style.mod_rand.Z)
+                return;
+#ifdef _LUA
+            if (!style.LuaBeforeTransformHandler.IsEmpty() || !style.LuaCustomTransformHandler.IsEmpty() ||
+                !style.LuaAfterTransformHandler.IsEmpty() || !style.LuaRendererHandler.IsEmpty())
+                return;
+#endif
+            m_perspectiveJitter |= style.mod_jitter.enabled;
+        }
+    }
+    auto projection = std::make_unique<RenderGeometry::Perspective>();
+    if (projection->Set(*m_perspectivePins, (right - left) * 8., m_rect.Height() * 8.))
+    {
+        m_perspectiveLeft = left;
+        m_perspective = std::move(projection);
+    }
+}
+
+void CSubtitle::PreparePerspective(CPoint anchor, CPoint origin, const CRect& bounds, REFERENCE_TIME timestamp)
+{
+    if (!m_perspective) return;
+    const int left = anchor.x + m_perspectiveLeft;
+    const CPoint relativeOrigin(origin.x - left, origin.y - bounds.top);
+    if (m_perspectiveOrigin == relativeOrigin && (!m_perspectiveJitter || m_perspectiveTime == timestamp))
+        return;
+    m_perspectiveOrigin = relativeOrigin;
+    m_perspectiveTime = timestamp;
+    int64_t area = 32 * 1024 * 1024;
+    const auto project = [&](CWord& word, CPoint position) {
+        if (word.m_fWhiteSpaceChar || word.m_fLineBreak) return true;
+        return word.PrepareProjectedPath(*m_perspective,
+            CPoint(origin.x - position.x, origin.y - position.y),
+            CPoint(position.x - left, position.y - bounds.top), area);
+    };
+    bool valid = true;
+    for (auto& box : m_eventBox)
+        if (!(valid = project(*box, CPoint(anchor.x, bounds.top)))) break;
+    int y = bounds.top;
+    for (auto line = GetHeadPosition(); valid && line;)
+    {
+        auto* words = GetNext(line);
+        int x = LineLeft(*words, anchor.x);
+        for (auto position = words->GetHeadPosition(); position;)
+        {
+            auto& word = *words->GetNext(position);
+            const auto& style = word.m_style;
+            const auto flat = CPoint(x - style.mod_horizontalSpace,
+                y + words->m_ascent - word.m_ascent - style.mod_verticalSpace);
+            if (!(valid = project(word, word.LayoutPosition(flat) + word.m_style.mod_jitter.getOffset(timestamp))))
+                break;
+            x += word.m_width;
+        }
+        y += words->m_ascent + words->m_descent;
+    }
+    if (!valid)
+    {
+        // Some words may still hold projected masks from the previous origin.
+        for (auto& box : m_eventBox) box->ResetProjectedPath();
+        for (auto line = GetHeadPosition(); line;)
+        {
+            auto* words = GetNext(line);
+            for (auto position = words->GetHeadPosition(); position;)
+                words->GetNext(position)->ResetProjectedPath();
+        }
+    }
+}
 #endif
 
 // CScreenLayoutAllocator
@@ -4786,6 +4984,8 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
 #ifdef _VSMOD // patch m006. moveable vector clip
         else if(!cmd.Find(L"movevc"))
             ;
+        else if (cmd == L"mpersp")
+            ;
 #endif
         else if(!cmd.Find(L"move"))
             ;
@@ -5057,6 +5257,30 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         CStringW p = params.size() > 0 ? params[0] : L"";
 
 #ifdef _VSMOD
+        if (cmd == L"mpersp")
+        {
+            auto pins = RenderGeometry::IdentityPins();
+            if (params.size() == pins.size())
+            {
+                bool valid = true;
+                for (size_t i = 0; i < pins.size(); ++i)
+                {
+                    auto value = params[i];
+                    value.Trim();
+                    const wchar_t* begin = value;
+                    wchar_t* end = nullptr;
+                    pins[i] = std::wcstod(begin, &end);
+                    if (begin == end || *end || !std::isfinite(pins[i])) { valid = false; break; }
+                }
+                if (!valid) continue;
+            }
+            else if (params.size() > 1 || !p.IsEmpty()) continue;
+            const auto& from = sub->m_perspectivePins ? *sub->m_perspectivePins : RenderGeometry::IdentityPins();
+            for (size_t i = 0; i < pins.size(); ++i)
+                pins[i] = CalcAnimation(pins[i], from[i], fAnimate);
+            sub->m_perspectivePins = std::make_unique<RenderGeometry::Pins>(pins);
+            continue;
+        }
         if (cmd == L"vert" || cmd == L"vtype" || cmd == L"vdir" || cmd == L"vsp" || cmd == L"vcolsp")
         {
             if (fAnimate || !sub->m_words.IsEmpty()) continue;
@@ -7395,6 +7619,7 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
             sub->m_fAnimated = true;
         sub->CreateEventBox(borderStyle, m_time, m_fScaledBAS);
     }
+    sub->ConfigurePerspective();
 #endif
 
     m_subtitleCache[entry] = sub;
@@ -7511,7 +7736,11 @@ static std::function<void()> PrepareEventGeometry(CSubtitle* subtitle, CPoint or
             else if (style.outlineWidthX + style.outlineWidthY > 0 &&
                 !(word->m_ktype == 2 && time < word->m_kstart))
                 layer = 3;
-            if (word->NeedsPreparation(position))
+            if (word->NeedsPreparation(position)
+#ifdef _VSMOD
+                || subtitle->m_perspective
+#endif
+                )
                 words.push_back({word, position, layer});
             x += word->m_width;
         }
@@ -7519,7 +7748,15 @@ static std::function<void()> PrepareEventGeometry(CSubtitle* subtitle, CPoint or
     }
     if (words.empty())
         return {};
-    return [words = std::move(words), transformOrigin] {
+    return [words = std::move(words), transformOrigin
+#ifdef _VSMOD
+        , subtitle, origin, rectangle, timestamp
+#endif
+        ] {
+#ifdef _VSMOD
+        if (subtitle->m_perspective)
+            subtitle->PreparePerspective(origin, transformOrigin, rectangle, timestamp);
+#endif
         for (const auto& prepared : words)
         {
 #if defined(_VSMOD) && defined(_LUA)
@@ -8188,6 +8425,10 @@ try
         }
         auto paint = [=, &spd]() mutable {
         PROFILE_RENDER_STAGE(EventPaint);
+#ifdef _VSMOD
+        if (s->m_perspective)
+            s->PreparePerspective(org, org2, r, rt);
+#endif
         CRect bbox2(0, 0, 0, 0);
         CPoint p, p2(0, r.top);
 

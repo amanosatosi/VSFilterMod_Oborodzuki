@@ -524,6 +524,34 @@ if ROUND3:
     for workers in (2, 4, 6, 8):
         assert benchmark(CANDIDATE, vertical, workers, "regression")["hashes"] == expected
 
+    bars = ("m 0 0 l 200 0 200 4 0 4 "
+            "m 0 55 l 200 55 200 65 0 65 m 0 116 l 200 116 200 120 0 120")
+    pin = r"\mpersp(0,0,1,0,.75,1,.25,1)"
+    perspective = write("projective-pins", [
+        (200, 200, r"\1c$white\p1" + pin, bars),
+        (580, 200, r"\1c$white\p1\mpersp(0,0,1,0,0,1,1,1)", bars),
+        (960, 200, r"\1c$white\p1" + pin + r"\mpersp()", bars),
+        (1340, 200, r"\1c$white\p1\t(0,1000," + pin + ")", bars),
+        (200, 570, r"\fs56\1c$white\2c$red\kf100\3grd(0,$blue,$green)"
+         r"\bord4\2bs4\shad3\blur.7\fad(300,300,$red,$blue+a)" + pin, "ABCD"),
+    ])
+    centers = {"warped": (200, 200), "crossed": (580, 200), "reset": (960, 200),
+               "animated": (1340, 200), "paint": (200, 570)}
+    playback("csri", CANDIDATE, perspective, ROOT / "perspective")
+    actual = captures(ROOT / "perspective", centers)
+    assert min(actual(60, "warped", 100, 80)) > 220
+    assert max(actual(60, "warped", 100, 60)) < 12, "Bilinear midpoint used as the perspective midpoint"
+    for case in ("reset", "crossed"):
+        assert min(actual(60, case, 100, 60)) > 220
+        assert max(actual(60, case, 100, 80)) < 12
+    assert min(actual(60, "animated", 100, 60)) > 220
+    assert min(actual(90, "animated", 100, 69)) > 220
+    assert min(actual(120, "animated", 100, 80)) > 220
+    assert any(actual(60, "paint", x, y)[0] > 180 for y in range(90) for x in range(200))
+    expected = benchmark(CANDIDATE, perspective, 1, "regression")["hashes"]
+    for workers in (2, 4, 6, 8):
+        assert benchmark(CANDIDATE, perspective, workers, "regression")["hashes"] == expected
+
 # Check old corner math against the validated VSFilterMod path rather than
 # requiring its different legacy bitmap geometry to agree with libass.
 playback("csri", Path("threading-baseline/renderer/renderer.dll").resolve(), grid, ROOT / "previous")
