@@ -1,0 +1,17 @@
+{
+  "windows_sdk": "10.0.26100.0\\",
+  "mangetsu": "60e06ef0d4535c5403f446fd46b996df4d0d2560",
+  "vcpkg": "f3419f137f1a1e79b33b880ae6845f873d87820b",
+  "ram_bytes": 17174360064,
+  "original": "808f492f2e6feb92c975cbed9faaa7b4272cfec5",
+  "baseline": "b31674c1341487b706712ecc213482562687781a",
+  "image_version": "20261112.366.7",
+  "candidate": "bddd225435297cbea272c079658a902122f17b8d",
+  "compiler_tools": "14.44.35207",
+  "image": "win22",
+  "cpu": {
+    "Name": "AMD EPYC 9V45 96-Core Processor                ",
+    "NumberOfCores": 2,
+    "NumberOfLogicalProcessors": 4
+  }
+}

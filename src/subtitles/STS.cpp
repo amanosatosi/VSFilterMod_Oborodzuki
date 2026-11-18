@@ -26,7 +26,15 @@
 #include <atlstr.h>
 
 #include "RealTextParser.h"
+#include <atomic>
 #include <fstream>
+
+static std::atomic<unsigned> subtitleFontRevision{0};
+
+unsigned SubtitleFontRevision()
+{
+    return subtitleFontRevision.load();
+}
 
 static long revcolor(long c)
 {
@@ -1341,8 +1349,11 @@ static bool LoadFont(CString& font)
             }
         }
 
-        AddFontResource(fn);
+        if (AddFontResource(fn) > 0)
+            ++subtitleFontRevision;
     }
+    else if (hFont)
+        ++subtitleFontRevision;
 
     return(true);
 }
@@ -1398,6 +1409,7 @@ void CMyLua::CreateLuaState()
 
 void CMyLua::LoadLuaFile(CString Filename)
 {
+    hasExternalLua = true;
     CStringA aFilename(Filename);
     LPSTR pszFilename = aFilename.GetBuffer(Filename.GetLength());
 
@@ -2369,6 +2381,7 @@ void CSimpleTextSubtitle::Copy(CSimpleTextSubtitle& sts)
 #ifdef _VSMOD
 #ifdef _LUA
     L = sts.L;
+    hasExternalLua = sts.hasExternalLua;
    LuaLog = sts.LuaLog;
 #endif
 #endif
@@ -4125,10 +4138,12 @@ void MOD_GRADIENT::clear()
     subpixy = 0;
     fadalpha = 0xFF;
     bodyIsGradAlpha = false;
+    img_alpha = 0;
+    clipDiff = 0;
 }
 
 #include <math.h>
-DWORD MOD_GRADIENT::getmixcolor(int tx, int ty, int i) // too slow T.T
+DWORD MOD_GRADIENT::getmixcolor(int tx, int ty, int i) const
 {
     DWORD colorb = 0;
     tx += xoffset;

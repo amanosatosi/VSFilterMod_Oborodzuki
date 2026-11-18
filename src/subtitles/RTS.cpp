@@ -20,18 +20,96 @@
  */
 
 #include "stdafx.h"
+#include "RenderProfile.h"
+#include <algorithm>
 #include <cmath>
 #include <math.h>
 #include <time.h>
+#include <map>
+#include <set>
+#include <tuple>
+#include <unordered_map>
+#include <vector>
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
+#include <exception>
+#include <functional>
+#include <mutex>
+#include <thread>
+#include <stdexcept>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include "RTS.h"
 
 #if defined (_VSMOD) && defined(_LUA)
 // path m012. Lua animation
 #endif
 
-// WARNING: this isn't very thread safe, use only one RTS a time.
-static HDC g_hDC;
-static int g_hDC_refcnt = 0;
+struct TextDeviceContext
+{
+    HDC dc = nullptr;
+    TextDeviceContext()
+    {
+        const HDC screen = GetDC(nullptr);
+        dc = CreateCompatibleDC(screen);
+        if (screen)
+            ReleaseDC(nullptr, screen);
+        if (!dc)
+            throw std::runtime_error("Could not create the subtitle GDI context");
+        SetGraphicsMode(dc, GM_ADVANCED);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, 0xffffff);
+        SetMapMode(dc, MM_TEXT);
+    }
+    ~TextDeviceContext() { if (dc) DeleteDC(dc); }
+    TextDeviceContext(const TextDeviceContext&) = delete;
+    TextDeviceContext& operator=(const TextDeviceContext&) = delete;
+};
+
+static thread_local HDC g_hDC = nullptr;
+
+class WorkerFilterScope
+{
+#ifdef _OPENMP
+    int previous = omp_get_max_threads();
+#endif
+public:
+    WorkerFilterScope()
+    {
+#ifdef _OPENMP
+        omp_set_num_threads(1);
+#endif
+    }
+    ~WorkerFilterScope()
+    {
+#ifdef _OPENMP
+        omp_set_num_threads(previous);
+#endif
+    }
+};
+
+class TextDeviceScope
+{
+    HDC previous;
+public:
+    explicit TextDeviceScope(HDC dc) : previous(g_hDC) { g_hDC = dc; }
+    ~TextDeviceScope() { g_hDC = previous; }
+};
+
+class SelectedTextFont
+{
+    HDC dc;
+    HFONT previous;
+
+public:
+    explicit SelectedTextFont(HFONT font) : dc(g_hDC), previous(SelectFont(dc, font)) {}
+    ~SelectedTextFont() { if (previous) SelectFont(dc, previous); }
+    explicit operator bool() const { return previous != nullptr; }
+    SelectedTextFont(const SelectedTextFont&) = delete;
+    SelectedTextFont& operator=(const SelectedTextFont&) = delete;
+};
 
 static long revcolor(long c)
 {
@@ -42,11 +120,19 @@ static long revcolor(long c)
 
 // CMyFont
 
-CMyFont::CMyFont(STSStyle& style)
+static LOGFONT TextLogFont(STSStyle& style)
 {
     LOGFONT lf;
     memset(&lf, 0, sizeof(lf));
-    lf <<= style;
+    // This renderer already expresses font height in its GDI path units.
+    // The generic style conversion queries screen DPI and computes a point
+    // height that would immediately be overwritten here.
+    lf.lfCharSet = style.charSet;
+    _tcsncpy_s(lf.lfFaceName, LF_FACESIZE, CString(style.fontName), _TRUNCATE);
+    lf.lfWeight = style.fontWeight;
+    lf.lfItalic = style.fItalic ? -1 : 0;
+    lf.lfUnderline = style.fUnderline ? -1 : 0;
+    lf.lfStrikeOut = style.fStrikeOut ? -1 : 0;
     lf.lfHeight = (LONG)(style.fontSize + 0.5);
     lf.lfOutPrecision = OUT_TT_PRECIS;
     lf.lfClipPrecision = CLIP_DEFAULT_PRECIS;
@@ -55,19 +141,444 @@ CMyFont::CMyFont(STSStyle& style)
 #ifdef _VSMOD // patch m007. symbol rotating
     lf.lfOrientation = (LONG)style.mod_fontOrient;
 #endif
+    return lf;
+}
 
+CMyFont::CMyFont(STSStyle& style) : CMyFont(TextLogFont(style))
+{
+}
+
+CMyFont::CMyFont(const LOGFONT& font)
+{
+    LOGFONT lf = font;
     if(!CreateFontIndirect(&lf))
     {
         _tcscpy(lf.lfFaceName, _T("Arial"));
         CreateFontIndirect(&lf);
     }
+}
 
-    HFONT hOldFont = SelectFont(g_hDC, *this);
-    TEXTMETRIC tm;
-    GetTextMetrics(g_hDC, &tm);
-    m_ascent = ((tm.tmAscent + 4) >> 3);
-    m_descent = ((tm.tmDescent + 4) >> 3);
-    SelectFont(g_hDC, hOldFont);
+struct TextGeometryKey
+{
+    LOGFONT font;
+    CStringW text;
+
+    bool operator==(const TextGeometryKey& other) const
+    {
+        return !memcmp(&font, &other.font, sizeof(font)) &&
+            text.GetLength() == other.text.GetLength() &&
+            !memcmp(text.GetString(), other.text.GetString(), text.GetLength() * sizeof(wchar_t));
+    }
+};
+
+struct TextGeometryHash
+{
+    size_t operator()(const TextGeometryKey& key) const
+    {
+        size_t hash = 2166136261u;
+        const auto* font = reinterpret_cast<const unsigned char*>(&key.font);
+        for (size_t i = 0; i < sizeof(key.font); ++i)
+            hash = (hash ^ font[i]) * 16777619u;
+        for (int i = 0; i < key.text.GetLength(); ++i)
+            hash = (hash ^ key.text[i]) * 16777619u;
+        return hash;
+    }
+};
+
+struct TextGeometry
+{
+    bool measured = false;
+    CSize extent;
+    int ascent = 0;
+    int descent = 0;
+    bool hasPath = false;
+    std::vector<POINT> points;
+    std::vector<BYTE> types;
+};
+
+struct TextGeometryCache
+{
+    std::unordered_map<TextGeometryKey, TextGeometry, TextGeometryHash> runs;
+    CRegKey machineFonts, userFonts;
+    FILETIME machineStamp{}, userStamp{};
+    unsigned embeddedRevision = 0;
+    size_t pathBytes = 0;
+    bool saturated = false;
+    using ClipKey = std::tuple<CStringW, int, int, double, double, bool>;
+    std::map<ClipKey, std::shared_ptr<BYTE>> clipMasks;
+    size_t clipBytes = 0;
+
+    void Clear()
+    {
+        runs.clear();
+        pathBytes = 0;
+        saturated = false;
+        clipMasks.clear();
+        clipBytes = 0;
+    }
+
+    void SaveClip(const ClipKey& key, const std::shared_ptr<BYTE>& pixels, size_t bytes)
+    {
+        constexpr size_t limit = 16 * 1024 * 1024;
+        if (bytes > limit)
+            return;
+        if (clipMasks.size() >= 8 || clipBytes + bytes > limit)
+        {
+            clipMasks.clear();
+            clipBytes = 0;
+        }
+        if (clipMasks.emplace(key, pixels).second)
+            clipBytes += bytes;
+    }
+
+    static bool FontStamp(HKEY root, CRegKey& key, FILETIME& stamp)
+    {
+        if (!key.m_hKey)
+        {
+            const LSTATUS result = key.Open(root,
+                _T("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts"), KEY_QUERY_VALUE);
+            if (result != ERROR_SUCCESS)
+                return result == ERROR_FILE_NOT_FOUND;
+        }
+        const auto result = RegQueryInfoKey(key.m_hKey, nullptr, nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, nullptr, nullptr, nullptr, &stamp);
+        if (result != ERROR_SUCCESS)
+            key.Close();
+        return result == ERROR_SUCCESS;
+    }
+
+    void StartFrame()
+    {
+        PROFILE_RENDER_STAGE(Cache);
+        const unsigned revision = SubtitleFontRevision();
+        FILETIME currentMachine{}, currentUser{};
+        if (!FontStamp(HKEY_LOCAL_MACHINE, machineFonts, currentMachine) ||
+            !FontStamp(HKEY_CURRENT_USER, userFonts, currentUser) ||
+            revision != embeddedRevision || CompareFileTime(&machineStamp, &currentMachine) ||
+            CompareFileTime(&userStamp, &currentUser) || saturated)
+            Clear();
+        embeddedRevision = revision;
+        machineStamp = currentMachine;
+        userStamp = currentUser;
+    }
+
+    TextGeometry& Get(const LOGFONT& font, const CStringW& text)
+    {
+        PROFILE_RENDER_STAGE(Cache);
+        TextGeometryKey key{font, text};
+        const auto found = runs.find(key);
+        if (found != runs.end())
+            return found->second;
+        if (runs.size() >= 512)
+            Clear();
+        return runs.emplace(std::move(key), TextGeometry{}).first->second;
+    }
+
+    void SavePath(TextGeometry& run, const POINT* points, const BYTE* types, size_t count)
+    {
+        PROFILE_RENDER_STAGE(Cache);
+        constexpr size_t maxBytes = 4 * 1024 * 1024;
+        if (count > maxBytes / (sizeof(POINT) + sizeof(BYTE)))
+            return;
+        const size_t bytes = count * (sizeof(POINT) + sizeof(BYTE));
+        if (pathBytes + bytes > maxBytes)
+        {
+            saturated = true;
+            return;
+        }
+        if (count)
+        {
+            run.points.assign(points, points + count);
+            run.types.assign(types, types + count);
+        }
+        run.hasPath = true;
+        pathBytes += bytes;
+    }
+};
+
+// Words are short-lived. Bind the renderer's cache only while that renderer
+// is laying out and painting a frame, including nested calls on this thread.
+static thread_local TextGeometryCache* activeTextGeometry = nullptr;
+
+class TextGeometryScope
+{
+    TextGeometryCache* previous;
+public:
+    explicit TextGeometryScope(TextGeometryCache* cache) : previous(activeTextGeometry)
+    {
+        activeTextGeometry = cache;
+    }
+    ~TextGeometryScope() { activeTextGeometry = previous; }
+};
+
+class EventWorkerPool
+{
+    std::vector<std::thread> threads;
+    mutable std::mutex mutex;
+    std::condition_variable ready[7], finished;
+    const std::vector<std::function<void()>>* tasks = nullptr;
+    std::atomic<size_t> next{0};
+    size_t generation = 0;
+    unsigned pending = 0;
+    bool stopping = false;
+    std::exception_ptr failure;
+    unsigned workers = 1;
+    unsigned activeWorkers = 1;
+    bool needsTextContext = true;
+#ifdef OBORODZUKI_PROFILE
+    struct Sample
+    {
+        unsigned long long tasks = 0, busyNs = 0, wakeNs = 0, idleNs = 0, mutexNs = 0;
+        RenderProfile stages;
+        // Separate active counters without requiring over-aligned heap allocation.
+        char padding[64];
+    };
+    Sample samples[8];
+    EventWorkerStatistics stats;
+    RenderProfile::Clock::time_point published;
+    static unsigned long long Since(RenderProfile::Clock::time_point start)
+    {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(RenderProfile::Clock::now() - start).count();
+    }
+#endif
+
+    void RecordFailure()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!failure)
+            failure = std::current_exception();
+    }
+
+    void Drain(unsigned worker)
+    {
+        const WorkerFilterScope filterThreads;
+        for (;;)
+        {
+            const size_t index = next.fetch_add(1, std::memory_order_relaxed);
+            if (index >= tasks->size())
+                return;
+#ifdef OBORODZUKI_PROFILE
+            const auto started = RenderProfile::Clock::now();
+#endif
+            try { (*tasks)[index](); }
+            catch (...) { RecordFailure(); }
+#ifdef OBORODZUKI_PROFILE
+            ++samples[worker].tasks;
+            samples[worker].busyNs += Since(started);
+#endif
+        }
+    }
+
+    void Worker(size_t observed, unsigned index)
+    {
+        std::unique_ptr<TextDeviceContext> dc;
+        std::unique_ptr<TextGeometryCache> geometry;
+        for (;;)
+        {
+            bool useTextContext;
+            {
+#ifdef OBORODZUKI_PROFILE
+                const auto acquiring = RenderProfile::Clock::now();
+#endif
+                std::unique_lock<std::mutex> lock(mutex);
+#ifdef OBORODZUKI_PROFILE
+                samples[index].mutexNs += Since(acquiring);
+                const auto waiting = RenderProfile::Clock::now();
+#endif
+                ready[index - 1].wait(lock, [&] {
+                    return stopping || (generation != observed && index < activeWorkers);
+                });
+#ifdef OBORODZUKI_PROFILE
+                samples[index].idleNs += Since(waiting);
+#endif
+                if (stopping)
+                    return;
+                observed = generation;
+                useTextContext = needsTextContext;
+            }
+            try
+            {
+#ifdef OBORODZUKI_PROFILE
+                samples[index].wakeNs += Since(published);
+                render_profile() = RenderProfile{};
+                samples[index].stages = RenderProfile{};
+#endif
+                if (useTextContext)
+                {
+                    if (!dc)
+                        dc = std::make_unique<TextDeviceContext>();
+                    if (!geometry)
+                        geometry = std::make_unique<TextGeometryCache>();
+                    geometry->StartFrame();
+                    const TextDeviceScope deviceScope(dc->dc);
+                    const TextGeometryScope geometryScope(geometry.get());
+                    Drain(index);
+                }
+                else
+                    Drain(index);
+#ifdef OBORODZUKI_PROFILE
+                samples[index].stages = render_profile();
+#endif
+            }
+            catch (...) { RecordFailure(); }
+            {
+#ifdef OBORODZUKI_PROFILE
+                const auto acquiring = RenderProfile::Clock::now();
+#endif
+                std::lock_guard<std::mutex> lock(mutex);
+#ifdef OBORODZUKI_PROFILE
+                samples[index].mutexNs += Since(acquiring);
+#endif
+                if (--pending == 0)
+                    finished.notify_one();
+            }
+        }
+    }
+
+public:
+    enum class Batch { Preparation, Capture, Blend };
+
+    EventWorkerPool()
+    {
+        SYSTEM_INFO system{};
+        GetSystemInfo(&system);
+        workers = (std::min)(4u, (std::max)(1u, unsigned(system.dwNumberOfProcessors)));
+        wchar_t option[16]{};
+        const DWORD length = GetEnvironmentVariableW(L"OBORODZUKI_WORKERS", option, 16);
+        if (length && length < 16)
+        {
+            wchar_t* end = nullptr;
+            const auto count = wcstoul(option, &end, 10);
+            if (end != option && !*end && count >= 1 && count <= 8)
+                workers = unsigned(count);
+        }
+    }
+
+    ~EventWorkerPool()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        for (auto& wake : ready)
+            wake.notify_one();
+        for (auto& thread : threads)
+            thread.join();
+    }
+
+    bool CanParallelize(size_t events) const { return workers > 1 && events >= 4; }
+
+    void Run(const std::vector<std::function<void()>>& work, Batch batch = Batch::Preparation,
+        unsigned blendLimit = 1)
+    {
+        const auto available = batch == Batch::Blend
+            ? (std::min)(work.size(), size_t(blendLimit)) : work.size() / 2;
+        const unsigned desiredWorkers = unsigned((std::min)(size_t(workers), available));
+        if (desiredWorkers < 2)
+        {
+            for (const auto& task : work)
+                task();
+            return;
+        }
+        // Thread creation failure leaves the existing pool usable.
+        while (threads.size() + 1 < desiredWorkers)
+        {
+            const size_t observed = generation;
+            const unsigned index = unsigned(threads.size()) + 1;
+            try { threads.emplace_back([this, observed, index] { Worker(observed, index); }); }
+            catch (const std::system_error&) { break; }
+        }
+#ifdef OBORODZUKI_PROFILE
+        const auto dispatched = RenderProfile::Clock::now();
+#endif
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+#ifdef OBORODZUKI_PROFILE
+            stats.mutexNs += Since(dispatched);
+#endif
+            tasks = &work;
+            next.store(0, std::memory_order_relaxed);
+            activeWorkers = (std::min)(desiredWorkers, unsigned(threads.size()) + 1);
+            needsTextContext = batch != Batch::Blend;
+            pending = activeWorkers - 1;
+            failure = nullptr;
+            ++generation;
+#ifdef OBORODZUKI_PROFILE
+            published = RenderProfile::Clock::now();
+#endif
+        }
+        for (unsigned i = 0; i + 1 < activeWorkers; ++i)
+            ready[i].notify_one();
+#ifdef OBORODZUKI_PROFILE
+        stats.dispatchNs += Since(dispatched);
+        constexpr auto glyph = static_cast<unsigned>(RenderStage::GlyphPath);
+        constexpr auto hit = static_cast<unsigned>(RenderStage::GlyphPathHit);
+        const auto callerRequests = render_profile().calls[glyph];
+        const auto callerHits = render_profile().calls[hit];
+#endif
+        Drain(0);
+#ifdef OBORODZUKI_PROFILE
+        const auto waiting = RenderProfile::Clock::now();
+#endif
+        std::unique_lock<std::mutex> lock(mutex);
+#ifdef OBORODZUKI_PROFILE
+        stats.mutexNs += Since(waiting);
+#endif
+        finished.wait(lock, [&] { return pending == 0; });
+        tasks = nullptr;
+#ifdef OBORODZUKI_PROFILE
+        stats.waitNs += Since(waiting);
+        if (batch == Batch::Blend)
+        {
+            stats.blendNs += Since(dispatched);
+            ++stats.blendBatches;
+        }
+        else
+            stats.preparationNs += Since(dispatched);
+        ++stats.batches;
+        stats.tasks += work.size();
+        stats.glyphRequests[0] += render_profile().calls[glyph] - callerRequests;
+        stats.glyphHits[0] += render_profile().calls[hit] - callerHits;
+        for (unsigned worker = 1; worker < activeWorkers; ++worker)
+        {
+            stats.glyphRequests[worker] += samples[worker].stages.calls[glyph];
+            stats.glyphHits[worker] += samples[worker].stages.calls[hit];
+            for (unsigned stage = 0; stage < static_cast<unsigned>(RenderStage::Count); ++stage)
+            {
+                render_profile().ns[stage] += samples[worker].stages.ns[stage];
+                render_profile().calls[stage] += samples[worker].stages.calls[stage];
+            }
+        }
+#endif
+        if (failure)
+            std::rethrow_exception(failure);
+    }
+
+    EventWorkerStatistics Statistics() const
+    {
+#ifdef OBORODZUKI_PROFILE
+        std::lock_guard<std::mutex> lock(mutex);
+        auto result = stats;
+        for (unsigned index = 0; index < 8; ++index)
+        {
+            const auto& sample = samples[index];
+            result.busyNs += sample.busyNs;
+            result.wakeNs += sample.wakeNs;
+            result.tasksByWorker[index] = sample.tasks;
+            result.busyByWorkerNs[index] = sample.busyNs;
+            result.idleNs += sample.idleNs;
+            result.mutexNs += sample.mutexNs;
+        }
+        return result;
+#else
+        return {};
+#endif
+    }
+};
+
+EventWorkerStatistics CRenderedTextSubtitle::WorkerStatistics() const
+{
+    return m_eventWorkers ? m_eventWorkers->Statistics() : EventWorkerStatistics{};
 }
 
 // CWord
@@ -85,11 +596,14 @@ CWord::CWord(STSStyle& style, CStringW str, int ktype, int kstart, int kend, dou
     {
         m_fWhiteSpaceChar = m_fLineBreak = true;
     }
+}
 
-    CMyFont font(m_style);
-    m_ascent = (int)(m_style.fontScaleY / 100 * font.m_ascent);
-    m_descent = (int)(m_style.fontScaleY / 100 * font.m_descent);
-    m_width = 0;
+void CWord::MeasureSelectedFont()
+{
+    TEXTMETRIC metrics{};
+    GetTextMetrics(g_hDC, &metrics);
+    m_ascent = int(m_style.fontScaleY / 100 * ((metrics.tmAscent + 4) >> 3));
+    m_descent = int(m_style.fontScaleY / 100 * ((metrics.tmDescent + 4) >> 3));
 }
 
 CWord::~CWord()
@@ -176,6 +690,7 @@ void CWord::Paint(CPoint p, CPoint org)
 #ifdef _LUA
 void CWord::CustomTransform(CPoint org, CString F, int Layer)
 {
+    PROFILE_RENDER_STAGE(Transform);
     CStringA Func(F);
     // Calculate size:
     int minx = INT_MAX, miny = INT_MAX, maxx = -INT_MAX, maxy = -INT_MAX;
@@ -283,6 +798,7 @@ void CWord::CustomTransform(CPoint org, CString F, int Layer)
 
 void CWord::Transform(CPoint org)
 {
+    PROFILE_RENDER_STAGE(Transform);
     double scalex = isOpaqueBox ? 1 : m_style.fontScaleX / 100;
     double scaley = isOpaqueBox ? 1 : m_style.fontScaleY / 100;
     const double xzoomf = m_scalex * 20000.0;
@@ -690,58 +1206,80 @@ bool CWord::CreateOpaqueBox()
 CText::CText(STSStyle& style, CStringW str, int ktype, int kstart, int kend, double scalex, double scaley)
     : CWord(style, str, ktype, kstart, kend, scalex, scaley)
 {
-    if(m_str == L" ")
-    {
+    PROFILE_RENDER_STAGE(TextMeasure);
+    if (m_str == L" ")
         m_fWhiteSpaceChar = true;
+
+    const bool measureCharacters = m_style.fontSpacing || (long)GetVersion() < 0;
+    const auto logFont = TextLogFont(m_style);
+    auto* geometry = !measureCharacters && activeTextGeometry && m_str.GetLength() <= 128
+        ? &activeTextGeometry->Get(logFont, m_str) : nullptr;
+#ifdef _VSMOD
+    const double angle = m_style.mod_fontOrient * 3.1415926 / 1800;
+    const double cosOrientation = abs(cos(angle)), sinOrientation = abs(sin(angle));
+#endif
+    const auto applyMetrics = [&](int ascent, int descent) {
+        m_ascent = int(m_style.fontScaleY / 100 * ascent);
+        m_descent = int(m_style.fontScaleY / 100 * descent);
+    };
+    const auto measureWidth = [&](const CSize& extent) {
+#ifdef _VSMOD
+        return extent.cx * cosOrientation + extent.cy * sinOrientation;
+#else
+        return double(extent.cx);
+#endif
+    };
+    if (geometry && geometry->measured)
+    {
+        PROFILE_RENDER_STAGE(TextMeasureHit);
+        applyMetrics(geometry->ascent, geometry->descent);
+        m_width = int(m_style.fontScaleX / 100 * int(measureWidth(geometry->extent)) + 4) >> 3;
+        return;
     }
 
-    CMyFont font(m_style);
-
-    HFONT hOldFont = SelectFont(g_hDC, font);
-
-#ifdef _VSMOD // patch m007. symbol rotating
-    double t = (double)m_style.mod_fontOrient * 3.1415926 / 1800;
-#endif
-    if(m_style.fontSpacing || (long)GetVersion() < 0)
+    PROFILE_RENDER_STAGE(GdiMetrics);
+    CMyFont font(logFont);
+    const SelectedTextFont selected(font);
+    TEXTMETRIC metrics{};
+    const bool hasMetrics = !!GetTextMetrics(g_hDC, &metrics);
+    const int ascent = (metrics.tmAscent + 4) >> 3;
+    const int descent = (metrics.tmDescent + 4) >> 3;
+    applyMetrics(ascent, descent);
+    if (measureCharacters)
     {
-        bool bFirstPath = true;
-
-        for(LPCWSTR s = m_str; *s; s++)
+        for (LPCWSTR s = m_str; *s; ++s)
         {
             CSize extent;
-            if(!GetTextExtentPoint32W(g_hDC, s, 1, &extent))
+            if (!GetTextExtentPoint32W(g_hDC, s, 1, &extent))
             {
-                SelectFont(g_hDC, hOldFont);
                 ASSERT(0);
                 return;
             }
-#ifdef _VSMOD // patch m007. symbol rotating
-            m_width += (int)(extent.cx * abs(cos(t)) + extent.cy * abs(sin(t)) + m_style.fontSpacing);
+#ifdef _VSMOD
+            m_width += int(measureWidth(extent) + m_style.fontSpacing);
 #else
-            m_width += extent.cx + (int)m_style.fontSpacing;
+            m_width += extent.cx + int(m_style.fontSpacing);
 #endif
         }
-//			m_width -= (int)m_style.fontSpacing; // TODO: subtract only at the end of the line
     }
     else
     {
         CSize extent;
-        if(!GetTextExtentPoint32W(g_hDC, m_str, wcslen(str), &extent))
+        if (!GetTextExtentPoint32W(g_hDC, m_str, wcslen(str), &extent))
         {
-            SelectFont(g_hDC, hOldFont);
             ASSERT(0);
             return;
         }
-#ifdef _VSMOD // patch m007. symbol rotating
-        m_width += (int)(extent.cx * abs(cos(t)) + extent.cy * abs(sin(t)));
-#else
-        m_width += extent.cx;
-#endif
+        m_width = int(measureWidth(extent));
+        if (geometry && hasMetrics && selected && font.GetSafeHandle())
+        {
+            geometry->extent = extent;
+            geometry->ascent = ascent;
+            geometry->descent = descent;
+            geometry->measured = true;
+        }
     }
-
-    m_width = (int)(m_style.fontScaleX / 100 * m_width + 4) >> 3;
-
-    SelectFont(g_hDC, hOldFont);
+    m_width = int(m_style.fontScaleX / 100 * m_width + 4) >> 3;
 }
 
 CWord* CText::Copy()
@@ -763,13 +1301,25 @@ bool CText::Append(CWord* w)
 
 bool CText::CreatePath()
 {
-    CMyFont font(m_style);
+    PROFILE_RENDER_STAGE(GlyphPath);
+    const bool measureCharacters = m_style.fontSpacing || (long)GetVersion() < 0;
+    const auto logFont = TextLogFont(m_style);
+    auto* geometry = !measureCharacters && activeTextGeometry && m_str.GetLength() <= 128
+        ? &activeTextGeometry->Get(logFont, m_str) : nullptr;
+    if (geometry && geometry->hasPath)
+    {
+        PROFILE_RENDER_STAGE(GlyphPathHit);
+        if (CopyPath(geometry->points.data(), geometry->types.data(), geometry->points.size()))
+            return true;
+    }
 
-    HFONT hOldFont = SelectFont(g_hDC, font);
+    PROFILE_RENDER_STAGE(GdiPath);
+    CMyFont font(logFont);
+    const SelectedTextFont selected(font);
 
     int width = 0;
 
-    if(m_style.fontSpacing || (long)GetVersion() < 0)
+    if(measureCharacters)
     {
         bool bFirstPath = true;
 
@@ -778,7 +1328,6 @@ bool CText::CreatePath()
             CSize extent;
             if(!GetTextExtentPoint32W(g_hDC, s, 1, &extent))
             {
-                SelectFont(g_hDC, hOldFont);
                 ASSERT(0);
                 return(false);
             }
@@ -796,17 +1345,17 @@ bool CText::CreatePath()
         CSize extent;
         if(!GetTextExtentPoint32W(g_hDC, m_str, m_str.GetLength(), &extent))
         {
-            SelectFont(g_hDC, hOldFont);
             ASSERT(0);
             return(false);
         }
 
-        BeginPath(g_hDC);
-        TextOutW(g_hDC, 0, 0, m_str, m_str.GetLength());
-        EndPath(g_hDC);
+        const bool begun = BeginPath(g_hDC);
+        const bool drawn = !!TextOutW(g_hDC, 0, 0, m_str, m_str.GetLength());
+        const bool ended = EndPath(g_hDC);
+        if (geometry && !geometry->hasPath && begun && drawn && ended && selected &&
+            font.GetSafeHandle() && (!mPathPoints || (mpPathPoints && mpPathTypes)))
+            activeTextGeometry->SavePath(*geometry, mpPathPoints, mpPathTypes, mPathPoints);
     }
-
-    SelectFont(g_hDC, hOldFont);
 
     return(true);
 }
@@ -817,6 +1366,10 @@ CPolygon::CPolygon(STSStyle& style, CStringW str, int ktype, int kstart, int ken
     : CWord(style, str, ktype, kstart, kend, scalex, scaley)
     , m_scalex(scalex), m_scaley(scaley), m_baseline(baseline)
 {
+    CMyFont font(m_style);
+    HFONT oldFont = SelectFont(g_hDC, font);
+    MeasureSelectedFont();
+    SelectFont(g_hDC, oldFont);
     ParseStr();
 }
 
@@ -1135,10 +1688,39 @@ void CClipper::ParseLuaTable(STSStyle& style, CPoint & pos, CPoint & org)
 #endif
     : CPolygon(STSStyle(), str, 0, 0, 0, scalex, scaley, 0)
 {
+    PROFILE_RENDER_STAGE(Mask);
     m_size.cx = m_size.cy = 0;
     m_pAlphaMask = NULL;
 
-    if(size.cx < 0 || size.cy < 0 || !(m_pAlphaMask = DNew BYTE[size.cx*size.cy])) return;
+    if (size.cx < 0 || size.cy < 0)
+        return;
+    const size_t maskBytes = size_t(size.cx) * size.cy;
+    bool cacheMask = activeTextGeometry && str.GetLength() <= 1024 &&
+        std::isfinite(scalex) && std::isfinite(scaley) && maskBytes <= 16 * 1024 * 1024;
+#if defined(_VSMOD) && defined(_LUA)
+    cacheMask = cacheMask && LuaStyle.IsEmpty();
+#endif
+    const TextGeometryCache::ClipKey key(str, size.cx, size.cy, scalex, scaley, inverse);
+    if (cacheMask)
+    {
+        const auto found = activeTextGeometry->clipMasks.find(key);
+        if (found != activeTextGeometry->clipMasks.end())
+        {
+            m_maskStorage = found->second;
+            m_pAlphaMask = m_maskStorage.get();
+            m_size = size;
+            m_inverse = inverse;
+#if defined(_VSMOD) && defined(_LUA)
+            this->L = L;
+            this->LuaLog = LuaLog;
+            this->LuaStyle = LuaStyle;
+            m_entry = entry;
+#endif
+            return;
+        }
+    }
+    m_maskStorage = std::shared_ptr<BYTE>(DNew BYTE[maskBytes], std::default_delete<BYTE[]>());
+    m_pAlphaMask = m_maskStorage.get();
 
 #if defined (_VSMOD) && defined(_LUA)
     this->L = L;
@@ -1245,12 +1827,25 @@ void CClipper::ParseLuaTable(STSStyle& style, CPoint & pos, CPoint & org)
         for(ptrdiff_t i = size.cx * size.cy; i > 0; --i, ++dst)
             *dst = 0x40 - *dst; // mask is 6 bit
     }
+    if (cacheMask)
+        activeTextGeometry->SaveClip(key, m_maskStorage, maskBytes);
 }
 
 CClipper::~CClipper()
 {
-    if(m_pAlphaMask) delete [] m_pAlphaMask;
     m_pAlphaMask = NULL;
+}
+
+void CClipper::MakeMaskWritable()
+{
+    if (m_maskStorage && !m_maskStorage.unique())
+    {
+        const size_t bytes = size_t(m_size.cx) * m_size.cy;
+        auto pixels = std::shared_ptr<BYTE>(DNew BYTE[bytes], std::default_delete<BYTE[]>());
+        memcpy(pixels.get(), m_pAlphaMask, bytes);
+        m_maskStorage = std::move(pixels);
+        m_pAlphaMask = m_maskStorage.get();
+    }
 }
 
 CWord* CClipper::Copy()
@@ -1761,6 +2356,7 @@ CLine* CSubtitle::GetNextLine(POSITION& pos, int maxwidth)
 
 void CSubtitle::CreateClippers(CSize size)
 {
+    PROFILE_RENDER_STAGE(Mask);
     size.cx >>= 3;
     size.cy >>= 3;
 
@@ -1782,6 +2378,7 @@ void CSubtitle::CreateClippers(CSize size)
             if(!m_pClipper) return;
         }
 
+        m_pClipper->MakeMaskWritable();
         int da = (64 << 8) / width;
         BYTE* am = m_pClipper->m_pAlphaMask;
 
@@ -1824,6 +2421,7 @@ void CSubtitle::CreateClippers(CSize size)
             if(!m_pClipper) return;
         }
 
+        m_pClipper->MakeMaskWritable();
         int da = (64 << 8) / height;
         int a = 0;
         int k = m_effects[EF_SCROLL]->param[0] >> 3;
@@ -1883,6 +2481,7 @@ void CSubtitle::CreateClippers(CSize size)
 
 void CSubtitle::MakeLines(CSize size, CRect marginRect)
 {
+    PROFILE_RENDER_STAGE(Layout);
     CSize spaceNeeded(0, 0);
 
     bool fFirstLine = true;
@@ -1930,6 +2529,7 @@ void CScreenLayoutAllocator::Empty()
 
 void CScreenLayoutAllocator::AdvanceToSegment(int segment, const CAtlArray<int>& sa)
 {
+    PROFILE_RENDER_STAGE(Collision);
     POSITION pos = m_subrects.GetHeadPosition();
     while(pos)
     {
@@ -1957,6 +2557,7 @@ void CScreenLayoutAllocator::AdvanceToSegment(int segment, const CAtlArray<int>&
 
 CRect CScreenLayoutAllocator::AllocRect(CSubtitle* s, int segment, int entry, int layer, int collisions)
 {
+    PROFILE_RENDER_STAGE(Collision);
     // TODO: handle collisions == 1 (reversed collisions)
 
     POSITION pos = m_subrects.GetHeadPosition();
@@ -2015,31 +2616,61 @@ CRect CScreenLayoutAllocator::AllocRect(CSubtitle* s, int segment, int entry, in
 
 // CRenderedTextSubtitle
 
+struct OverrideTag {
+    CStringW rawCommand;
+    CStringW command;
+    std::vector<CStringW> parameters;
+    int rawCount;
+};
+
+using OverrideTags = std::vector<OverrideTag>;
+
+struct OverrideTagCache {
+    std::map<CStringW, std::shared_ptr<const OverrideTags>> blocks;
+    size_t characters = 0;
+
+    std::shared_ptr<const OverrideTags> Get(const CStringW& text);
+#if defined(_VSMOD) && defined(_LUA)
+    bool defaultFunctionsKnown = false;
+    std::set<CStringW> defaultFunctions;
+
+    bool IsLuaFunction(CMyLua& owner, const CStringW& command)
+    {
+        if (owner.hasExternalLua)
+            return owner.LuaHasFunction(owner.L, command);
+        if (!defaultFunctionsKnown)
+        {
+            // Before any user code executes, the global function table comes
+            // exclusively from luaL_openlibs. Snapshot its actual names once.
+            const int top = lua_gettop(owner.L);
+            lua_pushnil(owner.L);
+            while (lua_next(owner.L, LUA_GLOBALSINDEX))
+            {
+                if (lua_type(owner.L, -2) == LUA_TSTRING && lua_isfunction(owner.L, -1))
+                    defaultFunctions.insert(CStringW(CStringA(lua_tostring(owner.L, -2))));
+                lua_pop(owner.L, 1);
+            }
+            lua_settop(owner.L, top);
+            defaultFunctionsKnown = true;
+        }
+        return defaultFunctions.find(command) != defaultFunctions.end();
+    }
+#endif
+};
+
+
 CRenderedTextSubtitle::CRenderedTextSubtitle(CCritSec* pLock, STSStyle *styleOverride, bool doOverride)
     : ISubPicProviderImpl(pLock), m_doOverrideStyle(doOverride), m_pStyleOverride(styleOverride)
 {
     m_size = CSize(0, 0);
 
-    if(g_hDC_refcnt == 0)
-    {
-        g_hDC = CreateCompatibleDC(NULL);
-#ifdef _VSMOD // patch m007. symbol rotating
-        SetGraphicsMode(g_hDC, GM_ADVANCED); // patch for lfOrientation
-#endif
-        SetBkMode(g_hDC, TRANSPARENT);
-        SetTextColor(g_hDC, 0xffffff);
-        SetMapMode(g_hDC, MM_TEXT);
-    }
-
-    g_hDC_refcnt++;
 }
 
 CRenderedTextSubtitle::~CRenderedTextSubtitle()
 {
+    m_eventWorkers.reset();
     Deinit();
 
-    g_hDC_refcnt--;
-    if(g_hDC_refcnt == 0) DeleteDC(g_hDC);
 }
 
 void CRenderedTextSubtitle::Copy(CSimpleTextSubtitle& sts)
@@ -2064,6 +2695,8 @@ void CRenderedTextSubtitle::Empty()
 void CRenderedTextSubtitle::OnChanged()
 {
     __super::OnChanged();
+    if (m_textGeometry)
+        m_textGeometry->Clear();
 
     POSITION pos = m_subtitleCache.GetStartPosition();
     while(pos)
@@ -2093,6 +2726,9 @@ bool CRenderedTextSubtitle::Init(CSize size, CRect vidrect)
 
 void CRenderedTextSubtitle::Deinit()
 {
+    m_overrideTags.reset();
+    m_textGeometry.reset();
+    m_textDC.reset();
     POSITION pos = m_subtitleCache.GetStartPosition();
     while(pos)
     {
@@ -2165,6 +2801,7 @@ void CRenderedTextSubtitle::ParseEffect(CSubtitle* sub, CString str)
 
 void CRenderedTextSubtitle::ParseString(CSubtitle* sub, CStringW str, STSStyle& style)
 {
+    PROFILE_RENDER_STAGE(Layout);
     if(!sub) return;
 
     str.Replace(L"\\N", L"\n");
@@ -2230,6 +2867,7 @@ void CRenderedTextSubtitle::ParseString(CSubtitle* sub, CStringW str, STSStyle& 
 
 void CRenderedTextSubtitle::ParsePolygon(CSubtitle* sub, CStringW str, STSStyle& style)
 {
+    PROFILE_RENDER_STAGE(Layout);
     if(!sub || !str.GetLength() || !m_nPolygon) return;
 
     if(CWord* w = DNew CPolygon(style, str, m_ktype, m_kstart, m_kend, sub->m_scalex / (1 << (m_nPolygon - 1)), sub->m_scaley / (1 << (m_nPolygon - 1)), m_polygonBaselineOffset))
@@ -2416,12 +3054,9 @@ void CRenderedTextSubtitle::ParseLuaTable(CSubtitle* sub, STSStyle& style)
 }
 #endif
 
-bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org, bool fAnimate)
+static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& str)
 {
-    if(!sub) return(false);
-
-    int nTags = 0, nUnrecognizedTags = 0;
-
+    auto result = std::make_shared<OverrideTags>();
     for(int i = 0, j; (j = str.Find('\\', i)) >= 0; i = j)
     {
         CStringW cmd;
@@ -2429,7 +3064,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         cmd.Trim();
         if(cmd.IsEmpty()) continue;
 
-        CAtlArray<CStringW> params;
+        std::vector<CStringW> params;
 
         if(str[j] == '(')
         {
@@ -2451,24 +3086,211 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 if(i >= 0 && (j < 0 || i < j))
                 {
                     CStringW s = param.Left(i).Trim();
-                    if(!s.IsEmpty()) params.Add(s);
+                    if(!s.IsEmpty()) params.push_back(s);
                     param = i + 1 < param.GetLength() ? param.Mid(i + 1) : L"";
                 }
                 else
                 {
                     param.Trim();
-                    if(!param.IsEmpty()) params.Add(param);
+                    if(!param.IsEmpty()) params.push_back(param);
                     param.Empty();
                 }
             }
         }
 
+        const CStringW rawCommand = cmd;
+        const int rawCount = static_cast<int>(params.size());
+        if(!cmd.Find(L"1c") || !cmd.Find(L"2c") || !cmd.Find(L"3c") || !cmd.Find(L"4c"))
+            params.push_back(cmd.Mid(2).Trim(L"&H")), cmd = cmd.Left(2);
+        else if(!cmd.Find(L"1a") || !cmd.Find(L"2a") || !cmd.Find(L"3a") || !cmd.Find(L"4a"))
+            params.push_back(cmd.Mid(2).Trim(L"&H")), cmd = cmd.Left(2);
+#ifdef _VSMOD // patch m010. png background
+        else if(!cmd.Find(L"1img") || !cmd.Find(L"2img") || !cmd.Find(L"3img") || !cmd.Find(L"4img"))
+            ;//params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
+#endif
+#ifdef _VSMOD // patch m004. gradient colors
+        else if(!cmd.Find(L"1vc") || !cmd.Find(L"2vc") || !cmd.Find(L"3vc") || !cmd.Find(L"4vc"))
+            ;//params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+        else if(!cmd.Find(L"1va") || !cmd.Find(L"2va") || !cmd.Find(L"3va") || !cmd.Find(L"4va"))
+            ;//params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+#endif
+        else if(!cmd.Find(L"alpha"))
+            params.push_back(cmd.Mid(5).Trim(L"&H")), cmd = cmd.Left(5);
+        else if(!cmd.Find(L"an"))
+            params.push_back(cmd.Mid(2)), cmd = cmd.Left(2);
+        else if(!cmd.Find(L"a"))
+            params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+        else if(!cmd.Find(L"blur"))
+            params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
+        else if(!cmd.Find(L"bord"))
+            params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
+        else if(!cmd.Find(L"be"))
+            params.push_back(cmd.Mid(2)), cmd = cmd.Left(2);
+#ifdef _VSMOD
+        else if (!cmd.Find(L"blend")) // vpatch v003. blending mode
+            params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
+#endif
+        else if(!cmd.Find(L"b"))
+            params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+        else if(!cmd.Find(L"clip"))
+            ;
+        else if(!cmd.Find(L"c"))
+            params.push_back(cmd.Mid(1).Trim(L"&H")), cmd = cmd.Left(1);
+#ifdef _VSMOD // patch m008. distort
+        else if(!cmd.Find(L"distort"))
+            ;
+#endif
+        else if(!cmd.Find(L"fade"))
+            ;
+        else if(!cmd.Find(L"fe"))
+            params.push_back(cmd.Mid(2)), cmd = cmd.Left(2);
+        else if(!cmd.Find(L"fn"))
+            params.push_back(cmd.Mid(2)), cmd = cmd.Left(2);
+        else if(!cmd.Find(L"frx") || !cmd.Find(L"fry") || !cmd.Find(L"frz"))
+            params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+#ifdef _VSMOD // patch m007. symbol rotating
+        else if(!cmd.Find(L"frs"))
+            params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+#endif
+        else if(!cmd.Find(L"fax") || !cmd.Find(L"fay"))
+            params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+        else if(!cmd.Find(L"fr"))
+            params.push_back(cmd.Mid(2)), cmd = cmd.Left(2);
+        else if(!cmd.Find(L"fscx") || !cmd.Find(L"fscy"))
+            params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
+        else if(!cmd.Find(L"fsc"))
+            params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+        else if(!cmd.Find(L"fsp"))
+            params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+#ifdef _VSMOD// patch m001. Vertical fontspacing
+        else if(!cmd.Find(L"fsvp"))
+            params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
+        else if (!cmd.Find(L"fshp"))// vpatch v002. Horizontal fontspacing
+            params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
+#endif
+        else if(!cmd.Find(L"fs"))
+            params.push_back(cmd.Mid(2)), cmd = cmd.Left(2);
+        else if(!cmd.Find(L"iclip"))
+            ;
+        else if(!cmd.Find(L"i"))
+            params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+#ifdef _VSMOD // patch m011. jitter
+        else if(!cmd.Find(L"jitter"))
+            ;
+#endif
+        else if(!cmd.Find(L"kt") || !cmd.Find(L"kf") || !cmd.Find(L"ko"))
+            params.push_back(cmd.Mid(2)), cmd = cmd.Left(2);
+        else if(!cmd.Find(L"k") || !cmd.Find(L"K"))
+            params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+#ifdef _VSMOD // patch m012. add lua animation
+        else if(!cmd.Find(L"lua"))
+            ;
+#endif
+#ifdef _VSMOD // patch m005. add some move types
+        else if(!cmd.Find(L"mover"))	// radial move
+            ;
+        else if(!cmd.Find(L"moves3"))	// square spline
+            ;
+        else if(!cmd.Find(L"moves4"))	// cubic spline
+            ;
+#endif
+#ifdef _VSMOD // patch m006. moveable vector clip
+        else if(!cmd.Find(L"movevc"))
+            ;
+#endif
+        else if(!cmd.Find(L"move"))
+            ;
+        else if(!cmd.Find(L"org"))
+            ;
+        else if(!cmd.Find(L"pbo"))
+            params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+        else if(!cmd.Find(L"pos"))
+            ;
+        else if(!cmd.Find(L"p"))
+            params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+        else if(!cmd.Find(L"q"))
+            params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+#ifdef _VSMOD // patch m003. random text points
+        else if(!cmd.Find(L"rndx") || !cmd.Find(L"rndy") || !cmd.Find(L"rndz") || !cmd.Find(L"rnds"))
+            params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
+        else if(!cmd.Find(L"rnd"))
+            params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+#endif
+        else if(!cmd.Find(L"r"))
+            params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+        else if(!cmd.Find(L"shad"))
+            params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
+        else if(!cmd.Find(L"s"))
+            params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+        else if(!cmd.Find(L"t"))
+            ;
+        else if(!cmd.Find(L"u"))
+            params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+        else if(!cmd.Find(L"xbord"))
+            params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
+        else if(!cmd.Find(L"xshad"))
+            params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
+        else if(!cmd.Find(L"ybord"))
+            params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
+        else if(!cmd.Find(L"yshad"))
+            params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
+        else if (!cmd.Find(L"xblur"))
+            params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
+        else if (!cmd.Find(L"yblur"))
+            params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
+#ifdef _VSMOD // patch m002. Z-coord
+        else if(!cmd.Find(L"z"))
+            params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+        else if(!cmd.Find(L"ortho")) // vpatch v001. ortho
+            params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
+#endif
+        result->push_back({rawCommand, cmd, std::move(params), rawCount});
+    }
+    return result;
+}
+
+std::shared_ptr<const OverrideTags> OverrideTagCache::Get(const CStringW& text)
+{
+    const size_t length = text.GetLength();
+    if (length > 1024)
+        return TokenizeOverrideTags(text);
+
+    const auto found = blocks.find(text);
+    if (found != blocks.end())
+        return found->second;
+
+    auto tags = TokenizeOverrideTags(text);
+    if (blocks.size() >= 1024 || characters + length > 128 * 1024)
+    {
+        blocks.clear();
+        characters = 0;
+    }
+    blocks.emplace(text, tags);
+    characters += length;
+    return tags;
+}
+
+bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org, bool fAnimate)
+{
+    PROFILE_RENDER_STAGE(Overrides);
+    if (!sub)
+        return false;
+
+    if (!m_overrideTags)
+        m_overrideTags = std::make_unique<OverrideTagCache>();
+    // A nested transform can rotate the cache while this block is being applied.
+    const auto tags = m_overrideTags->Get(str);
+    for (const auto& tag : *tags)
+    {
+        const auto& cmd = tag.command;
+        const auto& params = tag.parameters;
 #ifdef _LUA
         // Direct function call!
-        CStringA Func(cmd);
-        if(LuaHasFunction(L, cmd))
+        if(m_overrideTags->IsLuaFunction(*this, tag.rawCommand))
         {
+            hasExternalLua = true;
             // Find function =D
+            const CStringA Func(tag.rawCommand);
             lua_getglobal(L, Func);
 
             // Create line table
@@ -2492,12 +3314,12 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     lua_pop(L, 1);
             }
             // Push arguments
-            for(int arg = 0; arg < params.GetCount(); arg++)
+            for(int arg = 0; arg < tag.rawCount; arg++)
             {
                 CStringA Param(params[arg]);
-                lua_pushstring(L, Param); 
+                lua_pushstring(L, Param);
             }
-            if (lua_pcall(L, params.GetCount() + 1, 1, 0) != 0)
+            if (lua_pcall(L, tag.rawCount + 1, 1, 0) != 0)
             {
                 // error
                 CString ErrorText = L"Error: ";
@@ -2519,160 +3341,8 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             }
             continue;
         }
-        else
 #endif
-        if(!cmd.Find(L"1c") || !cmd.Find(L"2c") || !cmd.Find(L"3c") || !cmd.Find(L"4c"))
-            params.Add(cmd.Mid(2).Trim(L"&H")), cmd = cmd.Left(2);
-        else if(!cmd.Find(L"1a") || !cmd.Find(L"2a") || !cmd.Find(L"3a") || !cmd.Find(L"4a"))
-            params.Add(cmd.Mid(2).Trim(L"&H")), cmd = cmd.Left(2);
-#ifdef _VSMOD // patch m010. png background
-        else if(!cmd.Find(L"1img") || !cmd.Find(L"2img") || !cmd.Find(L"3img") || !cmd.Find(L"4img"))
-            ;//params.Add(cmd.Mid(4)), cmd = cmd.Left(4);
-#endif
-#ifdef _VSMOD // patch m004. gradient colors
-        else if(!cmd.Find(L"1vc") || !cmd.Find(L"2vc") || !cmd.Find(L"3vc") || !cmd.Find(L"4vc"))
-            ;//params.Add(cmd.Mid(3)), cmd = cmd.Left(3);
-        else if(!cmd.Find(L"1va") || !cmd.Find(L"2va") || !cmd.Find(L"3va") || !cmd.Find(L"4va"))
-            ;//params.Add(cmd.Mid(3)), cmd = cmd.Left(3);
-#endif
-        else if(!cmd.Find(L"alpha"))
-            params.Add(cmd.Mid(5).Trim(L"&H")), cmd = cmd.Left(5);
-        else if(!cmd.Find(L"an"))
-            params.Add(cmd.Mid(2)), cmd = cmd.Left(2);
-        else if(!cmd.Find(L"a"))
-            params.Add(cmd.Mid(1)), cmd = cmd.Left(1);
-        else if(!cmd.Find(L"blur"))
-            params.Add(cmd.Mid(4)), cmd = cmd.Left(4);
-        else if(!cmd.Find(L"bord"))
-            params.Add(cmd.Mid(4)), cmd = cmd.Left(4);
-        else if(!cmd.Find(L"be"))
-            params.Add(cmd.Mid(2)), cmd = cmd.Left(2);
-#ifdef _VSMOD
-        else if (!cmd.Find(L"blend")) // vpatch v003. blending mode
-            params.Add(cmd.Mid(5)), cmd = cmd.Left(5);
-#endif
-        else if(!cmd.Find(L"b"))
-            params.Add(cmd.Mid(1)), cmd = cmd.Left(1);
-        else if(!cmd.Find(L"clip"))
-            ;
-        else if(!cmd.Find(L"c"))
-            params.Add(cmd.Mid(1).Trim(L"&H")), cmd = cmd.Left(1);
-#ifdef _VSMOD // patch m008. distort
-        else if(!cmd.Find(L"distort"))
-            ;
-#endif
-        else if(!cmd.Find(L"fade"))
-            ;
-        else if(!cmd.Find(L"fe"))
-            params.Add(cmd.Mid(2)), cmd = cmd.Left(2);
-        else if(!cmd.Find(L"fn"))
-            params.Add(cmd.Mid(2)), cmd = cmd.Left(2);
-        else if(!cmd.Find(L"frx") || !cmd.Find(L"fry") || !cmd.Find(L"frz"))
-            params.Add(cmd.Mid(3)), cmd = cmd.Left(3);
-#ifdef _VSMOD // patch m007. symbol rotating
-        else if(!cmd.Find(L"frs"))
-            params.Add(cmd.Mid(3)), cmd = cmd.Left(3);
-#endif
-        else if(!cmd.Find(L"fax") || !cmd.Find(L"fay"))
-            params.Add(cmd.Mid(3)), cmd = cmd.Left(3);
-        else if(!cmd.Find(L"fr"))
-            params.Add(cmd.Mid(2)), cmd = cmd.Left(2);
-        else if(!cmd.Find(L"fscx") || !cmd.Find(L"fscy"))
-            params.Add(cmd.Mid(4)), cmd = cmd.Left(4);
-        else if(!cmd.Find(L"fsc"))
-            params.Add(cmd.Mid(3)), cmd = cmd.Left(3);
-        else if(!cmd.Find(L"fsp"))
-            params.Add(cmd.Mid(3)), cmd = cmd.Left(3);
-#ifdef _VSMOD// patch m001. Vertical fontspacing
-        else if(!cmd.Find(L"fsvp"))
-            params.Add(cmd.Mid(4)), cmd = cmd.Left(4);
-        else if (!cmd.Find(L"fshp"))// vpatch v002. Horizontal fontspacing
-            params.Add(cmd.Mid(4)), cmd = cmd.Left(4);
-#endif
-        else if(!cmd.Find(L"fs"))
-            params.Add(cmd.Mid(2)), cmd = cmd.Left(2);
-        else if(!cmd.Find(L"iclip"))
-            ;
-        else if(!cmd.Find(L"i"))
-            params.Add(cmd.Mid(1)), cmd = cmd.Left(1);
-#ifdef _VSMOD // patch m011. jitter
-        else if(!cmd.Find(L"jitter"))
-            ;
-#endif
-        else if(!cmd.Find(L"kt") || !cmd.Find(L"kf") || !cmd.Find(L"ko"))
-            params.Add(cmd.Mid(2)), cmd = cmd.Left(2);
-        else if(!cmd.Find(L"k") || !cmd.Find(L"K"))
-            params.Add(cmd.Mid(1)), cmd = cmd.Left(1);
-#ifdef _VSMOD // patch m012. add lua animation
-        else if(!cmd.Find(L"lua"))
-            ;
-#endif
-#ifdef _VSMOD // patch m005. add some move types
-        else if(!cmd.Find(L"mover"))	// radial move
-            ;
-        else if(!cmd.Find(L"moves3"))	// square spline
-            ;
-        else if(!cmd.Find(L"moves4"))	// cubic spline
-            ;
-#endif
-#ifdef _VSMOD // patch m006. moveable vector clip
-        else if(!cmd.Find(L"movevc"))
-            ;
-#endif
-        else if(!cmd.Find(L"move"))
-            ;
-        else if(!cmd.Find(L"org"))
-            ;
-        else if(!cmd.Find(L"pbo"))
-            params.Add(cmd.Mid(3)), cmd = cmd.Left(3);
-        else if(!cmd.Find(L"pos"))
-            ;
-        else if(!cmd.Find(L"p"))
-            params.Add(cmd.Mid(1)), cmd = cmd.Left(1);
-        else if(!cmd.Find(L"q"))
-            params.Add(cmd.Mid(1)), cmd = cmd.Left(1);
-#ifdef _VSMOD // patch m003. random text points
-        else if(!cmd.Find(L"rndx") || !cmd.Find(L"rndy") || !cmd.Find(L"rndz") || !cmd.Find(L"rnds"))
-            params.Add(cmd.Mid(4)), cmd = cmd.Left(4);
-        else if(!cmd.Find(L"rnd"))
-            params.Add(cmd.Mid(3)), cmd = cmd.Left(3);
-#endif
-        else if(!cmd.Find(L"r"))
-            params.Add(cmd.Mid(1)), cmd = cmd.Left(1);
-        else if(!cmd.Find(L"shad"))
-            params.Add(cmd.Mid(4)), cmd = cmd.Left(4);
-        else if(!cmd.Find(L"s"))
-            params.Add(cmd.Mid(1)), cmd = cmd.Left(1);
-        else if(!cmd.Find(L"t"))
-            ;
-        else if(!cmd.Find(L"u"))
-            params.Add(cmd.Mid(1)), cmd = cmd.Left(1);
-        else if(!cmd.Find(L"xbord"))
-            params.Add(cmd.Mid(5)), cmd = cmd.Left(5);
-        else if(!cmd.Find(L"xshad"))
-            params.Add(cmd.Mid(5)), cmd = cmd.Left(5);
-        else if(!cmd.Find(L"ybord"))
-            params.Add(cmd.Mid(5)), cmd = cmd.Left(5);
-        else if(!cmd.Find(L"yshad"))
-            params.Add(cmd.Mid(5)), cmd = cmd.Left(5);
-        else if (!cmd.Find(L"xblur"))
-            params.Add(cmd.Mid(5)), cmd = cmd.Left(5);
-        else if (!cmd.Find(L"yblur"))
-            params.Add(cmd.Mid(5)), cmd = cmd.Left(5);
-#ifdef _VSMOD // patch m002. Z-coord
-        else if(!cmd.Find(L"z"))
-            params.Add(cmd.Mid(1)), cmd = cmd.Left(1);
-        else if(!cmd.Find(L"ortho")) // vpatch v001. ortho
-            params.Add(cmd.Mid(5)), cmd = cmd.Left(5);
-#endif
-        else
-            nUnrecognizedTags++;
-
-        nTags++;
-
-        // TODO: call ParseStyleModifier(cmd, params, ..) and move the rest there
-
-        CStringW p = params.GetCount() > 0 ? params[0] : L"";
+        CStringW p = params.size() > 0 ? params[0] : L"";
 
         if(cmd == "1c" || cmd == L"2c" || cmd == L"3c" || cmd == L"4c")
         {
@@ -2746,7 +3416,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         {
             int i = cmd[0] - '1';
 
-            if(params.GetCount() >= 1)// file[,xoffset,yoffset[,angle]]
+            if(params.size() >= 1)// file[,xoffset,yoffset[,angle]]
             {
                 if(!fAnimate)
                 {
@@ -2793,7 +3463,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                         }
                     }
                 }
-                if(params.GetCount() >= 3)
+                if(params.size() >= 3)
                 {
                     style.mod_grad.b_images[i].xoffset = !p.IsEmpty()
                                                          ? CalcAnimation(wcstol(params[1], NULL, 10), style.mod_grad.b_images[i].xoffset, fAnimate)
@@ -2810,12 +3480,12 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         {
             int i = cmd[0] - '1';
 
-            if(params.GetCount() >= 4)
+            if(params.size() >= 4)
             {
                 DWORD c;
                 for(int j = 0; j < 4; j++)
                 {
-                    c = wcstol(params[j].Trim(L"&H"), NULL, 16);
+                    c = wcstol(CStringW(params[j]).Trim(L"&H"), NULL, 16);
                     style.mod_grad.color[i][j] = !p.IsEmpty()
                                                  ? (((int)CalcAnimation((c & 0xff0000) >> 16, style.mod_grad.color[i][j] & 0xff, fAnimate)) & 0xff
                                                     | ((int)CalcAnimation(c & 0xff00, style.mod_grad.color[i][j] & 0xff00, fAnimate)) & 0xff00
@@ -2840,12 +3510,12 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         {
             int i = cmd[0] - '1';
 
-            if(params.GetCount() >= 4)
+            if(params.size() >= 4)
             {
                 int a;
                 for(int j = 0; j < 4; j++)
                 {
-                    a = wcstol(params[j].Trim(L"&H"), NULL, 16);
+                    a = wcstol(CStringW(params[j]).Trim(L"&H"), NULL, 16);
                     style.mod_grad.alpha[i][j] = !p.IsEmpty()
                                                  ? (int)CalcAnimation(a, style.mod_grad.alpha[i][j], fAnimate) : org.mod_grad.alpha[i][j];
                 }
@@ -2954,7 +3624,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         {
             bool invert = (cmd == L"iclip");
 
-            if(params.GetCount() == 1 && !sub->m_pClipper)
+            if(params.size() == 1 && !sub->m_pClipper)
             {
 #if defined (_VSMOD) && defined(_LUA)
                 sub->m_pClipper = DNew CClipper(params[0], CSize(m_size.cx >> 3, m_size.cy >> 3), sub->m_scalex, sub->m_scaley, invert, style.LuaClipStyleHandler, L, LuaLog, m_entry);
@@ -2962,7 +3632,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 sub->m_pClipper = DNew CClipper(params[0], CSize(m_size.cx >> 3, m_size.cy >> 3), sub->m_scalex, sub->m_scaley, invert);
 #endif           
             }
-            else if(params.GetCount() == 2 && !sub->m_pClipper)
+            else if(params.size() == 2 && !sub->m_pClipper)
             {
                 int scale = max(wcstol(p, NULL, 10), 1);
 #if defined (_VSMOD) && defined(_LUA)
@@ -2971,7 +3641,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 sub->m_pClipper = DNew CClipper(params[1], CSize(m_size.cx >> 3, m_size.cy >> 3), sub->m_scalex / (1 << (scale - 1)), sub->m_scaley / (1 << (scale - 1)), invert);
 #endif       
             }
-            else if(params.GetCount() == 4)
+            else if(params.size() == 4)
             {
                 CRect r;
 
@@ -3036,7 +3706,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #ifdef _VSMOD // patch m008. distort
         else if(cmd == L"distort")
         {
-            if(params.GetCount() >= 6)
+            if(params.size() >= 6)
             {
                 DWORD c;
                 for(int j = 0; j < 3; j++)
@@ -3054,7 +3724,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #endif
         else if(cmd == L"fade" || cmd == L"fad")
         {
-            if(params.GetCount() == 7 && !sub->m_effects[EF_FADE])// {\fade(a1=param[0], a2=param[1], a3=param[2], t1=t[0], t2=t[1], t3=t[2], t4=t[3])
+            if(params.size() == 7 && !sub->m_effects[EF_FADE])// {\fade(a1=param[0], a2=param[1], a3=param[2], t1=t[0], t2=t[1], t3=t[2], t4=t[3])
             {
                 if(Effect* e = DNew Effect)
                 {
@@ -3066,7 +3736,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     sub->m_effects[EF_FADE] = e;
                 }
             }
-            else if(params.GetCount() == 2 && !sub->m_effects[EF_FADE]) // {\fad(t1=t[1], t2=t[2])
+            else if(params.size() == 2 && !sub->m_effects[EF_FADE]) // {\fad(t1=t[1], t2=t[2])
             {
                 if(Effect* e = DNew Effect)
                 {
@@ -3215,7 +3885,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #ifdef _VSMOD // patch m011. jitter
         else if(cmd == L"jitter") // {\jitter(left,right,up,down,period,[seed])}
         {
-            if((params.GetCount() >= 4))
+            if((params.size() >= 4))
             {
                 int left = (int)abs(wcstol(params[0], NULL, 10)) * 8;
                 int right = (int)abs(wcstol(params[1], NULL, 10)) * 8;
@@ -3227,11 +3897,11 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 style.mod_jitter.offset.right = CalcAnimation(right, style.mod_jitter.offset.right, fAnimate);
                 style.mod_jitter.enabled = true;
 
-                if(params.GetCount() >= 5)
+                if(params.size() >= 5)
                 {
                     int period = wcstol(params[4], NULL, 10) * 10000;
                     style.mod_jitter.period = CalcAnimation(period, style.mod_jitter.period, fAnimate);
-                    if(params.GetCount() >= 6)
+                    if(params.size() >= 6)
                     {
                         style.mod_jitter.seed = wcstol(params[5], NULL, 10);
                     }
@@ -3274,11 +3944,11 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #ifdef _LUA
         else if(cmd == L"lua")
         {
-            if(params.GetCount() > 0)
+            if(params.size() > 0)
             {
-                CStringA Func(params[0]);
                 if(LuaHasFunction(L, params[0]))
                 {
+                    hasExternalLua = true;
                     CStringA Func(params[0]);
                     lua_getglobal(L, Func);
                     // Create line table
@@ -3301,12 +3971,12 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                             lua_pop(L, 1);
                     }
                     // Push arguments
-                    for(int arg = 1; arg < params.GetCount(); arg++)
+                    for(int arg = 1; arg < params.size(); arg++)
                     {
                         CStringA Param(params[arg]);
                         lua_pushstring(L, Param); 
                     }
-                    if (lua_pcall(L, params.GetCount(), 1, 0) != 0)
+                    if (lua_pcall(L, params.size(), 1, 0) != 0)
                     {
                         // error
                         CString ErrorText = L"Error: ";
@@ -3334,7 +4004,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #ifdef _VSMOD // patch m005. add some move types
         else if(cmd == L"mover") // {\mover(x1,x2,x2,y2,alp1,alp2,r1,r2,t1,t2)}
         {
-            if((params.GetCount() == 8 || params.GetCount() == 10) && !sub->m_effects[EF_MOVE])
+            if((params.size() == 8 || params.size() == 10) && !sub->m_effects[EF_MOVE])
             {
                 if(Effect* e = new Effect)
                 {
@@ -3350,7 +4020,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 
                     e->t[0] = e->t[1] = -1;
 
-                    if(params.GetCount() == 10)
+                    if(params.size() == 10)
                     {
                         for(int i = 0; i < 2; i++)
                             e->t[i] = wcstol(params[8+i], NULL, 10);
@@ -3361,7 +4031,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         }
         else if(cmd == L"moves3") // {\moves3(x1,x2,x2,y2,x3,y3[,t1,t2])}
         {
-            if((params.GetCount() == 6 || params.GetCount() == 8) && !sub->m_effects[EF_MOVE])
+            if((params.size() == 6 || params.size() == 8) && !sub->m_effects[EF_MOVE])
             {
                 if(Effect* e = new Effect)
                 {
@@ -3374,7 +4044,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     e->param[6] = (int)(sub->m_scaley * wcstod(params[5], NULL) * 8); // y3
                     e->t[0] = e->t[1] = -1;
 
-                    if(params.GetCount() == 8)
+                    if(params.size() == 8)
                     {
                         for(int i = 0; i < 2; i++)
                             e->t[i] = wcstol(params[6+i], NULL, 10);
@@ -3385,7 +4055,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         }
         else if(cmd == L"moves4") // {\moves4(x1,x2,x2,y2,x3,y3,x4,y4[,t1,t2])}
         {
-            if((params.GetCount() == 8 || params.GetCount() == 10) && !sub->m_effects[EF_MOVE])
+            if((params.size() == 8 || params.size() == 10) && !sub->m_effects[EF_MOVE])
             {
                 if(Effect* e = new Effect)
                 {
@@ -3400,7 +4070,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     e->param[8] = (int)(sub->m_scaley * wcstod(params[7], NULL) * 8); // y4
                     e->t[0] = e->t[1] = -1;
 
-                    if(params.GetCount() == 10)
+                    if(params.size() == 10)
                     {
                         for(int i = 0; i < 2; i++)
                             e->t[i] = wcstol(params[8+i], NULL, 10);
@@ -3413,7 +4083,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #ifdef _VSMOD // patch m006. moveable vector clip
         else if(cmd == L"movevc")
         {
-            if((params.GetCount() == 2 || params.GetCount() == 4 || params.GetCount() == 6) && !sub->m_effects[EF_VECTCLP])
+            if((params.size() == 2 || params.size() == 4 || params.size() == 6) && !sub->m_effects[EF_VECTCLP])
             {
                 if(Effect* e = new Effect)
                 {
@@ -3421,12 +4091,12 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     e->param[1] = e->param[3] = (int)(sub->m_scaley * wcstod(params[1], NULL));
                     e->t[0] = e->t[1] = -1;
 
-                    if(params.GetCount() >= 4)
+                    if(params.size() >= 4)
                     {
                         e->param[2] = (int)(sub->m_scalex * wcstod(params[2], NULL));
                         e->param[3] = (int)(sub->m_scaley * wcstod(params[3], NULL));
                     }
-                    if(params.GetCount() == 6)
+                    if(params.size() == 6)
                     {
                         e->t[0] = (int)(sub->m_scalex * wcstod(params[4], NULL));
                         e->t[1] = (int)(sub->m_scaley * wcstod(params[5], NULL));
@@ -3438,7 +4108,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #endif
         else if(cmd == L"move") // {\move(x1=param[0], y1=param[1], x2=param[2], y2=param[3][, t1=t[0], t2=t[1]])}
         {
-            if((params.GetCount() == 4 || params.GetCount() == 6) && !sub->m_effects[EF_MOVE])
+            if((params.size() == 4 || params.size() == 6) && !sub->m_effects[EF_MOVE])
             {
                 if(Effect* e = DNew Effect)
                 {
@@ -3456,7 +4126,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #endif
                     e->t[0] = e->t[1] = -1;
 
-                    if(params.GetCount() == 6)
+                    if(params.size() == 6)
                     {
                         for(ptrdiff_t i = 0; i < 2; i++)
                             e->t[i] = wcstol(params[4+i], NULL, 10);
@@ -3469,7 +4139,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         else if(cmd == L"org") // {\org(x=param[0], y=param[1])}
         {
 #ifdef _VSMOD // patch f003. moving \org for some karaoke effects. part 1
-            if((params.GetCount() == 2 || params.GetCount() == 4 || params.GetCount() == 6) && !sub->m_effects[EF_ORG])
+            if((params.size() == 2 || params.size() == 4 || params.size() == 6) && !sub->m_effects[EF_ORG])
             {
                 if(Effect* e = new Effect)
                 {
@@ -3477,12 +4147,12 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     e->param[1] = e->param[3] = (int)(sub->m_scaley * wcstod(params[1], NULL) * 8);
                     e->t[0] = e->t[1] = -1;
 
-                    if(params.GetCount() >= 4)
+                    if(params.size() >= 4)
                     {
                         e->param[2] = (int)(sub->m_scalex * wcstod(params[2], NULL) * 8);
                         e->param[3] = (int)(sub->m_scaley * wcstod(params[3], NULL) * 8);
                     }
-                    if(params.GetCount() == 6)
+                    if(params.size() == 6)
                     {
                         e->t[0] = (int)(sub->m_scalex * wcstod(params[4], NULL) * 8);
                         e->t[1] = (int)(sub->m_scaley * wcstod(params[5], NULL) * 8);
@@ -3491,7 +4161,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 }
             }
 #else
-            if(params.GetCount() == 2 && !sub->m_effects[EF_ORG])
+            if(params.size() == 2 && !sub->m_effects[EF_ORG])
             {
                 if(Effect* e = DNew Effect)
                 {
@@ -3509,7 +4179,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         }
         else if(cmd == L"pos")
         {
-            if(params.GetCount() == 2 && !sub->m_effects[EF_MOVE])
+            if(params.size() == 2 && !sub->m_effects[EF_MOVE])
             {
                 if(Effect* e = DNew Effect)
                 {
@@ -3527,7 +4197,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 }
             }
 #ifdef _VSMOD // patch m002. Z-coord
-            else if(params.GetCount() == 3 && !sub->m_effects[EF_MOVE])
+            else if(params.size() == 3 && !sub->m_effects[EF_MOVE])
             {
                 if(Effect* e = DNew Effect)
                 {
@@ -3617,22 +4287,22 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             m_animStart = m_animEnd = 0;
             m_animAccel = 1;
 
-            if(params.GetCount() == 1)
+            if(params.size() == 1)
             {
                 p = params[0];
             }
-            else if(params.GetCount() == 2)
+            else if(params.size() == 2)
             {
                 m_animAccel = wcstod(params[0], NULL);
                 p = params[1];
             }
-            else if(params.GetCount() == 3)
+            else if(params.size() == 3)
             {
                 m_animStart = (int)wcstod(params[0], NULL);
                 m_animEnd = (int)wcstod(params[1], NULL);
                 p = params[2];
             }
-            else if(params.GetCount() == 4)
+            else if(params.size() == 4)
             {
                 m_animStart = wcstol(params[0], NULL, 10);
                 m_animEnd = wcstol(params[1], NULL, 10);
@@ -3736,12 +4406,12 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #endif
     }
 
-//	return(nUnrecognizedTags < nTags);
-    return(true); // there are ppl keeping coments inside {}, lets make them happy now
+    return true; // Preserve comments inside override blocks.
 }
 
 bool CRenderedTextSubtitle::ParseHtmlTag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org)
 {
+    PROFILE_RENDER_STAGE(Overrides);
     if(str.Find(L"!--") == 0)
         return(true);
 
@@ -3859,15 +4529,17 @@ bool CRenderedTextSubtitle::ParseHtmlTag(CSubtitle* sub, CStringW str, STSStyle&
 
 double CRenderedTextSubtitle::CalcAnimation(double dst, double src, bool fAnimate)
 {
+    PROFILE_RENDER_STAGE(Animation);
     int s = m_animStart ? m_animStart : 0;
     int e = m_animEnd ? m_animEnd : m_delay;
 
-    if(fabs(dst - src) >= 0.0001 && fAnimate)
+    if(fAnimate && fabs(dst - src) >= 0.0001)
     {
         if(m_time < s) dst = src;
         else if(s <= m_time && m_time < e)
         {
-            double t = pow(1.0 * (m_time - s) / (e - s), m_animAccel);
+            const double fraction = 1.0 * (m_time - s) / (e - s);
+            const double t = m_animAccel == 1.0 ? fraction : pow(fraction, m_animAccel);
             dst = (1 - t) * src + t * dst;
         }
 //		else dst = dst;
@@ -3878,18 +4550,13 @@ double CRenderedTextSubtitle::CalcAnimation(double dst, double src, bool fAnimat
 
 CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry)
 {
-    CSubtitle* sub;
-    if(m_subtitleCache.Lookup(entry, sub))
-    {
-        if(sub->m_fAnimated)
-        {
-            delete sub;
-            sub = NULL;
-        }
-        else return(sub);
-    }
+    PROFILE_RENDER_STAGE(Subtitle);
+    CSubtitle* previous = nullptr;
+    if (m_subtitleCache.Lookup(entry, previous) && !previous->m_fAnimated)
+        return previous;
 
-    sub = DNew CSubtitle();
+    std::unique_ptr<CSubtitle> owned(DNew CSubtitle());
+    CSubtitle* sub = owned.get();
     if(!sub) return(NULL);
 
 #if defined (_VSMOD) && defined(_LUA)
@@ -4067,8 +4734,8 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry)
     sub->MakeLines(m_size, marginRect);
 
     m_subtitleCache[entry] = sub;
-
-    return(sub);
+    delete previous;
+    return owned.release();
 }
 
 //
@@ -4130,13 +4797,165 @@ struct LSub
 
 static int lscomp(const void* ls1, const void* ls2)
 {
-    int ret = ((LSub*)ls1)->layer - ((LSub*)ls2)->layer;
-    if(!ret) ret = ((LSub*)ls1)->readorder - ((LSub*)ls2)->readorder;
-    return(ret);
+    const auto& a = *static_cast<const LSub*>(ls1);
+    const auto& b = *static_cast<const LSub*>(ls2);
+    if (a.layer != b.layer)
+        return a.layer < b.layer ? -1 : 1;
+    return (a.readorder > b.readorder) - (a.readorder < b.readorder);
+}
+
+struct PreparedWord
+{
+    CWord* word;
+    CPoint position;
+    int layer;
+};
+
+static std::function<void()> PrepareEventGeometry(CSubtitle* subtitle, CPoint origin,
+    CPoint transformOrigin, CRect rectangle, int time, REFERENCE_TIME timestamp)
+{
+    std::vector<PreparedWord> words;
+    int y = rectangle.top;
+    POSITION linePosition = subtitle->GetHeadPosition();
+    while (linePosition)
+    {
+        CLine* line = subtitle->GetNext(linePosition);
+        int x = subtitle->m_scrAlignment % 3 == 1 ? origin.x :
+            subtitle->m_scrAlignment % 3 == 0 ? origin.x - line->m_width : origin.x - line->m_width / 2;
+        POSITION wordPosition = line->GetHeadPosition();
+        while (wordPosition)
+        {
+            CWord* word = line->GetNext(wordPosition);
+            if (word->m_fLineBreak)
+                break;
+            const auto& style = word->m_style;
+            CPoint position(x, y + line->m_ascent - word->m_ascent);
+            int layer = 1;
+#ifdef _VSMOD
+            position.x -= style.mod_horizontalSpace;
+            position.y -= style.mod_verticalSpace;
+            position += word->m_style.mod_jitter.getOffset(timestamp);
+#endif
+            // Match the first Paint invocation, because its origin determines
+            // the path transform and its subpixel phase determines rasterization.
+            if (style.shadowDepthX != 0 || style.shadowDepthY != 0)
+            {
+                position.x += int(style.shadowDepthX + 0.5);
+                position.y += int(style.shadowDepthY + 0.5);
+                layer = 4;
+            }
+            else if (style.outlineWidthX + style.outlineWidthY > 0 &&
+                !(word->m_ktype == 2 && time < word->m_kstart))
+                layer = 3;
+            if (word->NeedsPreparation(position))
+                words.push_back({word, position, layer});
+            x += word->m_width;
+        }
+        y += line->m_ascent + line->m_descent;
+    }
+    if (words.empty())
+        return {};
+    return [words = std::move(words), transformOrigin] {
+        for (const auto& prepared : words)
+        {
+#if defined(_VSMOD) && defined(_LUA)
+            prepared.word->Paint(prepared.position, transformOrigin, prepared.layer);
+#else
+            prepared.word->Paint(prepared.position, transformOrigin);
+#endif
+        }
+    };
+}
+
+struct FramePaint
+{
+    std::function<CRect()> paint;
+    int entry;
+};
+
+static CRect PaintFrameBands(EventWorkerPool& pool, const std::vector<FramePaint>& events, int height)
+{
+    std::vector<OverlayDrawList> overlays(events.size());
+    std::vector<std::function<void()>> work;
+    work.reserve(events.size());
+    for (size_t i = 0; i < events.size(); ++i)
+    {
+        work.emplace_back([&, i] {
+            const OverlayCaptureScope capture(overlays[i]);
+            events[i].paint();
+        });
+    }
+    pool.Run(work, EventWorkerPool::Batch::Capture);
+
+    struct Band
+    {
+        int top = 0, bottom = 0;
+        uint64_t pixels = 0;
+        std::vector<const OverlayDraw*> draws;
+    };
+    // Bound the number of jobs for large surfaces. Smaller bands distribute
+    // overlapping effects independently of how many distinct events draw them.
+    const int bandHeight = (std::max)(32, (height - 1) / 48 + 1);
+    std::vector<Band> bands;
+    CRect bounds(0, 0, 0, 0);
+    uint64_t totalPixels = 0;
+    {
+        PROFILE_RENDER_STAGE(BandPlan);
+        bands.resize((height - 1) / bandHeight + 1);
+        for (const auto& event : overlays)
+        {
+            for (const auto& draw : event.draws)
+            {
+                bounds |= draw.bounds;
+                totalPixels += uint64_t(draw.bounds.Width()) * draw.bounds.Height();
+                for (int i = draw.bounds.top / bandHeight; i <= (draw.bounds.bottom - 1) / bandHeight; ++i)
+                {
+                    auto& band = bands[i];
+                    band.top = i * bandHeight;
+                    band.bottom = band.top + (std::min)(bandHeight, height - band.top);
+                    const int rows = (std::min)(int(draw.bounds.bottom), band.bottom) -
+                        (std::max)(int(draw.bounds.top), band.top);
+                    band.pixels += uint64_t(rows) * draw.bounds.Width();
+                    band.draws.push_back(&draw);
+                }
+            }
+        }
+    }
+
+    constexpr uint64_t pixelsPerWorker = 64 * 1024;
+    if (totalPixels < 2 * pixelsPerWorker)
+    {
+        for (const auto& event : overlays)
+            for (const auto& draw : event.draws)
+                draw.Blend(draw.bounds.top, draw.bounds.bottom);
+        return bounds;
+    }
+
+    // Each band visits commands in the original event and paint order. Only
+    // the scheduling order of whole, disjoint bands may change.
+    {
+        PROFILE_RENDER_STAGE(BandPlan);
+        std::sort(bands.begin(), bands.end(), [](const Band& a, const Band& b) { return a.pixels > b.pixels; });
+        work.clear();
+        for (const auto& band : bands)
+        {
+            if (band.draws.empty())
+                break;
+            work.emplace_back([job = &band] {
+                for (const auto* draw : job->draws)
+                    draw->Blend(job->top, job->bottom);
+            });
+        }
+    }
+    pool.Run(work, EventWorkerPool::Batch::Blend,
+        unsigned((std::min)(totalPixels / pixelsPerWorker, uint64_t(bands.size()))));
+    return bounds;
 }
 
 STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, double fps, RECT& bbox)
+try
 {
+    PROFILE_RENDER_STAGE(Frame);
     CRect bbox2(0, 0, 0, 0);
 
     if(m_size != CSize(spd.w * 8, spd.h * 8) || m_vidrect != CRect(spd.vidrect.left * 8, spd.vidrect.top * 8, spd.vidrect.right * 8, spd.vidrect.bottom * 8))
@@ -4146,12 +4965,25 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
 
     int segment;
 //    TRACE(_T("search started: %d"), t);
-    const STSSegment* stss = SearchSubs(t, fps, &segment);
+    const STSSegment* stss;
+    {
+        PROFILE_RENDER_STAGE(ActiveEvents);
+        stss = SearchSubs(t, fps, &segment);
+    }
 //    TRACE(_T("search complete: %d"), t);
     if(!stss) return S_FALSE;
 
+    if (!m_textGeometry)
+        m_textGeometry = std::make_unique<TextGeometryCache>();
+    if (!m_textDC)
+        m_textDC = std::make_unique<TextDeviceContext>();
+    const TextDeviceScope deviceScope(m_textDC->dc);
+    m_textGeometry->StartFrame();
+    const TextGeometryScope geometryScope(m_textGeometry.get());
+
     // clear any cached subs that current position is not in its bounds
     {
+        PROFILE_RENDER_STAGE(Cache);
         POSITION pos = m_subtitleCache.GetStartPosition();
         while(pos)
         {
@@ -4173,16 +5005,70 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
 
     CAtlArray<LSub> subs;
 
-    for(ptrdiff_t i = 0, j = stss->subs.GetCount(); i < j; i++)
     {
-        LSub ls;
-        ls.idx = stss->subs[i];
-        ls.layer = GetAt(stss->subs[i]).layer;
-        ls.readorder = GetAt(stss->subs[i]).readorder;
-        subs.Add(ls);
+        PROFILE_RENDER_STAGE(ActiveEvents);
+        for(ptrdiff_t i = 0, j = stss->subs.GetCount(); i < j; i++)
+        {
+            const int index = stss->subs[i];
+            const auto& entry = GetAt(index);
+            subs.Add({index, entry.layer, entry.readorder});
+        }
+        qsort(subs.GetData(), subs.GetCount(), sizeof(LSub), lscomp);
     }
 
-    qsort(subs.GetData(), subs.GetCount(), sizeof(LSub), lscomp);
+    if (!m_eventWorkers)
+        m_eventWorkers = std::make_unique<EventWorkerPool>();
+    bool parallel = m_eventWorkers->CanParallelize(subs.GetCount());
+#if defined(_VSMOD) && defined(_LUA)
+    // User scripts may observe callback order and shared Lua globals.
+    parallel = parallel && !hasExternalLua;
+    if (m_doOverrideStyle && m_pStyleOverride)
+    {
+        const auto& style = *m_pStyleOverride;
+        parallel = parallel && style.LuaCustomTransformHandler.IsEmpty() &&
+            style.LuaBeforeTransformHandler.IsEmpty() && style.LuaAfterTransformHandler.IsEmpty() &&
+            style.LuaRendererHandler.IsEmpty();
+    }
+#endif
+    const auto rowBytes = int64_t(spd.w) * int64_t(sizeof(DWORD));
+    const bool captureOverlays = parallel && subs.GetCount() >= 8 && spd.bpp == 32 &&
+        spd.w > 0 && spd.h > 0 && spd.bits &&
+        (int64_t(spd.pitch) >= rowBytes || int64_t(spd.pitch) <= -rowBytes);
+    std::vector<std::function<void()>> preparations;
+    std::vector<FramePaint> compositions;
+    if (parallel)
+    {
+        if (!captureOverlays)
+            preparations.reserve(subs.GetCount());
+        compositions.reserve(subs.GetCount());
+    }
+    const auto clearLuaData = [this](int entry) {
+#if defined (_VSMOD) && defined(_LUA)
+        CStringA index;
+        index.Format("sub_%d", entry);
+        lua_pushnil(L);
+        lua_setglobal(L, index);
+#endif
+    };
+    const auto finishEvents = [&](bool captureOverlays) {
+        if (captureOverlays)
+        {
+            bbox2 |= PaintFrameBands(*m_eventWorkers, compositions, spd.h);
+            for (const auto& event : compositions)
+                clearLuaData(event.entry);
+        }
+        else
+        {
+            m_eventWorkers->Run(preparations);
+            for (const auto& event : compositions)
+            {
+                bbox2 |= event.paint();
+                clearLuaData(event.entry);
+            }
+        }
+        preparations.clear();
+        compositions.clear();
+    };
 
     for(ptrdiff_t i = 0, j = subs.GetCount(); i < j; i++)
     {
@@ -4203,6 +5089,13 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
 
         CSubtitle* s = GetSubtitle(entry);
         if(!s) continue;
+#if defined(_VSMOD) && defined(_LUA)
+        if (parallel && hasExternalLua)
+        {
+            finishEvents(false);
+            parallel = false;
+        }
+#endif
 
         CRect clipRect = s->m_clip;
         CRect r = s->m_rect;
@@ -4229,6 +5122,7 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
         {
             if(!s->m_effects[k]) continue;
 
+            PROFILE_RENDER_STAGE(Animation);
             switch(k)
             {
             case EF_MOVE: // {\move(x1=param[0], y1=param[1], x2=param[2], y2=param[3], t1=t[0], t2=t[1])}
@@ -4488,6 +5382,9 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
 
                 fPosOverride = true;
             }
+            // Scroll has no vector-clip timing fields. Falling through reads
+            // uninitialized Effect::t values and enables an unintended mask move.
+            break;
 #ifdef _VSMOD // patch m006. moveable vector clip
             case EF_VECTCLP:
             {
@@ -4537,6 +5434,16 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
 
         if(!fOrgOverride) org2 = org;
 
+        const int eventTime = m_time;
+        if (parallel && !captureOverlays)
+        {
+            auto prepare = PrepareEventGeometry(s, org, org2, r, eventTime, rt);
+            if (prepare)
+                preparations.push_back(std::move(prepare));
+        }
+        auto paint = [=, &spd]() mutable {
+        PROFILE_RENDER_STAGE(EventPaint);
+        CRect bbox2(0, 0, 0, 0);
         CPoint p, p2(0, r.top);
 
         POSITION pos;
@@ -4562,26 +5469,26 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
 #ifdef _VSMOD // patch m006. moveable vector clip
             if(s->m_clipInverse)
             {
-                bbox2 |= l->PaintShadow(spd, iclipRect[0], pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
-                bbox2 |= l->PaintShadow(spd, iclipRect[1], pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
-                bbox2 |= l->PaintShadow(spd, iclipRect[2], pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
-                bbox2 |= l->PaintShadow(spd, iclipRect[3], pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
+                bbox2 |= l->PaintShadow(spd, iclipRect[0], pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
+                bbox2 |= l->PaintShadow(spd, iclipRect[1], pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
+                bbox2 |= l->PaintShadow(spd, iclipRect[2], pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
+                bbox2 |= l->PaintShadow(spd, iclipRect[3], pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
             }
             else
             {
-                bbox2 |= l->PaintShadow(spd, clipRect, pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
+                bbox2 |= l->PaintShadow(spd, clipRect, pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
             }
 #else
             if(s->m_clipInverse)
             {
-                bbox2 |= l->PaintShadow(spd, iclipRect[0], pAlphaMask, p, org2, m_time, alpha);
-                bbox2 |= l->PaintShadow(spd, iclipRect[1], pAlphaMask, p, org2, m_time, alpha);
-                bbox2 |= l->PaintShadow(spd, iclipRect[2], pAlphaMask, p, org2, m_time, alpha);
-                bbox2 |= l->PaintShadow(spd, iclipRect[3], pAlphaMask, p, org2, m_time, alpha);
+                bbox2 |= l->PaintShadow(spd, iclipRect[0], pAlphaMask, p, org2, eventTime, alpha);
+                bbox2 |= l->PaintShadow(spd, iclipRect[1], pAlphaMask, p, org2, eventTime, alpha);
+                bbox2 |= l->PaintShadow(spd, iclipRect[2], pAlphaMask, p, org2, eventTime, alpha);
+                bbox2 |= l->PaintShadow(spd, iclipRect[3], pAlphaMask, p, org2, eventTime, alpha);
             }
             else
             {
-                bbox2 |= l->PaintShadow(spd, clipRect, pAlphaMask, p, org2, m_time, alpha);
+                bbox2 |= l->PaintShadow(spd, clipRect, pAlphaMask, p, org2, eventTime, alpha);
             }
 #endif
             p.y += l->m_ascent + l->m_descent;
@@ -4601,26 +5508,26 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
 #ifdef _VSMOD // patch m006. moveable vector clip
             if(s->m_clipInverse)
             {
-                bbox2 |= l->PaintOutline(spd, iclipRect[0], pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
-                bbox2 |= l->PaintOutline(spd, iclipRect[1], pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
-                bbox2 |= l->PaintOutline(spd, iclipRect[2], pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
-                bbox2 |= l->PaintOutline(spd, iclipRect[3], pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
+                bbox2 |= l->PaintOutline(spd, iclipRect[0], pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
+                bbox2 |= l->PaintOutline(spd, iclipRect[1], pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
+                bbox2 |= l->PaintOutline(spd, iclipRect[2], pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
+                bbox2 |= l->PaintOutline(spd, iclipRect[3], pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
             }
             else
             {
-                bbox2 |= l->PaintOutline(spd, clipRect, pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
+                bbox2 |= l->PaintOutline(spd, clipRect, pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
             }
 #else
             if(s->m_clipInverse)
             {
-                bbox2 |= l->PaintOutline(spd, iclipRect[0], pAlphaMask, p, org2, m_time, alpha);
-                bbox2 |= l->PaintOutline(spd, iclipRect[1], pAlphaMask, p, org2, m_time, alpha);
-                bbox2 |= l->PaintOutline(spd, iclipRect[2], pAlphaMask, p, org2, m_time, alpha);
-                bbox2 |= l->PaintOutline(spd, iclipRect[3], pAlphaMask, p, org2, m_time, alpha);
+                bbox2 |= l->PaintOutline(spd, iclipRect[0], pAlphaMask, p, org2, eventTime, alpha);
+                bbox2 |= l->PaintOutline(spd, iclipRect[1], pAlphaMask, p, org2, eventTime, alpha);
+                bbox2 |= l->PaintOutline(spd, iclipRect[2], pAlphaMask, p, org2, eventTime, alpha);
+                bbox2 |= l->PaintOutline(spd, iclipRect[3], pAlphaMask, p, org2, eventTime, alpha);
             }
             else
             {
-                bbox2 |= l->PaintOutline(spd, clipRect, pAlphaMask, p, org2, m_time, alpha);
+                bbox2 |= l->PaintOutline(spd, clipRect, pAlphaMask, p, org2, eventTime, alpha);
             }
 #endif
             p.y += l->m_ascent + l->m_descent;
@@ -4640,44 +5547,56 @@ STDMETHODIMP CRenderedTextSubtitle::Render(SubPicDesc& spd, REFERENCE_TIME rt, d
 #ifdef _VSMOD // patch m006. moveable vector clip
             if(s->m_clipInverse)
             {
-                bbox2 |= l->PaintBody(spd, iclipRect[0], pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
-                bbox2 |= l->PaintBody(spd, iclipRect[1], pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
-                bbox2 |= l->PaintBody(spd, iclipRect[2], pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
-                bbox2 |= l->PaintBody(spd, iclipRect[3], pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
+                bbox2 |= l->PaintBody(spd, iclipRect[0], pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
+                bbox2 |= l->PaintBody(spd, iclipRect[1], pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
+                bbox2 |= l->PaintBody(spd, iclipRect[2], pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
+                bbox2 |= l->PaintBody(spd, iclipRect[3], pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
             }
             else
             {
-                bbox2 |= l->PaintBody(spd, clipRect, pAlphaMask, p, org2, m_time, alpha, mod_vc, rt);
+                bbox2 |= l->PaintBody(spd, clipRect, pAlphaMask, p, org2, eventTime, alpha, mod_vc, rt);
             }
 #else
             if(s->m_clipInverse)
             {
-                bbox2 |= l->PaintBody(spd, iclipRect[0], pAlphaMask, p, org2, m_time, alpha);
-                bbox2 |= l->PaintBody(spd, iclipRect[1], pAlphaMask, p, org2, m_time, alpha);
-                bbox2 |= l->PaintBody(spd, iclipRect[2], pAlphaMask, p, org2, m_time, alpha);
-                bbox2 |= l->PaintBody(spd, iclipRect[3], pAlphaMask, p, org2, m_time, alpha);
+                bbox2 |= l->PaintBody(spd, iclipRect[0], pAlphaMask, p, org2, eventTime, alpha);
+                bbox2 |= l->PaintBody(spd, iclipRect[1], pAlphaMask, p, org2, eventTime, alpha);
+                bbox2 |= l->PaintBody(spd, iclipRect[2], pAlphaMask, p, org2, eventTime, alpha);
+                bbox2 |= l->PaintBody(spd, iclipRect[3], pAlphaMask, p, org2, eventTime, alpha);
             }
             else
             {
-                bbox2 |= l->PaintBody(spd, clipRect, pAlphaMask, p, org2, m_time, alpha);
+                bbox2 |= l->PaintBody(spd, clipRect, pAlphaMask, p, org2, eventTime, alpha);
             }
 #endif
             p.y += l->m_ascent + l->m_descent;
         }
-#if defined (_VSMOD) && defined(_LUA)
-        // Remove user data
+        return bbox2;
+        };
+        if (parallel)
+            compositions.push_back({std::move(paint), entry});
+        else
         {
-            CStringA index;
-            index.Format("sub_%d", m_entry);
-            lua_pushnil(L);
-            lua_setglobal(L, index);
+            bbox2 |= paint();
+            clearLuaData(entry);
         }
-#endif
     }
+    if (parallel)
+        finishEvents(captureOverlays);
 
     bbox = bbox2;
 
     return (subs.GetCount() && !bbox2.IsRectEmpty()) ? S_OK : S_FALSE;
+}
+catch (const std::bad_alloc&)
+{
+    Deinit();
+    return E_OUTOFMEMORY;
+}
+catch (...)
+{
+    Deinit();
+    return E_FAIL;
 }
 
 // IPersist

@@ -26,6 +26,8 @@
 #include "TextFile.h"
 #include "GFN.h"
 
+unsigned SubtitleFontRevision();
+
 #ifdef _VSMOD // path m012. Lua animation
 extern "C"
 {
@@ -41,6 +43,7 @@ extern "C"
 class CMyLua
 {
 public:
+    bool hasExternalLua = false;
     lua_State * L;
     std::wofstream * LuaLog;
 
@@ -170,7 +173,7 @@ public:
     bool operator == (MOD_GRADIENT& mg);
 
     void clear();
-    DWORD getmixcolor(int tx, int ty, int i);
+    DWORD getmixcolor(int tx, int ty, int i) const;
 };
 #endif
 

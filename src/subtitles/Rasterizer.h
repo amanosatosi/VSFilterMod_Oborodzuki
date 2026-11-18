@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include <memory>
 #include <vector>
 #include "..\SubPic\ISubPic.h"
 #ifdef _VSMOD // patch m004. gradient colors
@@ -45,7 +46,7 @@ public:
 
     MOD_MOVEVC();
 
-    byte GetAlphaValue(int wx, int wy);
+    byte GetAlphaValue(int wx, int wy) const;
     void clear();
 };
 #endif
@@ -59,29 +60,54 @@ class RasterizerNfo
 public:
     int w;
     int h;
-    int spdw;
+    int rowOffset = 0;
     int overlayp;
     int pitch;
-    DWORD color;
 
     int xo;
-    int yo;
 
-    const DWORD* sw;
+    DWORD sw[4];
     byte* s;
     byte* src;
     DWORD* dst;
+    MOD_BLEND mod_blendMode = BLEND_NORMAL;
+};
+
+struct OverlayDraw
+{
+    CRect bounds;
+    RasterizerNfo info;
+    bool body;
+    BYTE* alphaMask;
 
 #ifdef _VSMOD
-    int typ;
-    MOD_GRADIENT mod_grad;
-    MOD_MOVEVC mod_vc;
-    MOD_BLEND mod_blendMode;
+    int colorType;
+    MOD_GRADIENT gradient;
+    MOD_MOVEVC maskPosition;
 #else
-    byte* am;
+    int maskPitch;
 #endif
 
-    RasterizerNfo();
+    void Blend(int top, int bottom) const;
+};
+
+struct OverlayDrawList
+{
+    std::vector<OverlayDraw> draws;
+    // A word can replace its coverage mask between the shadow and outline.
+    // Keep earlier phases alive until all bands have read them.
+    std::vector<std::unique_ptr<BYTE[]>> retiredMasks;
+};
+
+class OverlayCaptureScope
+{
+    OverlayDrawList* previous;
+
+public:
+    explicit OverlayCaptureScope(OverlayDrawList& list);
+    ~OverlayCaptureScope();
+    OverlayCaptureScope(const OverlayCaptureScope&) = delete;
+    OverlayCaptureScope& operator=(const OverlayCaptureScope&) = delete;
 };
 
 #if defined (_VSMOD) && defined(_LUA)
@@ -97,6 +123,7 @@ protected:
     BYTE* mpPathTypes;
     POINT* mpPathPoints;
     size_t mPathPoints;
+    bool CopyPath(const POINT* points, const BYTE* types, size_t count);
 
 private:
     int mWidth, mHeight;
@@ -112,11 +139,11 @@ private:
     {
         int next;
         int posandflag;
-    } *mpEdgeBuffer;
+    } *mpEdgeBuffer = nullptr;
     size_t mEdgeHeapSize;
     size_t mEdgeNext;
 
-    size_t* mpScanBuffer;
+    size_t* mpScanBuffer = nullptr;
 
     typedef unsigned char byte;
 
@@ -129,11 +156,14 @@ protected:
 private:
     void _TrashPath();
     void _TrashOverlay();
-    void _ReallocEdgeBuffer(int edges);
+    void _TrashScanBuffers();
+    void _ReallocEdgeBuffer(size_t edges);
     void _EvaluateBezier(int ptbase, bool fBSpline);
     void _EvaluateLine(int pt1idx, int pt2idx);
     void _EvaluateLine(int x0, int y0, int x1, int y1);
-    static void _OverlapRegion(tSpanBuffer& dst, tSpanBuffer& src, int dx, int dy);
+    static void _OverlapRegion(tSpanBuffer& dst, tSpanBuffer& scratch,
+        tSpanBuffer::const_iterator first, tSpanBuffer::const_iterator last, int dx, int dy);
+    bool WidenOutlineByRow(int rx, int ry);
 public:
 #if defined (_VSMOD) && defined(_LUA)
     int     m_entry; // id

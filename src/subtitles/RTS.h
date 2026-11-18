@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include <memory>
 #include "STS.h"
 #include "Rasterizer.h"
 #include "..\SubPic\ISubPic.h"
@@ -28,9 +29,8 @@
 class CMyFont : public CFont
 {
 public:
-    int m_ascent, m_descent;
-
     CMyFont(STSStyle& style);
+    CMyFont(const LOGFONT& font);
 };
 
 class CPolygon;
@@ -52,6 +52,7 @@ protected:
     double m_scalex, m_scaley;
     CStringW m_str;
 
+    void MeasureSelectedFont();
     virtual bool CreatePath() = 0;
 
 public:
@@ -72,6 +73,10 @@ public:
 
     virtual CWord* Copy() = 0;
     virtual bool Append(CWord* w);
+    bool NeedsPreparation(CPoint p) const
+    {
+        return !m_fDrawn || (m_p.x & 7) != (p.x & 7) || (m_p.y & 7) != (p.y & 7);
+    }
 
 #if defined (_VSMOD) && defined(_LUA)
     void Paint(CPoint p, CPoint org, int Layer);
@@ -119,6 +124,7 @@ public:
 class CClipper : public CPolygon
 {
 private:
+    std::shared_ptr<BYTE> m_maskStorage;
     CWord* Copy();
     virtual bool Append(CWord* w);
 
@@ -132,6 +138,7 @@ public:
     CClipper(CStringW str, CSize size, double scalex, double scaley, bool inverse);
 #endif
     virtual ~CClipper();
+    void MakeMaskWritable();
 
     CSize m_size;
     bool m_inverse;
@@ -240,10 +247,20 @@ public:
     CRect AllocRect(CSubtitle* s, int segment, int entry, int layer, int collisions);
 };
 
+struct OverrideTagCache;
+struct TextGeometryCache;
+struct TextDeviceContext;
+class EventWorkerPool;
+struct EventWorkerStatistics;
+
 [uuid("537DCACA-2812-4a4f-B2C6-1A34C17ADEB0")]
 class CRenderedTextSubtitle : public CSimpleTextSubtitle, public ISubPicProviderImpl, public ISubStream
 {
     CAtlMap<int, CSubtitle*> m_subtitleCache;
+    std::unique_ptr<OverrideTagCache> m_overrideTags;
+    std::unique_ptr<TextGeometryCache> m_textGeometry;
+    std::unique_ptr<TextDeviceContext> m_textDC;
+    std::unique_ptr<EventWorkerPool> m_eventWorkers;
 
     CScreenLayoutAllocator m_sla;
 
@@ -285,6 +302,7 @@ protected:
     virtual void OnChanged();
 
 public:
+    EventWorkerStatistics WorkerStatistics() const;
     CRenderedTextSubtitle(CCritSec* pLock, STSStyle *styleOverride = NULL, bool doOverride = false);
     virtual ~CRenderedTextSubtitle();
 

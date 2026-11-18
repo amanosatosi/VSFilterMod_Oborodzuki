@@ -1,5 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+.github/ci/op.fx.4testing.ass -text
 
 # Custom for Visual Studio
 *.cs     diff=csharp

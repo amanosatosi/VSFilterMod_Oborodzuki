@@ -27,6 +27,7 @@
 #include "..\subtitles\RTS.h"
 #include "..\subtitles\SSF.h"
 #include "..\SubPic\MemSubPic.h"
+#include "../subtitles/RenderProfile.h"
 
 #define CSRIAPI extern "C" __declspec(dllexport)
 #define CSRI_OWN_HANDLES
@@ -43,8 +44,33 @@ extern "C" struct csri_vsfilter_inst
 };
 typedef struct csri_vsfilter_inst csri_inst;
 #include "csri.h"
+
+#ifdef OBORODZUKI_PROFILE
+CSRIAPI void csri_oborodzuki_worker_stats_v2(EventWorkerStatistics* result, csri_inst* instance)
+{
+    if (result && instance)
+    {
+        CAutoLock lock(instance->cs);
+        *result = instance->rts->WorkerStatistics();
+    }
+}
+CSRIAPI void csri_oborodzuki_profile_reset()
+{
+    render_profile() = RenderProfile{};
+}
+
+CSRIAPI void csri_oborodzuki_profile_read_v2(uint64_t* ns, uint64_t* calls)
+{
+    const auto& profile = render_profile();
+    for (unsigned i = 0; i < static_cast<unsigned>(RenderStage::Count); ++i) {
+        ns[i] = profile.ns[i];
+        calls[i] = profile.calls[i];
+    }
+}
+#endif
+
 #ifdef _VSMOD
-static csri_rend csri_vsfilter = "vsfiltermod";
+static csri_rend csri_vsfilter = "vsfiltermod_oborodzuki";
 #else
 static csri_rend csri_vsfilter = "vsfilter";
 #endif
@@ -115,7 +141,8 @@ CSRIAPI void csri_close(csri_inst *inst)
 
 CSRIAPI int csri_request_fmt(csri_inst *inst, const struct csri_fmt *fmt)
 {
-    if(!inst) return -1;
+    if(!inst || !fmt) return -1;
+    CAutoLock lock(inst->cs);
 
     if(!fmt->width || !fmt->height)
         return -1;
@@ -141,6 +168,9 @@ CSRIAPI int csri_request_fmt(csri_inst *inst, const struct csri_fmt *fmt)
 
 CSRIAPI void csri_render(csri_inst *inst, struct csri_frame *frame, double time)
 {
+    if (!inst || !frame)
+        return;
+    CAutoLock lock(inst->cs);
     const double arbitrary_framerate = 25.0;
     SubPicDesc spd;
     spd.w = inst->screen_res.cx;
@@ -184,7 +214,10 @@ CSRIAPI void csri_render(csri_inst *inst, struct csri_frame *frame, double time)
     }
     spd.vidrect = inst->video_rect;
 
-    inst->rts->Render(spd, (REFERENCE_TIME)(time * 10000000), arbitrary_framerate, inst->video_rect);
+    // Render writes subtitle output bounds. They are independent of the video
+    // viewport used to key layout and geometry caches on the following frame.
+    CRect subtitleBounds;
+    inst->rts->Render(spd, (REFERENCE_TIME)(time * 10000000), arbitrary_framerate, subtitleBounds);
 }
 
 
@@ -199,14 +232,14 @@ static struct csri_info csri_vsfilter_info =
 {
 #ifdef _DEBUG
 #ifdef _VSMOD
-    "vsfiltermod_textsub_debug", // name
+    csri_vsfilter, // name
 #else
     "vsfilter_textsub_debug", // name
 #endif
     "2.39", // version (assumed version number, svn revision, patchlevel)
 #else
 #ifdef _VSMOD
-    "vsfiltermod_textsub", // name
+    csri_vsfilter, // name
 #else
     "vsfilter_textsub", // name
 #endif
@@ -219,7 +252,7 @@ static struct csri_info csri_vsfilter_info =
     // 2.38-0611-4 fixes be1-dots and ugly-fade bugs and adds xbord/ybord/xshad/yshad/blur tags and extends be
     // 2.39 merges with guliverkli2 fork
 #ifdef _VSMOD
-    "VSFilterMod/TextSub (guliverkli2)", // longname
+    "vsfiltermod oborodzuki", // longname
 #else
     "VSFilter/TextSub (guliverkli2)", // longname
 #endif
@@ -233,7 +266,18 @@ CSRIAPI struct csri_info *csri_renderer_info(csri_rend *rend)
 // Only one supported, obviously
 CSRIAPI csri_rend *csri_renderer_byname(const char *name, const char *specific)
 {
-    if(strcmp(name, csri_vsfilter_info.name))
+    if(!name)
+        return 0;
+    bool matches = strcmp(name, csri_vsfilter_info.name) == 0;
+#ifdef _VSMOD
+    // Retain lookup for hosts that call this DLL directly by its old name.
+#ifdef _DEBUG
+    matches = matches || strcmp(name, "vsfiltermod_textsub_debug") == 0;
+#else
+    matches = matches || strcmp(name, "vsfiltermod_textsub") == 0;
+#endif
+#endif
+    if(!matches)
         return 0;
     if(specific && strcmp(specific, csri_vsfilter_info.specific))
         return 0;

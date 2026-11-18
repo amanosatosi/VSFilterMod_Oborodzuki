@@ -1,0 +1,211 @@
+name: Renderer benchmarks
+
+on:
+  push:
+    branches: [develop/oborodzuki, feature/parallel-event-rendering]
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'vapoursynth/**'
+      - '.gitattributes'
+      - '.github/ci/**'
+      - '.github/workflows/benchmark.yml'
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Benchmark suite
+        type: choice
+        options: [iteration, full]
+        default: full
+
+permissions:
+  contents: read
+
+env:
+  VCPKG_REVISION: f3419f137f1a1e79b33b880ae6845f873d87820b
+  BENCH_SUITE: "${{ inputs.suite || (contains(github.event.head_commit.message, 'Benchmark-Suite: full') && 'full') || 'iteration' }}"
+
+jobs:
+  prepare:
+    name: Prepare benchmark inputs
+    runs-on: ubuntu-latest
+    outputs:
+      renderers: ${{ steps.prepare.outputs.renderers }}
+      input_sha256: ${{ steps.prepare.outputs.input_sha256 }}
+      mangetsu_revision: ${{ steps.prepare.outputs.mangetsu_revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: prepare
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $mangetsu = '60e06ef0d4535c5403f446fd46b996df4d0d2560'
+          $inputs = @(
+              @{ kind = 'candidate'; repository = $env:GITHUB_REPOSITORY; ref = $env:GITHUB_SHA },
+              @{ kind = 'original'; repository = 'Masaiki/VSFilterMod'; ref = '808f492f2e6feb92c975cbed9faaa7b4272cfec5' },
+              @{ kind = 'baseline'; repository = $env:GITHUB_REPOSITORY; ref = 'b31674c1341487b706712ecc213482562687781a' },
+              @{ kind = 'mangetsu'; repository = 'amanosatosi/libassmod'; ref = $mangetsu }
+          )
+          $digest = (Get-FileHash -LiteralPath .github/ci/op.fx.4testing.ass).Hash.ToLowerInvariant()
+          $expected = 'b814f38e854f9dddf08226e6d1f943e74d2d24b63e2e000f5a0a85f8ac0d7ec3'
+          if ($digest -ne $expected) { throw "Primary benchmark file SHA-256 mismatch: $digest" }
+          "input_sha256=$digest" >> $env:GITHUB_OUTPUT
+          "mangetsu_revision=$mangetsu" >> $env:GITHUB_OUTPUT
+          "renderers=$(ConvertTo-Json -InputObject $inputs -Compress)" >> $env:GITHUB_OUTPUT
+          "Primary benchmark: op.fx.4testing.ass (SHA-256 $digest)" >> $env:GITHUB_STEP_SUMMARY
+
+  build-renderer:
+    name: Build ${{ matrix.kind }}
+    needs: prepare
+    runs-on: windows-2022
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.renderers) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - id: image
+        shell: pwsh
+        run: '"version=$env:ImageVersion" >> $env:GITHUB_OUTPUT'
+
+      - id: renderer-cache
+        if: matrix.kind != 'candidate'
+        uses: actions/cache@v4
+        with:
+          path: bundle
+          key: benchmark-dll-${{ matrix.kind }}-${{ matrix.ref }}-x64-${{ steps.image.outputs.version }}-${{ matrix.kind == 'mangetsu' && env.VCPKG_REVISION || 'native' }}-${{ hashFiles('.github/ci/build-bench-component.ps1') }}
+
+      - uses: actions/checkout@v4
+        if: steps.renderer-cache.outputs.cache-hit != 'true' && matrix.kind != 'candidate'
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.ref }}
+          path: benchmark-source
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        if: steps.renderer-cache.outputs.cache-hit != 'true' && matrix.kind == 'mangetsu'
+        with:
+          repository: microsoft/vcpkg
+          ref: ${{ env.VCPKG_REVISION }}
+          path: benchmark-vcpkg
+          persist-credentials: false
+
+      - uses: actions/cache@v4
+        if: steps.renderer-cache.outputs.cache-hit != 'true' && matrix.kind == 'mangetsu'
+        with:
+          path: vcpkg-binaries
+          key: mangetsu-vcpkg-${{ env.VCPKG_REVISION }}-${{ steps.image.outputs.version }}
+          restore-keys: mangetsu-vcpkg-${{ env.VCPKG_REVISION }}-
+
+      - name: Build renderer
+        if: steps.renderer-cache.outputs.cache-hit != 'true'
+        shell: cmd
+        env:
+          COMPONENT: ${{ matrix.kind }}
+          REVISION: ${{ matrix.ref }}
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+          if "%COMPONENT%"=="mangetsu" (
+            where nasm >nul 2>&1 || choco install nasm --yes --no-progress || exit /b 1
+            set "PATH=%ProgramFiles%\NASM;%PATH%"
+          )
+          pwsh -NoProfile -File .github\ci\build-bench-component.ps1 -Component "%COMPONENT%" -Revision "%REVISION%" || exit /b 1
+
+      - name: Upload versioned renderer
+        uses: actions/upload-artifact@v4
+        with:
+          name: renderer-${{ matrix.kind }}-${{ matrix.ref }}
+          path: bundle/
+          if-no-files-found: error
+
+  harness:
+    name: Build benchmark harness
+    needs: prepare
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: amanosatosi/libassmod
+          ref: ${{ needs.prepare.outputs.mangetsu_revision }}
+          path: benchmark-source
+          sparse-checkout: libass
+          persist-credentials: false
+      - name: Compile benchmark host
+        shell: cmd
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+          pwsh -NoProfile -File .github\ci\build-bench-component.ps1 -Component harness -Revision "%GITHUB_SHA%" || exit /b 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: harness-${{ github.sha }}
+          path: bundle/
+          if-no-files-found: error
+
+  compare:
+    name: Compare renderer artifacts
+    needs: [prepare, build-renderer, harness]
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      BENCH_RENDERERS: ${{ needs.prepare.outputs.renderers }}
+      BENCH_INPUT_SHA256: ${{ needs.prepare.outputs.input_sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: renderer-*
+          path: benchmark-bundles
+      - uses: actions/download-artifact@v4
+        with:
+          name: harness-${{ github.sha }}
+          path: benchmark-harness
+      - name: Verify artifacts and benchmark on one runner
+        shell: pwsh
+        run: .github/ci/compare-bench.ps1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: renderer-results-${{ github.sha }}
+          path: benchmark-results/
+          if-no-files-found: warn
+
+  profile:
+    name: Profile instrumented Oborodzuki
+    needs: [prepare, harness]
+    runs-on: windows-2022
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: harness-${{ github.sha }}
+          path: benchmark-harness
+      - name: Build instrumented renderer and collect profile
+        shell: cmd
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+          pwsh -NoProfile -File .github\ci\build-bench-component.ps1 -Component profile -Revision "%GITHUB_SHA%" || exit /b 1
+          python .github\ci\run-bench.py --profile || exit /b 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: renderer-profile-${{ github.sha }}
+          path: |
+            profile-results/
+            bundle/build.json
+          if-no-files-found: warn

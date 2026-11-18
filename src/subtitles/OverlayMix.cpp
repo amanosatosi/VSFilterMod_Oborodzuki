@@ -134,7 +134,8 @@ DWORD COverlayMixer::SafeSubstract(DWORD a, DWORD b)
 // Draw
 void COverlayMixer::Draw(bool Body)
 {
-    int h = Info->h;
+    const int bottom = Info->rowOffset;
+    int h = Info->h + bottom;
 
     byte* s = Info->s;
     DWORD* dst = Info->dst;
@@ -142,7 +143,7 @@ void COverlayMixer::Draw(bool Body)
 
     if (Body)
     {
-        while (h--)
+        while (h-- > bottom)
         {
             for (int wt = 0; wt < gran; ++wt)
                 PixMix(&dst[wt], Color->getcolor1(wt, h), s[wt * 2], Info->mod_blendMode);
@@ -156,7 +157,7 @@ void COverlayMixer::Draw(bool Body)
     else
     {
         s = Info->src;
-        while (h--)
+        while (h-- > bottom)
         {
             for (int wt = 0; wt < gran; ++wt)
                 PixMix(&dst[wt], Color->getcolor1(wt, h), SafeSubstract(s[wt * 2 + 1], s[wt * 2]), Info->mod_blendMode);
@@ -190,6 +191,87 @@ void COverlayMixerSSE2::PixMix(DWORD* dst, DWORD color, BYTE alpha, MOD_BLEND mo
     *dst = (DWORD)_mm_cvtsi128_si32(r);
 }
 
+static __forceinline __m128i MixTwoNormalPixels(__m128i dst, __m128i src, __m128i alpha)
+{
+    const auto dstWeight = _mm_sub_epi16(_mm_set1_epi16(256), alpha);
+    const auto srcWeight = _mm_add_epi16(alpha, _mm_set1_epi16(1));
+    // Each colour lane is at most 255 * (256 - a + a + 1), which fits
+    // in an unsigned 16-bit lane before the legacy truncating shift.
+    return _mm_srli_epi16(_mm_add_epi16(_mm_mullo_epi16(dst, dstWeight),
+        _mm_mullo_epi16(src, srcWeight)), 8);
+}
+
+static __forceinline void MixFourNormalPixels(DWORD* dst, __m128i colors, __m128i coverage)
+{
+    const auto zero = _mm_setzero_si128();
+    const auto opacity = _mm_packs_epi32(_mm_srli_epi32(colors, 24), zero);
+    auto alpha = _mm_and_si128(_mm_srli_epi16(_mm_mullo_epi16(opacity, coverage), 6), _mm_set1_epi16(255));
+    alpha = _mm_unpacklo_epi16(alpha, alpha);
+
+    const auto rgb = _mm_and_si128(colors, _mm_set1_epi32(0x00ffffff));
+    const auto dstBytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(dst));
+    const auto low = MixTwoNormalPixels(_mm_unpacklo_epi8(dstBytes, zero),
+        _mm_unpacklo_epi8(rgb, zero), _mm_unpacklo_epi32(alpha, alpha));
+    const auto high = MixTwoNormalPixels(_mm_unpackhi_epi8(dstBytes, zero),
+        _mm_unpackhi_epi8(rgb, zero), _mm_unpackhi_epi32(alpha, alpha));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst), _mm_packus_epi16(low, high));
+}
+
+void COverlayMixerSSE2::Draw(bool Body)
+{
+    const int gran = (Info->sw[1] == 0xffffffff) ? Info->w : min(Info->sw[3] + 1 - Info->xo, Info->w);
+    if (Info->mod_blendMode != BLEND_NORMAL || gran < 0)
+    {
+        COverlayMixer::Draw(Body);
+        return;
+    }
+
+    const auto solid = dynamic_cast<COverlayColor*>(Color);
+    const bool bodyUsesBorder = Info->s != Info->src;
+    const byte* mask = Info->src;
+    DWORD* dst = Info->dst;
+    const auto bodyMask = _mm_set1_epi16(255);
+
+    const int bottom = Info->rowOffset;
+    for (int y = Info->h + bottom - 1; y >= bottom; --y)
+    {
+        auto drawRange = [&](int x, int end, DWORD (COverlayGetter::*getColor)(int, int)) {
+            const DWORD color = solid ? (solid->*getColor)(0, 0) : 0;
+            const auto repeatedColor = _mm_set1_epi32(color);
+            for (; x <= end - 4; x += 4)
+            {
+                const auto both = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(mask + 2 * x));
+                const auto fill = _mm_and_si128(both, bodyMask);
+                const auto border = _mm_srli_epi16(both, 8);
+                const auto coverage = Body ? (bodyUsesBorder ? border : fill) : _mm_subs_epu16(border, fill);
+                // At zero coverage the destination is unchanged, including
+                // the fourth byte. The legacy source term is at most 255/256.
+                const int empty = _mm_movemask_epi8(_mm_cmpeq_epi16(coverage, _mm_setzero_si128()));
+                if ((empty & 0xff) == 0xff)
+                    continue;
+                const auto colors = solid ? repeatedColor : _mm_setr_epi32(
+                    (empty & 0x01) ? 0 : (Color->*getColor)(x, y),
+                    (empty & 0x04) ? 0 : (Color->*getColor)(x + 1, y),
+                    (empty & 0x10) ? 0 : (Color->*getColor)(x + 2, y),
+                    (empty & 0x40) ? 0 : (Color->*getColor)(x + 3, y));
+                MixFourNormalPixels(dst + x, colors, coverage);
+            }
+            for (; x < end; ++x)
+            {
+                const auto fill = mask[2 * x];
+                const auto border = mask[2 * x + 1];
+                const auto coverage = Body ? (bodyUsesBorder ? border : fill) : SafeSubstract(border, fill);
+                if (coverage)
+                    PixMix(dst + x, solid ? color : (Color->*getColor)(x, y), BYTE(coverage), BLEND_NORMAL);
+            }
+        };
+        drawRange(0, gran, &COverlayGetter::getcolor1);
+        drawRange(gran, Info->w, &COverlayGetter::getcolor2);
+        mask += 2 * Info->overlayp;
+        dst = reinterpret_cast<DWORD*>(reinterpret_cast<char*>(dst) + Info->pitch);
+    }
+}
+
 DWORD COverlayMixerSSE2::SafeSubstract(DWORD a, DWORD b)
 {
     __m128i ap = _mm_cvtsi32_si128(a);
@@ -202,15 +284,39 @@ DWORD COverlayMixerSSE2::SafeSubstract(DWORD a, DWORD b)
 
 template<class T> void COverlayAlphaMixer<T>::Draw(bool Body)
 {
-    int h = Info->h;
+    const int bottom = Info->rowOffset;
+    int h = Info->h + bottom;
 
     byte* s = Info->s;
     DWORD* dst = Info->dst;
     int gran = (Info->sw[1] == 0xffffffff) ? Info->w : min(Info->sw[3] + 1 - Info->xo, Info->w);
 
+    if (Info->mod_blendMode == BLEND_NORMAL && gran >= 0)
+    {
+        for (int row = h - 1; row >= bottom; --row)
+        {
+            const auto drawRange = [&](int first, int end, DWORD (COverlayGetter::*get)(int, int)) {
+                for (int x = first; x < end; ++x)
+                {
+                    const DWORD coverage = Body ? s[2 * x] : SafeSubstract(s[2 * x + 1], s[2 * x]);
+                    if (!coverage)
+                        continue;
+                    const BYTE clipped = BYTE(coverage * (Alpha->*get)(x, row) >> 6);
+                    if (clipped)
+                        PixMix(dst + x, (Color->*get)(x, row), clipped, BLEND_NORMAL);
+                }
+            };
+            drawRange(0, gran, &COverlayGetter::getcolor1);
+            drawRange(gran, Info->w, &COverlayGetter::getcolor2);
+            s += 2 * Info->overlayp;
+            dst = reinterpret_cast<DWORD*>(reinterpret_cast<char*>(dst) + Info->pitch);
+        }
+        return;
+    }
+
     if (Body)
     {
-        while (h--)
+        while (h-- > bottom)
         {
             for (int wt = 0; wt < gran; ++wt)
                 PixMix(&dst[wt], Color->getcolor1(wt, h), s[wt * 2] * Alpha->getcolor1(wt, h) >> 6, Info->mod_blendMode);
@@ -223,7 +329,7 @@ template<class T> void COverlayAlphaMixer<T>::Draw(bool Body)
     }
     else
     {
-        while (h--)
+        while (h-- > bottom)
         {
             for (int wt = 0; wt < gran; ++wt)
                 PixMix(&dst[wt], Color->getcolor1(wt, h), SafeSubstract(s[wt * 2 + 1], s[wt * 2]) * Alpha->getcolor1(wt, h) >> 6, Info->mod_blendMode);

@@ -20,8 +20,11 @@
  */
 
 #include "stdafx.h"
+#include "RenderProfile.h"
+#include <cstdint>
 #include <string.h>
 #include <math.h>
+#include <new>
 #include <vector>
 #include <algorithm>
 #include "Rasterizer.h"
@@ -37,6 +40,18 @@
 #define _IMPL_MAX _MAX
 #define _IMPL_MIN _MIN
 #endif
+
+static thread_local OverlayDrawList* activeOverlayDraws = nullptr;
+
+OverlayCaptureScope::OverlayCaptureScope(OverlayDrawList& list) : previous(activeOverlayDraws)
+{
+    activeOverlayDraws = &list;
+}
+
+OverlayCaptureScope::~OverlayCaptureScope()
+{
+    activeOverlayDraws = previous;
+}
 
 int Rasterizer::getOverlayWidth()
 {
@@ -54,6 +69,8 @@ Rasterizer::~Rasterizer()
 {
     _TrashPath();
     _TrashOverlay();
+    if (mpEdgeBuffer || mpScanBuffer)
+        _TrashScanBuffers();
 }
 
 void Rasterizer::_TrashPath()
@@ -71,10 +88,23 @@ void Rasterizer::_TrashOverlay()
     mpOverlayBuffer = NULL;
 }
 
-void Rasterizer::_ReallocEdgeBuffer(int edges)
+void Rasterizer::_TrashScanBuffers()
 {
+    free(mpEdgeBuffer);
+    delete[] mpScanBuffer;
+    mpEdgeBuffer = nullptr;
+    mpScanBuffer = nullptr;
+}
+
+void Rasterizer::_ReallocEdgeBuffer(size_t edges)
+{
+    if (edges > SIZE_MAX / sizeof(Edge))
+        throw std::bad_alloc();
+    auto* grown = static_cast<Edge*>(realloc(mpEdgeBuffer, sizeof(Edge) * edges));
+    if (!grown)
+        throw std::bad_alloc();
+    mpEdgeBuffer = grown;
     mEdgeHeapSize = edges;
-    mpEdgeBuffer = (Edge*)realloc(mpEdgeBuffer, sizeof(Edge) * edges);
 }
 
 void Rasterizer::_EvaluateBezier(int ptbase, bool fBSpline)
@@ -279,6 +309,30 @@ bool Rasterizer::BeginPath(HDC hdc)
     return !!::BeginPath(hdc);
 }
 
+bool Rasterizer::CopyPath(const POINT* points, const BYTE* types, size_t count)
+{
+    if (!count)
+    {
+        _TrashPath();
+        return true;
+    }
+    auto* copyPoints = static_cast<POINT*>(malloc(count * sizeof(POINT)));
+    auto* copyTypes = static_cast<BYTE*>(malloc(count * sizeof(BYTE)));
+    if (!copyPoints || !copyTypes)
+    {
+        free(copyPoints);
+        free(copyTypes);
+        return false;
+    }
+    memcpy(copyPoints, points, count * sizeof(POINT));
+    memcpy(copyTypes, types, count * sizeof(BYTE));
+    _TrashPath();
+    mPathPoints = count;
+    mpPathPoints = copyPoints;
+    mpPathTypes = copyTypes;
+    return true;
+}
+
 bool Rasterizer::EndPath(HDC hdc)
 {
     ::CloseFigure(hdc);
@@ -366,6 +420,7 @@ bool Rasterizer::PartialEndPath(HDC hdc, long dx, long dy)
 
 bool Rasterizer::ScanConvert()
 {
+    PROFILE_RENDER_STAGE(ScanConvert);
     size_t lastmoveto = -1;
     size_t i;
 
@@ -428,8 +483,7 @@ bool Rasterizer::ScanConvert()
     // Initialize edge buffer.  We use edge 0 as a sentinel.
 
     mEdgeNext = 1;
-    mEdgeHeapSize = 2048;
-    mpEdgeBuffer = (Edge*)malloc(sizeof(Edge) * mEdgeHeapSize);
+    _ReallocEdgeBuffer(2048);
 
     // Initialize scanline list.
 
@@ -548,8 +602,7 @@ bool Rasterizer::ScanConvert()
 
     // Dump the edge and scan buffers, since we no longer need them.
 
-    free(mpEdgeBuffer);
-    delete [] mpScanBuffer;
+    _TrashScanBuffers();
 
     // All done!
 
@@ -558,32 +611,18 @@ bool Rasterizer::ScanConvert()
 
 using namespace std;
 
-void Rasterizer::_OverlapRegion(tSpanBuffer& dst, tSpanBuffer& src, int dx, int dy)
+template<class IteratorA, class IteratorB, class Offset, class Emit>
+static void MergeOutlineSpans(IteratorA itA, IteratorA itAE, IteratorB itB, IteratorB itBE,
+    Offset offset1, Offset offset2, Emit emit)
 {
-    tSpanBuffer temp;
-
-    temp.reserve(dst.size() + src.size());
-
-    dst.swap(temp);
-
-    tSpanBuffer::iterator itA = temp.begin();
-    tSpanBuffer::iterator itAE = temp.end();
-    tSpanBuffer::iterator itB = src.begin();
-    tSpanBuffer::iterator itBE = src.end();
-
-    // Don't worry -- even if dy<0 this will still work! // G: hehe, the evil twin :)
-
-    unsigned __int64 offset1 = (((__int64)dy) << 32) - dx;
-    unsigned __int64 offset2 = (((__int64)dy) << 32) + dx;
-
     while(itA != itAE && itB != itBE)
     {
         if((*itB).first + offset1 < (*itA).first)
         {
             // B span is earlier.  Use it.
 
-            unsigned __int64 x1 = (*itB).first + offset1;
-            unsigned __int64 x2 = (*itB).second + offset2;
+            auto x1 = (*itB).first + offset1;
+            auto x2 = (*itB).second + offset2;
 
             ++itB;
 
@@ -620,14 +659,14 @@ void Rasterizer::_OverlapRegion(tSpanBuffer& dst, tSpanBuffer& src, int dx, int 
 
             // Flush span.
 
-            dst.push_back(tSpan(x1, x2));
+            emit(x1, x2);
         }
         else
         {
             // A span is earlier.  Use it.
 
-            unsigned __int64 x1 = (*itA).first;
-            unsigned __int64 x2 = (*itA).second;
+            auto x1 = (*itA).first;
+            auto x2 = (*itA).second;
 
             ++itA;
 
@@ -664,29 +703,203 @@ void Rasterizer::_OverlapRegion(tSpanBuffer& dst, tSpanBuffer& src, int dx, int 
 
             // Flush span.
 
-            dst.push_back(tSpan(x1, x2));
+            emit(x1, x2);
         }
     }
 
     // Copy over leftover spans.
 
     while(itA != itAE)
-        dst.push_back(*itA++);
+    {
+        emit(itA->first, itA->second);
+        ++itA;
+    }
 
     while(itB != itBE)
     {
-        dst.push_back(tSpan((*itB).first + offset1, (*itB).second + offset2));
+        emit(itB->first + offset1, itB->second + offset2);
         ++itB;
     }
 }
 
+void Rasterizer::_OverlapRegion(tSpanBuffer& dst, tSpanBuffer& scratch,
+    tSpanBuffer::const_iterator first, tSpanBuffer::const_iterator last, int dx, int dy)
+{
+    const auto verticalOffset = static_cast<unsigned __int64>(dy) << 32;
+    scratch.clear();
+    scratch.reserve(dst.size() + (last - first));
+    dst.swap(scratch);
+
+    MergeOutlineSpans(scratch.cbegin(), scratch.cend(), first, last,
+        verticalOffset - dx, verticalOffset + dx,
+        [&](unsigned __int64 left, unsigned __int64 right) { dst.emplace_back(left, right); });
+}
+
+bool Rasterizer::WidenOutlineByRow(int rx, int ry)
+{
+    using RowSpan = std::pair<DWORD, DWORD>;
+    constexpr size_t rowCapacity = 64;
+    std::vector<int> radius(size_t(ry) + 1);
+    for (int dy = 0; dy <= ry; ++dy)
+        radius[dy] = int(0.5 + sqrt(float(ry * ry - dy * dy)) * float(rx) / float(ry));
+    const DWORD maxRadius = static_cast<DWORD>(radius.front());
+
+    // Packed spans are sorted by subpixel row. Each destination row receives
+    // the same source rows in the same order as the whole-outline merge.
+    struct SourceRow
+    {
+        DWORD firstSpan;
+        int firstIdenticalRow;
+    };
+    std::vector<SourceRow> rows(size_t(mHeight) + 1);
+    std::vector<RowSpan> sourceSpans;
+    sourceSpans.reserve(mOutline.size());
+    for (int y = 0; y < mHeight; ++y)
+    {
+        auto& row = rows[y];
+        row.firstSpan = DWORD(sourceSpans.size());
+        row.firstIdenticalRow = y;
+        const auto packedY = static_cast<unsigned __int64>(y) + 0x40000000;
+        while (sourceSpans.size() < mOutline.size() &&
+            (mOutline[sourceSpans.size()].first >> 32) == packedY)
+        {
+            const auto& current = mOutline[sourceSpans.size()];
+            const DWORD left = DWORD(current.first), right = DWORD(current.second);
+            if ((current.second >> 32) != packedY || left < maxRadius || right > MAXDWORD - maxRadius)
+                return false;
+            sourceSpans.emplace_back(left, right);
+        }
+        const size_t count = sourceSpans.size() - row.firstSpan;
+        if (count > rowCapacity)
+            return false;
+        if (count == 1 && y && row.firstSpan - rows[y - 1].firstSpan == 1 &&
+            sourceSpans[row.firstSpan - 1] == sourceSpans[row.firstSpan])
+            row.firstIdenticalRow = rows[y - 1].firstIdenticalRow;
+    }
+    if (sourceSpans.size() != mOutline.size())
+        return false;
+    rows[mHeight].firstSpan = DWORD(sourceSpans.size());
+
+    RowSpan rowStorage[rowCapacity], scratchStorage[rowCapacity];
+    auto row = &rowStorage[0];
+    auto scratch = &scratchStorage[0];
+    mWideOutline.reserve(mOutline.size());
+    for (int y = -ry; y < mHeight + ry; ++y)
+    {
+        size_t rowCount = 0;
+        const int firstSource = min(y + ry, mHeight - 1);
+        const int lastSource = max(y - ry, 0);
+        for (int source = firstSource; source >= lastSource;)
+        {
+            const auto& sourceRow = rows[source];
+            const size_t begin = sourceRow.firstSpan;
+            const size_t end = rows[source + 1].firstSpan;
+            int nearest = source--;
+            if (begin != end)
+            {
+                // Identical single spans expand into nested intervals. If the
+                // accumulated row has at most one span, the widest interval
+                // gives the same merge without visiting every source row.
+                if (end - begin == 1 && rowCount <= 1 && sourceRow.firstIdenticalRow < nearest)
+                {
+                    const int first = (std::max)(lastSource, sourceRow.firstIdenticalRow);
+                    nearest = (std::max)(first, (std::min)(y, nearest));
+                    source = first - 1;
+                }
+                const DWORD dx = radius[abs(y - nearest)];
+                if (rowCount == 1 && row[0].first <= sourceSpans[begin].first - dx &&
+                    row[0].second >= sourceSpans[end - 1].second + dx)
+                    continue;
+                if (end - begin == 1)
+                {
+                    const DWORD left = sourceSpans[begin].first - dx;
+                    const DWORD right = sourceSpans[begin].second + dx;
+                    size_t first = 0;
+                    while (first < rowCount && row[first].second < left)
+                        ++first;
+                    if (first < rowCount && row[first].first <= right)
+                    {
+                        row[first].first = (std::min)(row[first].first, left);
+                        row[first].second = (std::max)(row[first].second, right);
+                        size_t next = first + 1;
+                        while (next < rowCount && row[next].first <= row[first].second)
+                        {
+                            row[first].second = (std::max)(row[first].second, row[next].second);
+                            ++next;
+                        }
+                        if (next > first + 1)
+                        {
+                            std::move(row + next, row + rowCount, row + first + 1);
+                            rowCount -= next - first - 1;
+                        }
+                        continue;
+                    }
+                    if (rowCount < rowCapacity)
+                    {
+                        std::move_backward(row + first, row + rowCount, row + rowCount + 1);
+                        row[first] = RowSpan(left, right);
+                        ++rowCount;
+                        continue;
+                    }
+                }
+                // A shifted row wholly covered by existing disjoint spans
+                // cannot change the merge. Check neighbours too: overlapping
+                // legacy spans can coalesce even if the new span is contained.
+                if (rowCount > 1)
+                {
+                    size_t covered = begin, span = 0;
+                    for (; covered < end; ++covered)
+                    {
+                        const DWORD left = sourceSpans[covered].first - dx;
+                        const DWORD right = sourceSpans[covered].second + dx;
+                        while (span < rowCount && row[span].second < left)
+                            ++span;
+                        if (span == rowCount || row[span].first > left || row[span].second < right ||
+                            (span && row[span - 1].second >= row[span].first) ||
+                            (span + 1 < rowCount && row[span + 1].first <= row[span].second))
+                            break;
+                    }
+                    if (covered == end)
+                        continue;
+                }
+                if (rowCount + end - begin > rowCapacity)
+                {
+                    mWideOutline.clear();
+                    return false;
+                }
+                size_t count = 0;
+                MergeOutlineSpans(row, row + rowCount, sourceSpans.data() + begin,
+                    sourceSpans.data() + end, DWORD(0) - dx, dx,
+                    [&](DWORD left, DWORD right) { scratch[count++] = RowSpan(left, right); });
+                std::swap(row, scratch);
+                rowCount = count;
+            }
+        }
+        const auto packedY = (static_cast<unsigned __int64>(y) + 0x40000000) << 32;
+        for (size_t i = 0; i < rowCount; ++i)
+            mWideOutline.emplace_back(packedY | row[i].first, packedY | row[i].second);
+    }
+    return true;
+}
+
 bool Rasterizer::CreateWidenedRegion(int rx, int ry)
 {
+    PROFILE_RENDER_STAGE(WidenOutline);
     if(rx < 0) rx = 0;
     if(ry < 0) ry = 0;
 
     mWideBorder = max(rx, ry);
+    if (mOutline.empty())
+        return true;
 
+    // Keep the whole-outline path for dimensions where the packed horizontal
+    // offset may carry into the row, or where indexing rows would be costly.
+    if (ry > 0 && ry <= 2048 && rx <= 0x20000000 && mHeight > 0 && mHeight <= 0x100000 &&
+        size_t(mHeight / 2) <= mOutline.size() && mOutline.size() <= MAXDWORD &&
+        mWideOutline.empty() && WidenOutlineByRow(rx, ry))
+        return true;
+
+    tSpanBuffer scratch;
     if(ry > 0)
     {
         // Do a half circle.
@@ -695,14 +908,14 @@ bool Rasterizer::CreateWidenedRegion(int rx, int ry)
         {
             int x = (int)(0.5 + sqrt(float(ry * ry - y * y)) * float(rx) / float(ry));
 
-            _OverlapRegion(mWideOutline, mOutline, x, y);
+            _OverlapRegion(mWideOutline, scratch, mOutline.cbegin(), mOutline.cend(), x, y);
         }
     }
     else if(ry == 0 && rx > 0)
     {
         // There are artifacts if we don't make at least two overlaps of the line, even at same Y coord
-        _OverlapRegion(mWideOutline, mOutline, rx, 0);
-        _OverlapRegion(mWideOutline, mOutline, rx, 0);
+        _OverlapRegion(mWideOutline, scratch, mOutline.cbegin(), mOutline.cend(), rx, 0);
+        _OverlapRegion(mWideOutline, scratch, mOutline.cbegin(), mOutline.cend(), rx, 0);
     }
 
     return true;
@@ -716,7 +929,15 @@ void Rasterizer::DeleteOutlines()
 
 bool Rasterizer::Rasterize(int xsub, int ysub, int fBlur, double fGaussianBlurX, double fGaussianBlurY)
 {
-    _TrashOverlay();
+    PROFILE_RENDER_STAGE(Rasterize);
+    if (activeOverlayDraws && mpOverlayBuffer)
+    {
+        std::unique_ptr<BYTE[]> previous(mpOverlayBuffer);
+        mpOverlayBuffer = nullptr;
+        activeOverlayDraws->retiredMasks.push_back(std::move(previous));
+    }
+    else
+        _TrashOverlay();
 
     if(!mWidth || !mHeight)
     {
@@ -810,6 +1031,7 @@ bool Rasterizer::Rasterize(int xsub, int ysub, int fBlur, double fGaussianBlurX,
         }
     }
 
+    PROFILE_RENDER_STAGE(Blur);
     // Do some gaussian blur magic
     if(fGaussianBlur > 0)
     {
@@ -909,6 +1131,52 @@ static __forceinline void pixmix_sse2(DWORD* dst, DWORD color, DWORD alpha, MOD_
 // For CPUID usage in Rasterizer::Draw
 #include "../dsutil/vd.h"
 
+template<class Mixer>
+static void BlendOverlay(RasterizerNfo& info, bool body, COverlayGetter* color, COverlayGetter* alpha)
+{
+    if (alpha)
+        COverlayAlphaMixer<Mixer>(&info, color, alpha).Draw(body);
+    else
+        Mixer(&info, color).Draw(body);
+}
+
+void OverlayDraw::Blend(int top, int bottom) const
+{
+    const int first = (std::max)(top, int(bounds.top));
+    const int last = (std::min)(bottom, int(bounds.bottom));
+    if (first >= last)
+        return;
+
+    PROFILE_RENDER_STAGE(Composite);
+    RasterizerNfo band = info;
+    const ptrdiff_t skip = first - bounds.top;
+    band.dst = reinterpret_cast<DWORD*>(reinterpret_cast<BYTE*>(band.dst) + skip * band.pitch);
+    band.src += skip * 2 * band.overlayp;
+    band.s += skip * 2 * band.overlayp;
+    band.h = last - first;
+    // The mixers count down from the bottom of the original clipped draw.
+    band.rowOffset = bounds.bottom - last;
+
+    COverlayColor solid(band.sw[0], band.sw[2]);
+    COverlayGetter* color = &solid;
+#ifdef _VSMOD
+    COverlayGradient shaded(gradient, colorType);
+    if (gradient.mode[colorType] || (colorType == 0 && gradient.mode[1]))
+        color = &shaded;
+    COverlayAlpha mask(maskPosition);
+#else
+    COverlayAlpha mask(alphaMask, maskPitch, info.h);
+#endif
+    auto* alpha = alphaMask ? &mask : nullptr;
+    if (g_cpuid.m_flags & CCpuID::sse2)
+        BlendOverlay<COverlayMixerSSE2>(band, body, color, alpha);
+    else
+        BlendOverlay<COverlayMixer>(band, body, color, alpha);
+#ifndef _M_X64
+    _mm_empty();
+#endif
+}
+
 // Render a subpicture onto a surface.
 // spd is the surface to render on.
 // clipRect is a rectangular clip region to render inside.
@@ -928,7 +1196,7 @@ CRect Rasterizer::Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int x
 {
     CRect bbox(0, 0, 0, 0);
 
-    if(!switchpts || !fBody && !fBorder) return(bbox);
+    if(!mpOverlayBuffer || !switchpts || !fBody && !fBorder) return(bbox);
 
     // Limit drawn area to intersection of rendering surface and rectangular clip area
     CRect r(0, 0, spd.w, spd.h);
@@ -967,148 +1235,79 @@ CRect Rasterizer::Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int x
     bbox.SetRect(x, y, x + w, y + h);
     bbox &= CRect(0, 0, spd.w, spd.h);
 
-    // CPUID from VDub
-    bool fSSE2 = !!(g_cpuid.m_flags & CCpuID::sse2);
-    //bool fSSE2 = false;
-
-#ifdef _VSMOD // patch m006. moveable vector clip
-    mod_vc.hfull = h;
-    mod_vc.curpos = CPoint(x, y);
-    mod_vc.alphamask = pAlphaMask + spd.w * y + x;
-#endif
-
-    // fill rasterize info
-    RasterizerNfo rnfo;
-    // Grab the first colour
-    rnfo.color = switchpts[0];
-    // How would this differ from src?
-    rnfo.dst = (DWORD*)((char *)spd.bits + (spd.pitch * y)) + x;
-    rnfo.sw = switchpts;
-
-    rnfo.w = w;
-    rnfo.h = h;
-    rnfo.xo = xo;
-    rnfo.yo = yo;
-    rnfo.overlayp = mOverlayWidth;
-    rnfo.pitch = spd.pitch;
-    rnfo.spdw = spd.w;
-    // The alpha bitmap of the subtitles?
-    rnfo.src = mpOverlayBuffer + 2 * (mOverlayWidth * yo + xo);
-    // s points to what the "body" to use is
-    // If we're rendering body fill and border, src+1 points to the array of
-    // widened regions which contain both border and fill in one.
-    rnfo.s = fBorder ? (rnfo.src + 1) : rnfo.src;
-#ifdef _VSMOD // patch m006. moveable vector clip
-    rnfo.mod_vc = mod_vc;
-    rnfo.mod_grad = mod_grad;
-    rnfo.mod_grad.width = mOverlayWidth;
-    rnfo.mod_grad.height = mOverlayHeight;
-    rnfo.mod_grad.xoffset = xo;
-    rnfo.mod_grad.yoffset = yo;
-    rnfo.typ = typ;
-    rnfo.mod_blendMode = mod_blendMode; // vpatch v003. blending mode
-    rnfo.mod_grad.clipDiff = clipRect.bottom < yBeforeClip + mOverlayHeight ? yBeforeClip + mOverlayHeight - clipRect.bottom : 0;
+    OverlayDraw draw;
+    draw.bounds = bbox;
+    draw.body = fBody;
+    auto& info = draw.info;
+    info.dst = reinterpret_cast<DWORD*>(static_cast<BYTE*>(spd.bits) + ptrdiff_t(spd.pitch) * y) + x;
+    std::copy_n(switchpts, 4, info.sw);
+    info.w = w;
+    info.h = h;
+    info.xo = xo;
+    info.overlayp = mOverlayWidth;
+    info.pitch = spd.pitch;
+    info.src = mpOverlayBuffer + 2 * (ptrdiff_t(mOverlayWidth) * yo + xo);
+    info.s = fBorder ? info.src + 1 : info.src;
+    draw.alphaMask = pAlphaMask ? pAlphaMask + ptrdiff_t(spd.w) * y + x : nullptr;
+#ifdef _VSMOD
+    draw.maskPosition = mod_vc;
+    draw.maskPosition.hfull = h;
+    draw.maskPosition.curpos = CPoint(x, y);
+    draw.maskPosition.alphamask = draw.alphaMask;
+    draw.gradient = mod_grad;
+    draw.gradient.width = mOverlayWidth;
+    draw.gradient.height = mOverlayHeight;
+    draw.gradient.xoffset = xo;
+    draw.gradient.yoffset = yo;
+    draw.gradient.clipDiff = (std::max)(0, yBeforeClip + mOverlayHeight - int(clipRect.bottom));
+    draw.colorType = typ;
+    info.mod_blendMode = mod_blendMode;
 #else
-    // The complex "vector clip mask" I think.
-    rnfo.am = pAlphaMask + spd.w * y + x;
-#endif
-
-    COverlayGetter * Color;
-    
-    // Every remaining line in the bitmap to be rendered...
-    // Basic case of no complex clipping mask
-#ifdef _VSMOD // patch m004. gradient colors
-    if (
-        ((typ == 0) && ((mod_grad.mode[0] == 0) && (mod_grad.mode[1] == 0)))
-        || ((typ != 0) && (mod_grad.mode[typ] == 0))
-        )
-        // No gradient
-    {
-#endif
-        Color = new COverlayColor(switchpts[0], switchpts[2]);
-#ifdef _VSMOD // patch m004. gradient colors
-    }
-    else
-        Color = new COverlayGradient(rnfo.mod_grad, typ);
+    draw.maskPitch = spd.w;
 #endif
 
 #if defined (_VSMOD) && defined(_LUA)
     if (LuaRendererHandler.GetLength() > 0)
     {
-        COverlayGetter* Alpha = (pAlphaMask) ? new COverlayAlpha(mod_vc) : NULL;
-
-        if (fSSE2)
+        // Lua can read and write pixels in this draw. The caller runs the
+        // callback in order, with the full clipped rectangle.
+        ASSERT(!activeOverlayDraws);
+        PROFILE_RENDER_STAGE(Composite);
+        COverlayColor solid(info.sw[0], info.sw[2]);
+        COverlayGradient shaded(draw.gradient, typ);
+        auto* color = (draw.gradient.mode[typ] || (typ == 0 && draw.gradient.mode[1]))
+            ? static_cast<COverlayGetter*>(&shaded) : &solid;
+        COverlayAlpha mask(draw.maskPosition);
+        auto* alpha = draw.alphaMask ? &mask : nullptr;
+        auto runCallback = [&](auto& mix) {
+            mix.L = L;
+            mix.LuaLog = LuaLog;
+            mix.m_entry = m_entry;
+            mix.m_layer = m_layer;
+            mix.Function = LuaRendererHandler;
+            mix.Draw(fBody);
+        };
+        if (g_cpuid.m_flags & CCpuID::sse2)
         {
-            COverlayLuaMixer<COverlayMixerSSE2> Mix(&rnfo, Color, Alpha);
-            Mix.L = L;
-            Mix.LuaLog = LuaLog;
-            Mix.m_entry = m_entry;
-            Mix.m_layer = m_layer;
-            Mix.Function = LuaRendererHandler;
-            Mix.Draw(fBody);
+            COverlayLuaMixer<COverlayMixerSSE2> mix(&info, color, alpha);
+            runCallback(mix);
         }
         else
         {
-            COverlayLuaMixer<COverlayMixer> Mix(&rnfo, Color, Alpha);
-            Mix.L = L;
-            Mix.LuaLog = LuaLog;
-            Mix.m_entry = m_entry;
-            Mix.Function = LuaRendererHandler;
-            Mix.Draw(fBody);
+            COverlayLuaMixer<COverlayMixer> mix(&info, color, alpha);
+            runCallback(mix);
         }
-
-        if (Alpha) delete Alpha;
-    }
-    else
-    {
-#endif
-        if (!pAlphaMask)
-        {
-            if (fSSE2)
-            {
-                COverlayMixerSSE2 Mix(&rnfo, Color);
-                Mix.Draw(fBody);
-            }
-            else
-            {
-                COverlayMixer Mix(&rnfo, Color);
-                Mix.Draw(fBody);
-            }
-        }
-        else
-        {
-            COverlayGetter* Alpha;
-
-#ifdef _VSMOD
-            Alpha = new COverlayAlpha(mod_vc);
-#else
-            Alpha = new COverlayAlpha(pAlphaMask, spd.w, spd.h);
-#endif
-            if (fSSE2)
-            {
-                COverlayAlphaMixer<COverlayMixerSSE2> Mix(&rnfo, Color, Alpha);
-                Mix.Draw(fBody);
-            }
-            else
-            {
-                COverlayAlphaMixer<COverlayMixer> Mix(&rnfo, Color, Alpha);
-                Mix.Draw(fBody);
-            }
-
-            delete Alpha;
-        }
-#if defined (_VSMOD) && defined(_LUA)
-    }
-#endif
-
-    delete Color;
-    // Remember to EMMS!
-    // Rendering fails in funny ways if we don't do this.
-
 #ifndef _M_X64
-    _mm_empty();
+        _mm_empty();
+#endif
+        return bbox;
+    }
 #endif
 
+    if (activeOverlayDraws)
+        activeOverlayDraws->draws.push_back(std::move(draw));
+    else
+        draw.Blend(bbox.top, bbox.bottom);
     return bbox;
 }
 
@@ -1164,7 +1363,7 @@ void MOD_MOVEVC::clear()
     isInverse = false;
 }
 
-byte MOD_MOVEVC::GetAlphaValue(int wx, int wy)
+byte MOD_MOVEVC::GetAlphaValue(int wx, int wy) const
 {
     byte alpham;
     if(!enable)
@@ -1196,30 +1395,3 @@ byte MOD_MOVEVC::GetAlphaValue(int wx, int wy)
     return alpham;
 }
 #endif
-
-RasterizerNfo::RasterizerNfo()
-{
-    /*
-    w = 0;
-    h = 0;
-    spdw = 0;
-    overlayp = 0;
-    typ = 0;
-    pitch = 0;
-    color = 0;
-
-    xo = 0;
-
-    sw = NULL;
-    s = NULL;
-    src = NULL;
-    dst = NULL;
-
-    #ifdef _VSMOD
-    mod_grad.clear();
-    mod_vc.clear();
-    #else
-    am = NULL;
-    #endif
-    */
-}

@@ -1,0 +1,128 @@
+name: Parallel renderer validation
+on:
+  workflow_dispatch:
+    inputs:
+      full:
+        description: Run all 5,400 KFX frames at each worker count
+        type: boolean
+        default: true
+  push:
+    branches: [feature/parallel-event-rendering]
+    paths: ['src/**', '.github/parallel/**', '.github/workflows/parallel-renderer.yml']
+permissions:
+  contents: read
+  actions: read
+env:
+  PARALLEL_FULL: "${{ inputs.full || contains(github.event.head_commit.message, 'Parallel-KFX full') }}"
+  PARALLEL_QUICK: "${{ contains(github.event.head_commit.message, 'Parallel-KFX quick') }}"
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: amanosatosi/libassmod
+          ref: 60e06ef0d4535c5403f446fd46b996df4d0d2560
+          path: benchmark-source
+          sparse-checkout: libass
+      - name: Compile renderer and existing hosts
+        shell: cmd
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+          pwsh -File .github\ci\build-bench-component.ps1 -Component candidate -Revision "%GITHUB_SHA%" || exit /b 1
+          move bundle renderer || exit /b 1
+          set "MANGETSU_REVISION=60e06ef0d4535c5403f446fd46b996df4d0d2560"
+          pwsh -File .github\kfx\build-harness.ps1 -Revision "%GITHUB_SHA%" || exit /b 1
+          move bundle hosts || exit /b 1
+          cl /nologo /std:c++17 /O2 /EHsc /MT /Ibenchmark-source\libass .github\ci\render-bench.cpp /Fe:hosts\render-bench.exe || exit /b 1
+          cl /nologo /std:c++17 /O2 /EHsc /MT .github\parallel\concurrent.cpp /Fe:hosts\concurrent.exe user32.lib || exit /b 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: parallel-hosts-${{ github.sha }}
+          path: |
+            renderer/
+            hosts/
+          if-no-files-found: error
+  compare:
+    needs: build
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: parallel-hosts-${{ github.sha }}
+      - name: Download the previous parallel renderer
+        uses: actions/download-artifact@v4
+        with:
+          name: parallel-hosts-b110ccac5d1b9b55410b1d50df46dfaf29468503
+          run-id: 44151605518
+          github-token: ${{ github.token }}
+          path: threading-baseline
+      - name: Record actual runner hardware
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force parallel-results
+          @{ cpu = @(Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors)
+             image = $env:ImageVersion
+             ram = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
+             revision = $env:GITHUB_SHA } | ConvertTo-Json -Depth 4 | Set-Content parallel-results/environment.json
+      - name: Reuse pre-threading renderer for a same-runner reference
+        if: env.PARALLEL_FULL == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .github/kfx/reuse-renderer.ps1 -Kind candidate -Revision b8ea6fff7838ba4389593041face289122b99b30
+          if (Test-Path bundle/renderer.dll) { Move-Item bundle previous-renderer }
+      - name: Concurrent instance and controlled worker comparisons
+        shell: pwsh
+        run: |
+          python -m pip install matplotlib==3.10.1
+          python .github/parallel/scale.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: parallel-results-${{ github.sha }}
+          path: parallel-results/
+          if-no-files-found: error
+
+  profile:
+    needs: build
+    runs-on: windows-2022
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, 'Parallel-KFX profile')
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: parallel-hosts-${{ github.sha }}
+      - name: Build separate instrumented renderer
+        shell: cmd
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+          pwsh -File .github\ci\build-bench-component.ps1 -Component profile -Revision "%GITHUB_SHA%" || exit /b 1
+      - name: Collect KFX and mixed-scene worker diagnostics
+        shell: pwsh
+        run: |
+          python .github/kfx/fixture.py
+          $plan = Get-Content kfx-plan.json -Raw | ConvertFrom-Json
+          foreach ($workers in @(1,2,4)) {
+            $env:OBORODZUKI_WORKERS = "$workers"
+            & hosts/kfx-playback.exe csri "$pwd/bundle/renderer.dll" "$pwd/$($plan.fixture)" "$pwd/worker-profile/$workers" "$($plan.dialogue_events)" "$($plan.size_bytes)" --window 3300 3900
+            if ($LASTEXITCODE) { throw 'Instrumented playback failed' }
+          }
+          python .github/parallel/scale.py --fixtures-only
+          $env:OBORODZUKI_BENCH_ITERATION = '1'
+          foreach ($workers in @(1,2,4)) {
+            $env:OBORODZUKI_WORKERS = "$workers"
+            & hosts/render-bench.exe csri "$pwd/bundle/renderer.dll" "$pwd/parallel-results/mixed.ass" animation |
+              Set-Content "worker-profile/mixed-$workers.json"
+            if ($LASTEXITCODE) { throw 'Instrumented mixed workload failed' }
+          }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: worker-profile-${{ github.sha }}
+          path: worker-profile/
