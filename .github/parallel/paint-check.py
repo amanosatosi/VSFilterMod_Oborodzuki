@@ -636,6 +636,37 @@ if ROUND3:
     for workers in (2, 4, 6, 8):
         assert benchmark(CANDIDATE, columns, workers, "regression")["hashes"] == expected
 
+    eight = r"\distort(1,0,1,1,0,1,.25,0)"
+    six = r"\distort(1,0,1,1,0,1)"
+    warp = write("distortion-and-warped-anchors", [
+        (200, 210, rf"\1c{WHITE}\p1" + eight, bars),
+        (560, 210, rf"\1c{WHITE}\p1" + six, bars),
+        (920, 210, rf"\1c{WHITE}\p1" + eight + t(six), bars),
+        (1270, 210, rf"\1c{WHITE}\p1" + six + t(r"\distort(1,0,1,1,0,1,~+.25,0)"), bars),
+        (410, 650, rf"\an5\fs45\1c{WHITE}\wtan8\distort(1,-.15,1.2,1.15,-.1,1.1,.1,.05)",
+         r"FIRST LINE\NMUCH LONGER SECOND LINE\NTHIRD"),
+        (1160, 650, rf"\an5\fs45\1c{WHITE}\wtan2\distort(1,-.15,1.2,1.15,-.1,1.1,.1,.05)",
+         r"FIRST LINE\NMUCH LONGER SECOND LINE\NTHIRD"),
+    ])
+    centers = {"eight": (200, 210), "six": (560, 210), "to-six": (920, 210),
+               "relative": (1270, 210), "top": (410, 650), "bottom": (1160, 650)}
+    playback("csri", CANDIDATE, warp, ROOT / "warp")
+    playback("rgba", MANG, warp, ROOT / "warp-reference")
+    for getter in (captures(ROOT / "warp", centers), captures(ROOT / "warp-reference", centers)):
+        assert min(getter(60, "eight", 90, 2)) > 220
+        assert max(getter(60, "eight", 12, 2)) < 15
+        assert min(getter(60, "six", 12, 2)) > 220
+        assert max(getter(60, "to-six", 12, 2)) < 15
+        assert min(getter(120, "to-six", 12, 2)) > 220
+        assert min(getter(60, "relative", 12, 2)) > 220
+        assert max(getter(120, "relative", 12, 2)) < 15
+        top = ink_bounds(getter, 60, "top", left=-395, right=430, top=-100, bottom=220)
+        bottom = ink_bounds(getter, 60, "bottom", left=-395, right=430, top=-220, bottom=100)
+        assert -4 <= top[1] <= 10 and -10 <= bottom[3] <= 4, (top, bottom)
+    expected = benchmark(CANDIDATE, warp, 1, "regression")["hashes"]
+    for workers in (2, 4, 6, 8):
+        assert benchmark(CANDIDATE, warp, workers, "regression")["hashes"] == expected
+
 # Check old corner math against the validated VSFilterMod path rather than
 # requiring its different legacy bitmap geometry to agree with libass.
 playback("csri", Path("threading-baseline/renderer/renderer.dll").resolve(), grid, ROOT / "previous")

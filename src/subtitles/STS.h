@@ -187,6 +187,8 @@ class MOD_DISTORT
 public:
     double  pointsx[3]; //P1-P3
     double  pointsy[3]; //P1-P3
+    double  x0 = 0, y0 = 0;
+    bool extended = false;
     bool enabled;
 
     MOD_DISTORT();

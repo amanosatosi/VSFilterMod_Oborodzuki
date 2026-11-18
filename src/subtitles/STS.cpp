@@ -4277,6 +4277,7 @@ MOD_DISTORT::MOD_DISTORT()
 bool MOD_DISTORT::operator == (MOD_DISTORT& md)
 {
     return(enabled == md.enabled
+           && extended == md.extended && x0 == md.x0 && y0 == md.y0
            && pointsx[0] == md.pointsx[0]
            && pointsx[1] == md.pointsx[1]
            && pointsx[2] == md.pointsx[2]

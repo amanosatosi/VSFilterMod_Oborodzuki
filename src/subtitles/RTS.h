@@ -81,6 +81,7 @@ protected:
     std::unique_ptr<LayoutPlacement> m_layoutPlacement;
     void RotateLayoutOutline();
     bool m_projectedPath = false;
+    bool m_rawPathReady = false;
 #endif
 
     void MeasureSelectedFont();
@@ -120,7 +121,12 @@ public:
         m_layoutPlacement->clipEnd = end;
     }
     CRect RubyClip(const CRect& clip, int x, int y) const;
+    void OffsetLayout(CPoint offset);
+    bool RawOutlineBounds(CRect& bounds);
+    void SetDistortionDomain(const CRect& domain) { m_distortionDomain = std::make_unique<CRect>(domain); }
+    void AddWarpedBounds(CPoint position, RenderGeometry::Point& min, RenderGeometry::Point& max) const;
     bool m_verticalWord = false;
+    bool m_isRubyReading = false;
     unsigned m_rubyGroup = 0;
     unsigned m_columnCell = 0;
     int VerticalPaintSplit(int y, double progress) const
@@ -327,6 +333,10 @@ public:
     std::vector<std::unique_ptr<SemanticColumns::Block>> m_columnBlocks;
     SemanticColumns::Block* m_columns = nullptr;
     void ArrangeColumns();
+    bool m_hasExtendedWarp = false;
+    int m_warpedAnchor = 0;
+    CPoint m_warpedShift = CPoint(0, 0);
+    void ConfigureDistortion();
     double m_clipOffsetX = 0, m_clipOffsetY = 0;
     bool m_hasRectClip = false;
     struct LineAlignment { int first, inherited, full; };

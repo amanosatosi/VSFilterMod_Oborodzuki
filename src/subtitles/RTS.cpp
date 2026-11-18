@@ -626,6 +626,63 @@ void CWord::PlaceLayout(CPoint offset, double cosine, double sine, double center
     m_layoutPlacement->rotate = cosine != 1 || sine != 0 || center != 0 || baseline != 0;
 }
 
+void CWord::OffsetLayout(CPoint offset)
+{
+    if (!m_layoutPlacement) m_layoutPlacement = std::make_unique<LayoutPlacement>();
+    m_layoutPlacement->offset += offset;
+}
+
+bool CWord::RawOutlineBounds(CRect& rectangle)
+{
+    if (!m_rawPathReady) m_rawPathReady = CreatePath();
+    if (!m_rawPathReady || !mPathPoints) return false;
+    rectangle.SetRect(INT_MAX, INT_MAX, INT_MIN, INT_MIN);
+    for (size_t i = 0; i < mPathPoints; ++i)
+    {
+        const auto& point = mpPathPoints[i];
+        rectangle.left = (std::min)(rectangle.left, point.x);
+        rectangle.top = (std::min)(rectangle.top, point.y);
+        rectangle.right = (std::max)(rectangle.right, point.x);
+        rectangle.bottom = (std::max)(rectangle.bottom, point.y);
+    }
+    return true;
+}
+
+void CWord::AddWarpedBounds(CPoint position, RenderGeometry::Point& min, RenderGeometry::Point& max) const
+{
+    if (!m_rawPathReady) return;
+    const double sx = isOpaqueBox ? 1 : m_style.fontScaleX / 100;
+    const double sy = isOpaqueBox ? 1 : m_style.fontScaleY / 100;
+    const auto& warp = m_style.mod_distort;
+    const auto* domain = m_distortionDomain.get();
+    for (size_t i = 0; i < mPathPoints; ++i)
+    {
+        double x = mpPathPoints[i].x, y = mpPathPoints[i].y;
+        const auto* pose = m_layoutPlacement.get();
+        if (pose && pose->rotate && sx && sy)
+        {
+            const double dx = x * sx - pose->center, dy = y * sy - pose->baseline;
+            x = (dx * pose->cosine - dy * pose->sine) / sx;
+            y = (dx * pose->sine + dy * pose->cosine) / sy;
+        }
+        if (domain && warp.enabled && domain->Width() && domain->Height())
+        {
+            const double u = (x - domain->left) / domain->Width();
+            const double v = (y - domain->top) / domain->Height();
+            const double p0 = (1 - u) * (1 - v);
+            x = domain->left + domain->Width() * (u * warp.pointsx[0] + v * warp.pointsx[2] +
+                u * v * (warp.pointsx[1] - warp.pointsx[0] - warp.pointsx[2]) + p0 * warp.x0);
+            y = domain->top + domain->Height() * (u * warp.pointsy[0] + v * warp.pointsy[2] +
+                u * v * (warp.pointsy[1] - warp.pointsy[0] - warp.pointsy[2]) + p0 * warp.y0);
+        }
+        const double px = position.x + x * sx / 8, py = position.y + y * sy / 8;
+        min.x = (std::min)(min.x, px);
+        min.y = (std::min)(min.y, py);
+        max.x = (std::max)(max.x, px);
+        max.y = (std::max)(max.y, py);
+    }
+}
+
 CRect CWord::RubyClip(const CRect& clip, int x, int y) const
 {
     CRect result = clip;
@@ -674,7 +731,8 @@ bool CWord::PrepareProjectedPath(const RenderGeometry::Perspective& projection, 
 {
     if (m_fLineBreak || m_fWhiteSpaceChar) return true;
     ResetProjectedPath();
-    if (!CreatePath()) return false;
+    if (!m_rawPathReady && !CreatePath()) return false;
+    m_rawPathReady = false;
     if (m_layoutPlacement && m_layoutPlacement->rotate) RotateLayoutOutline();
     Transform(CPoint(relativeOrigin.x * 8, relativeOrigin.y * 8));
     using namespace RenderGeometry;
@@ -1002,6 +1060,7 @@ CWord::CWord(CWord& word)
         m_layoutPlacement = std::make_unique<LayoutPlacement>(*word.m_layoutPlacement);
     m_wrapAfter = word.m_wrapAfter;
     m_verticalWord = word.m_verticalWord;
+    m_isRubyReading = word.m_isRubyReading;
     m_rubyGroup = word.m_rubyGroup;
     m_columnCell = word.m_columnCell;
 #endif
@@ -1050,7 +1109,12 @@ void CWord::Paint(CPoint p, CPoint org)
         if (!projected)
         {
 #endif
+#ifdef _VSMOD
+        if (!m_rawPathReady && !CreatePath()) return;
+        m_rawPathReady = false;
+#else
         if(!CreatePath()) return;
+#endif
 
 #ifdef _VSMOD
         if (m_layoutPlacement && m_layoutPlacement->rotate)
@@ -1289,6 +1353,9 @@ void CWord::Transform(CPoint org)
         __m128 __max = _mm_set_ps(-INT_MAX, -INT_MAX, 1, 1);
 
         bool is_dist = m_style.mod_distort.enabled;
+        const bool additionalPin = m_style.mod_distort.x0 != 0 || m_style.mod_distort.y0 != 0;
+        const __m128 zeroPinX = _mm_set_ps1(float(m_style.mod_distort.x0));
+        const __m128 zeroPinY = _mm_set_ps1(float(m_style.mod_distort.y0));
         if(is_dist)
         {
             if (m_distortionDomain)
@@ -1311,6 +1378,8 @@ void CWord::Transform(CPoint org)
 
             __xsz = _mm_shuffle_ps(__max, __max, _MM_SHUFFLE(3,3,3,3));
             __ysz = _mm_shuffle_ps(__max, __max, _MM_SHUFFLE(2,2,2,2));
+            if (m_style.mod_distort.extended && (_mm_cvtss_f32(__xsz) == 0 || _mm_cvtss_f32(__ysz) == 0))
+                is_dist = false;
 
             __miny = _mm_shuffle_ps(__minx, __minx, _MM_SHUFFLE(2,2,2,2));
             __minx = _mm_shuffle_ps(__minx, __minx, _MM_SHUFFLE(3,3,3,3));
@@ -1380,6 +1449,12 @@ void CWord::Transform(CPoint org)
                 __m128 __1_ysz = _mm_rcp_ps(__ysz);
                 __u = _mm_mul_ps(__u, __1_xsz);
                 __v = _mm_mul_ps(__v, __1_ysz);
+                __m128 zeroWeight = _mm_setzero_ps();
+                if (additionalPin)
+                {
+                    const auto one = _mm_set_ps1(1);
+                    zeroWeight = _mm_mul_ps(_mm_sub_ps(one, __u), _mm_sub_ps(one, __v));
+                }
 
                 // x
                 __pointx = _mm_mul_ps(__dst213x, __u);
@@ -1389,6 +1464,7 @@ void CWord::Transform(CPoint org)
                 __pointx = _mm_add_ps(__pointx, __tmpx);
                 __tmpx = _mm_mul_ps(__dst1x, __u);
                 __pointx = _mm_add_ps(__pointx, __tmpx);
+                if (additionalPin) __pointx = _mm_add_ps(__pointx, _mm_mul_ps(zeroPinX, zeroWeight));
 
                 __pointx = _mm_mul_ps(__pointx, __xsz);
                 __pointx = _mm_add_ps(__pointx, __minx);
@@ -1399,6 +1475,7 @@ void CWord::Transform(CPoint org)
 
                 __m128 __tmpy = _mm_mul_ps(__dst3y, __v);
                 __pointy = _mm_add_ps(__pointy, __tmpy);
+                if (additionalPin) __pointy = _mm_add_ps(__pointy, _mm_mul_ps(zeroPinY, zeroWeight));
                 __tmpy = _mm_mul_ps(__dst1y, __u);
                 __pointy = _mm_add_ps(__pointy, __tmpy);
 
@@ -1592,6 +1669,12 @@ void CWord::Transform(CPoint org)
 
                 x = minx + (0 + (dst1x - 0) * u + (dst3x - 0) * v + (0 + dst2x - dst1x - dst3x) * u * v) * xsz;
                 y = miny + (0 + (dst1y - 0) * u + (dst3y - 0) * v + (0 + dst2y - dst1y - dst3y) * u * v) * ysz;
+                if (m_style.mod_distort.x0 != 0 || m_style.mod_distort.y0 != 0)
+                {
+                    const double zeroWeight = (1 - u) * (1 - v);
+                    x += xsz * zeroWeight * m_style.mod_distort.x0;
+                    y += ysz * zeroWeight * m_style.mod_distort.y0;
+                }
                 //P = P0 + (P1 - P0)u + (P3 - P0)v + (P0 + P2 - P1 - P3)uv
             }
 
@@ -4236,6 +4319,105 @@ void CSubtitle::ConfigurePerspective()
     }
 }
 
+void CSubtitle::ConfigureDistortion()
+{
+    if (!m_hasExtendedWarp && !m_warpedAnchor) return;
+    struct Glyph
+    {
+        CWord* word;
+        CRect path;
+        CPoint position;
+        double sx, sy;
+        bool text;
+    };
+    const int eventTop = m_scrAlignment <= 3 ? -m_rect.Height() :
+        m_scrAlignment <= 6 ? -m_rect.Height() / 2 : 0;
+    std::vector<Glyph> glyphs;
+    int y = eventTop;
+    bool warpedText = false, extendedText = false;
+    for (auto next = GetHeadPosition(); next;)
+    {
+        auto* line = GetNext(next);
+        int x = LineLeft(*line, 0);
+        for (auto pos = line->GetHeadPosition(); pos;)
+        {
+            auto* word = line->GetNext(pos);
+            const auto& style = word->m_style;
+            const CPoint flat(x - style.mod_horizontalSpace,
+                y + line->m_ascent - word->m_ascent - style.mod_verticalSpace);
+            x += word->m_width;
+            if (word->m_fWhiteSpaceChar || word->m_fLineBreak) continue;
+            const bool text = !dynamic_cast<CPolygon*>(word);
+            const double sx = style.fontScaleX / 100, sy = style.fontScaleY / 100;
+            CRect box;
+            if (sx <= 0 || sy <= 0 || !word->RawOutlineBounds(box)) continue;
+            glyphs.push_back({word, box, word->LayoutPosition(flat), sx, sy, text});
+            warpedText |= text && style.mod_distort.enabled;
+            extendedText |= text && (style.mod_distort.extended || style.mod_distort.x0 != 0 || style.mod_distort.y0 != 0);
+        }
+        y += line->m_ascent + line->m_descent;
+    }
+    bool firstUnit = true;
+    for (size_t start = 0; start < glyphs.size();)
+    {
+        const auto& first = glyphs[start];
+        const auto& warp = first.word->m_style.mod_distort;
+        const auto begin = start++;
+        if (!first.text || !warp.enabled) continue;
+        if (!warp.extended)
+        {
+            first.word->SetDistortionDomain(first.path);
+            continue;
+        }
+        while (start < glyphs.size() && glyphs[start].text &&
+            (glyphs[start].word->m_isRubyReading || glyphs[start].word->m_style == first.word->m_style))
+            ++start;
+        InkBox band;
+        for (size_t i = begin; i < start; ++i)
+        {
+            const auto& glyph = glyphs[i];
+            if (glyph.word->m_isRubyReading) continue;
+            band.Add(glyph.position.x * 8 + glyph.path.left * glyph.sx, glyph.position.y * 8 + glyph.path.top * glyph.sy);
+            band.Add(glyph.position.x * 8 + glyph.path.right * glyph.sx, glyph.position.y * 8 + glyph.path.bottom * glyph.sy);
+        }
+        if (!band.valid) continue;
+        const auto local = [&](CPoint position, double sx, double sy) {
+            return CRect(LONG(std::lround((band.left - position.x * 8.) / sx)),
+                LONG(std::lround((band.top - position.y * 8.) / sy)),
+                LONG(std::lround((band.right - position.x * 8.) / sx)),
+                LONG(std::lround((band.bottom - position.y * 8.) / sy)));
+        };
+        for (size_t i = begin; i < start; ++i)
+        {
+            const auto& glyph = glyphs[i];
+            if (!glyph.word->m_isRubyReading)
+                glyph.word->SetDistortionDomain(local(glyph.position, glyph.sx, glyph.sy));
+        }
+        if (firstUnit)
+            for (auto& box : m_eventBox)
+                if (box->m_style.mod_distort.enabled && box->m_style.mod_distort.extended)
+                    box->SetDistortionDomain(local(CPoint(0, eventTop), 1, 1));
+        firstUnit = false;
+    }
+    if (!warpedText || (!extendedText && !m_warpedAnchor)) return;
+    RenderGeometry::Point low{1e20, 1e20}, high{-1e20, -1e20};
+    for (const auto& glyph : glyphs)
+        if (glyph.text)
+            glyph.word->AddWarpedBounds(glyph.position, low, high);
+    if (low.x > high.x || low.y > high.y) return;
+    const int align = m_warpedAnchor ? m_warpedAnchor : m_scrAlignment;
+    const double x = align % 3 == 1 ? low.x : align % 3 == 2 ? (low.x + high.x) / 2 : high.x;
+    const double yAnchor = align <= 3 ? high.y : align <= 6 ? (low.y + high.y) / 2 : low.y;
+    if (std::abs(x) > 2097152 || std::abs(yAnchor) > 2097152) return;
+    m_warpedShift = CPoint(LONG(std::lround(-x)), LONG(std::lround(-yAnchor)));
+    for (auto next = GetHeadPosition(); next;)
+    {
+        auto* line = GetNext(next);
+        for (auto pos = line->GetHeadPosition(); pos;)
+            line->GetNext(pos)->OffsetLayout(m_warpedShift);
+    }
+}
+
 void CSubtitle::PreparePerspective(CPoint anchor, CPoint origin, const CRect& bounds, REFERENCE_TIME timestamp)
 {
     if (!m_perspective) return;
@@ -4254,7 +4436,7 @@ void CSubtitle::PreparePerspective(CPoint anchor, CPoint origin, const CRect& bo
     };
     bool valid = true;
     for (auto& box : m_eventBox)
-        if (!(valid = project(*box, CPoint(anchor.x, bounds.top)))) break;
+        if (!(valid = project(*box, CPoint(anchor.x, bounds.top) + m_warpedShift))) break;
     int y = bounds.top;
     for (auto line = GetHeadPosition(); valid && line;)
     {
@@ -4803,6 +4985,7 @@ bool CRenderedTextSubtitle::ParseFurigana(CSubtitle* sub, Furigana::Fields& fiel
             glyphStyle.fontScaleX *= group.options.scaleX / 100;
             glyphStyle.fontScaleY *= group.options.scaleY / 100;
             glyphStyle.fontSpacing = sub->m_vertical ? 0 : group.options.spacing * sub->m_scalex * 64;
+            glyphStyle.mod_distort = MOD_DISTORT();
         }
         for (size_t i = 0; i < run->clusters.size(); ++i)
         {
@@ -4812,6 +4995,7 @@ bool CRenderedTextSubtitle::ParseFurigana(CSubtitle* sub, Furigana::Fields& fiel
             if (segment != timing.begin()) --segment;
             auto word = std::make_unique<ShapedWord>(glyphStyle, plain.Mid(cluster.start, cluster.length), run, i,
                 segment->type, segment->start, segment->end, sub->m_scalex, sub->m_scaley);
+            word->m_isRubyReading = side != 0;
             const double width = word->m_fWhiteSpaceChar ? 0 : (std::max)(1, word->m_width);
             if (side == owner && width && (segment->explicitTag || timing.size() > 1))
             {
@@ -5788,6 +5972,8 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
             params.push_back(cmd.Mid(6)), cmd = cmd.Left(6);
         else if (!cmd.Find(L"vsp"))
             params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+        else if (!cmd.Find(L"wtan"))
+            params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
 #endif
         else if(!cmd.Find(L"xbord"))
             params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
@@ -6011,6 +6197,14 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         CStringW p = params.size() > 0 ? params[0] : L"";
 
 #ifdef _VSMOD
+        if (cmd == L"wtan")
+        {
+            const wchar_t* value = p;
+            const int digit = ReadDecimalDigit(value);
+            if (!fAnimate && !sub->m_warpedAnchor && digit >= 1 && digit <= 9 && !*value)
+                sub->m_warpedAnchor = digit;
+            continue;
+        }
         if (cmd == L"col" || cmd == L"colan" || cmd == L"colsp")
         {
             if (fAnimate || sub->m_vertical) continue;
@@ -7115,19 +7309,40 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #ifdef _VSMOD // patch m008. distort
         else if(cmd == L"distort")
         {
-            if(params.size() >= 6)
+            const bool extended = params.size() == 8;
+            const bool legacy = params.size() == 6 || (params.size() == 7 && params.back().IsEmpty());
+            if (extended || legacy)
             {
-                DWORD c;
-                for(int j = 0; j < 3; j++)
+                const auto& from = style.mod_distort;
+                MOD_DISTORT to = from;
+                bool valid = true;
+                const auto apply = [&](CStringW value, double current, double& output) {
+                    value.Trim();
+                    if (value.IsEmpty()) return true;
+                    AssNumeric::Operand operand;
+                    if (!readOperand(value, false, false, operand)) return false;
+                    const double target = operand.Resolve(current);
+                    if (!std::isfinite(target) || std::abs(target) > 1024) return false;
+                    output = CalcAnimation(target, current, fAnimate);
+                    return true;
+                };
+                for (size_t j = 0; valid && j < 3; ++j)
+                    valid = apply(params[2*j], from.pointsx[j], to.pointsx[j]) &&
+                        apply(params[2*j+1], from.pointsy[j], to.pointsy[j]);
+                if (extended && valid)
+                    valid = apply(params[6], from.x0, to.x0) && apply(params[7], from.y0, to.y0);
+                else if (valid)
                 {
-                    style.mod_distort.pointsx[j] = !p.IsEmpty()
-                                                   ? (CalcAnimation(wcstod(params[j*2], NULL), style.mod_distort.pointsx[j], fAnimate))
-                                                   : org.mod_distort.pointsx[j];
-                    style.mod_distort.pointsy[j] = !p.IsEmpty()
-                                                   ? (CalcAnimation(wcstod(params[j*2+1], NULL), style.mod_distort.pointsy[j], fAnimate))
-                                                   : org.mod_distort.pointsy[j];
+                    to.x0 = CalcAnimation(0, from.x0, fAnimate);
+                    to.y0 = CalcAnimation(0, from.y0, fAnimate);
                 }
-                style.mod_distort.enabled = true;
+                if (valid)
+                {
+                    to.enabled = true;
+                    to.extended = extended;
+                    style.mod_distort = to;
+                    sub->m_hasExtendedWarp |= extended;
+                }
             }
         }
 #endif
@@ -7806,6 +8021,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 sub->m_curveAnchor = 0;
                 sub->m_curveX = sub->m_curveY = 0;
                 sub->m_rubyOptions = Furigana::Options{};
+                sub->m_warpedAnchor = 0;
             }
 #endif
 #ifdef _VSMOD
@@ -8532,6 +8748,7 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
             sub->m_fAnimated = true;
         sub->CreateEventBox(borderStyle, m_time, m_fScaledBAS);
     }
+    sub->ConfigureDistortion();
     sub->ConfigurePerspective();
 #endif
 
@@ -9359,7 +9576,7 @@ try
 #ifdef _VSMOD
         if (!s->m_eventBox.empty())
         {
-            const CPoint origin(org.x, p2.y);
+            const CPoint origin = CPoint(org.x, p2.y) + s->m_warpedShift;
             for (auto i = s->m_eventBox.rbegin(); i != s->m_eventBox.rend(); ++i)
             {
                 auto& box = **i;
