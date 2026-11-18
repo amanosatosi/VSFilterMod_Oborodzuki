@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cwctype>
+#include <list>
+#include <string>
 
 namespace ShapedText
 {
@@ -12,6 +14,17 @@ struct Context::Impl
 {
     HMODULE library = nullptr;
     CComPtr<IDWriteFactory> factory;
+    struct Entry
+    {
+        std::wstring text, family;
+        float em;
+        int weight;
+        bool italic, vertical;
+        size_t points;
+        std::shared_ptr<const Run> run;
+    };
+    std::list<Entry> cache;
+    size_t cachedPoints = 0;
 
     Impl()
     {
@@ -218,8 +231,17 @@ std::shared_ptr<const Run> Context::Shape(const wchar_t* text, unsigned length, 
 {
     if (!length || length > 8192 || em <= 0 || em > 4096 || !std::isfinite(em)) return {};
     if (!native->factory) return {};
-    CComPtr<IDWriteTextFormat> format;
     const auto face = *family == L'@' ? family + 1 : family;
+    if (length <= 512)
+        for (auto hit = native->cache.begin(); hit != native->cache.end(); ++hit)
+            if (hit->text.size() == length && hit->em == em && hit->weight == weight &&
+                hit->italic == italic && hit->vertical == verticalVariants && hit->family == face &&
+                std::char_traits<wchar_t>::compare(hit->text.data(), text, length) == 0)
+            {
+                native->cache.splice(native->cache.begin(), native->cache, hit);
+                return hit->run;
+            }
+    CComPtr<IDWriteTextFormat> format;
     if (FAILED(native->factory->CreateTextFormat(face, nullptr, DWRITE_FONT_WEIGHT((std::max)(1, (std::min)(999, weight))),
             italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, em, L"", &format)))
         return {};
@@ -250,6 +272,24 @@ std::shared_ptr<const Run> Context::Shape(const wchar_t* text, unsigned length, 
     std::stable_sort(result->clusters.begin(), result->clusters.end(), [](const Cluster& a, const Cluster& b) {
         return a.left < b.left;
     });
+    if (length <= 512)
+    {
+        size_t points = length;
+        for (const auto& cluster : result->clusters)
+            for (const auto& glyph : cluster.glyphs)
+                points += glyph.points.size() + 1;
+        if (points <= 32768)
+        {
+            while (native->cache.size() == 64 || native->cachedPoints + points > 262144)
+            {
+                native->cachedPoints -= native->cache.back().points;
+                native->cache.pop_back();
+            }
+            native->cache.push_front({std::wstring(text, length), face, em, weight, italic,
+                verticalVariants, points, result});
+            native->cachedPoints += points;
+        }
+    }
     return result;
 }
 }

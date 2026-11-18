@@ -798,13 +798,13 @@ bool CWord::RasterizeDecorations(CPoint p, CPoint org)
 }
 
 CRect CWord::DrawBodyPaint(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int y, const DWORD* colors,
-    MOD_MOVEVC& vectorClip, bool reverse)
+    MOD_MOVEVC& vectorClip, bool reverse, int channel)
 {
     auto& style = m_style.mod_grad;
     if (!m_decorationMask)
-        return Draw(spd, clip, mask, x, y, colors, true, false, 0, style, vectorClip, m_style.mod_blendMode, reverse);
+        return Draw(spd, clip, mask, x, y, colors, true, false, channel, style, vectorClip, m_style.mod_blendMode, reverse);
 
-    auto bounds = m_undecoratedGlyphs->Draw(spd, clip, mask, x, y, colors, true, false, 0,
+    auto bounds = m_undecoratedGlyphs->Draw(spd, clip, mask, x, y, colors, true, false, channel,
         style, vectorClip, m_style.mod_blendMode, reverse);
     const auto& deco = *m_style.decoration;
     auto gradient = style;
@@ -832,7 +832,7 @@ CRect CWord::DrawBodyPaint(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int 
         }
     }
     gradient.paint = std::move(sources);
-    bounds |= m_decorationMask->Draw(spd, clip, mask, x, y, palette, true, false, 0,
+    bounds |= m_decorationMask->Draw(spd, clip, mask, x, y, palette, true, false, channel,
         gradient, vectorClip, m_style.mod_blendMode, reverse);
     return bounds;
 }
@@ -877,6 +877,7 @@ CWord::CWord(CWord& word)
     if (word.m_layoutPlacement)
         m_layoutPlacement = std::make_unique<LayoutPlacement>(*word.m_layoutPlacement);
     m_wrapAfter = word.m_wrapAfter;
+    m_verticalWord = word.m_verticalWord;
 #endif
 }
 
@@ -1670,6 +1671,7 @@ public:
 
     CWord* Copy() override { return new ShapedWord(*this); }
     bool Append(CWord*) override { return false; }
+    const CStringW& Text() const { return m_str; }
 
     template<class Visit>
     void OutlinePoints(Visit visit) const
@@ -2544,7 +2546,11 @@ CRect CLine::PaintBody(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoin
                 t = 1.0 * (time - w->m_kstart) / (w->m_kend - w->m_kstart);
 
                 double angle = fmod(w->m_style.fontAngleZ, 360.0);
-                if(angle > 90 && angle < 270)
+                if(
+#ifdef _VSMOD
+                    !w->m_verticalWord &&
+#endif
+                    angle > 90 && angle < 270)
                 {
                     reversePaint = true;
                     t = 1 - t;
@@ -2592,7 +2598,26 @@ CRect CLine::PaintBody(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoin
         sw[3] = (int)(w->m_style.outlineWidthX + t * w->getOverlayWidth() + t * bluradjust) >> 3;
 
 #ifdef _VSMOD // patch m004. gradient colors
-        bbox |= w->DrawBodyPaint(spd, clipRect, pAlphaMask, x, y, sw, mod_vc, reversePaint);
+        if (w->m_verticalWord && w->m_ktype == 1)
+        {
+            sw[1] = 0xffffffff;
+            const int split = w->VerticalPaintSplit(y, t);
+            if (t > 0)
+            {
+                auto top = clipRect;
+                if (t < 1) top.bottom = (std::min)(top.bottom, LONG(split));
+                bbox |= w->DrawBodyPaint(spd, top, pAlphaMask, x, y, sw, mod_vc, false);
+            }
+            if (t < 1)
+            {
+                auto bottom = clipRect;
+                if (t > 0) bottom.top = (std::max)(bottom.top, LONG(split));
+                sw[0] = secondary;
+                bbox |= w->DrawBodyPaint(spd, bottom, pAlphaMask, x, y, sw, mod_vc, false, 1);
+            }
+        }
+        else
+            bbox |= w->DrawBodyPaint(spd, clipRect, pAlphaMask, x, y, sw, mod_vc, reversePaint);
 #else
         bbox |= w->Draw(spd, clipRect, pAlphaMask, x, y, sw, true, false);
 #endif
@@ -2933,6 +2958,10 @@ void CSubtitle::MakeLines(CSize size, CRect marginRect)
 
     CLine* l = NULL;
 
+#ifdef _VSMOD
+    if (!m_vertical || !MakeVerticalLines(size.cy - marginRect.top - marginRect.bottom, spaceNeeded))
+#endif
+    {
     POSITION pos = m_words.GetHeadPosition();
     while(pos)
     {
@@ -2955,6 +2984,7 @@ void CSubtitle::MakeLines(CSize size, CRect marginRect)
     }
 
     if(l) m_bottomborder = l->m_borderY;
+    }
 
     m_rect = CRect(
                  CPoint((m_scrAlignment % 3) == 1 ? marginRect.left
@@ -2983,6 +3013,7 @@ int CSubtitle::LineLeft(const CLine& line, int anchor) const
     };
     const int normal = m_scrAlignment % 3;
 #ifdef _VSMOD
+    if (m_verticalLaidOut) return anchor - offset(line.m_width, normal);
     const int text = m_textAnchor < 0 ? normal : m_textAnchor;
     if (line.m_horizontalAnchor >= 0)
         return anchor - offset(m_textWidth, text) + offset(m_textWidth - line.m_width, line.m_horizontalAnchor);
@@ -3139,9 +3170,247 @@ void CSubtitle::CreateEventBox(int borderStyle, int time, bool scaledBorder)
         }
 }
 
+namespace
+{
+unsigned FirstScalar(const CStringW& text)
+{
+    int index = 0;
+    if (text.IsEmpty()) return 0;
+    const unsigned first = text[index++];
+    if (first >= 0xd800 && first <= 0xdbff && index < text.GetLength())
+    {
+        const unsigned second = text[index];
+        if (second >= 0xdc00 && second <= 0xdfff)
+            return 0x10000 + ((first - 0xd800) << 10) + second - 0xdc00;
+    }
+    return first;
+}
+
+bool CoreCjk(unsigned c)
+{
+    return (c >= 0x3040 && c <= 0x30ff) || (c >= 0x31f0 && c <= 0x31ff) ||
+        (c >= 0x3400 && c <= 0x9fff) || (c >= 0xf900 && c <= 0xfaff) ||
+        (c >= 0x1100 && c <= 0x11ff) || (c >= 0x3130 && c <= 0x318f) ||
+        (c >= 0xac00 && c <= 0xd7af) || (c >= 0x20000 && c <= 0x323af);
+}
+
+bool Myanmar(unsigned c)
+{
+    return (c >= 0x1000 && c <= 0x109f) || (c >= 0xa9e0 && c <= 0xa9ff) ||
+        (c >= 0xaa60 && c <= 0xaa7f);
+}
+
+bool CjkVerticalForm(unsigned c)
+{
+    return CoreCjk(c) || (c >= 0x3000 && c <= 0x303f) ||
+        (c >= 0xfe10 && c <= 0xfe4f) || (c >= 0xff01 && c <= 0xff65);
+}
+
+enum class MyanmarPart { Other, Base, Mark, Asat, Stack, Join };
+
+MyanmarPart MyanmarClass(unsigned c)
+{
+    if (c == 0x103a) return MyanmarPart::Asat;
+    if (c == 0x1039) return MyanmarPart::Stack;
+    if (c == 0x200c || c == 0x200d) return MyanmarPart::Join;
+    if ((c >= 0x1000 && c <= 0x1021) || (c >= 0x1023 && c <= 0x1027) ||
+        c == 0x1029 || c == 0x102a || c == 0x103f || c == 0x104e)
+        return MyanmarPart::Base;
+    if ((c >= 0x102b && c <= 0x103e) || (c >= 0x1056 && c <= 0x1059) ||
+        (c >= 0x1060 && c <= 0x109d) || (c >= 0xaa7b && c <= 0xaa7d))
+        return MyanmarPart::Mark;
+    return MyanmarPart::Other;
+}
+
+bool MyanmarContinuation(const std::vector<ShapedWord*>& words, size_t at)
+{
+    const auto& current = words[at]->Text();
+    const auto& previous = words[at - 1]->Text();
+    const auto next = MyanmarClass(FirstScalar(current));
+    if (next == MyanmarPart::Other) return false;
+    if (next != MyanmarPart::Base) return true;
+    const auto last = MyanmarClass(previous[previous.GetLength() - 1]);
+    if (last == MyanmarPart::Stack || last == MyanmarPart::Join) return true;
+    if (last == MyanmarPart::Other) return false;
+    // An asat can follow tone marks on a final consonant in a later cluster.
+    for (size_t i = at; i < words.size() && words[i]; ++i)
+    {
+        const auto& text = words[i]->Text();
+        for (int j = i == at ? 1 : 0; j < text.GetLength(); ++j)
+        {
+            const auto part = MyanmarClass(text[j]);
+            if (part == MyanmarPart::Asat) return true;
+            if (part != MyanmarPart::Mark && part != MyanmarPart::Join) return false;
+        }
+    }
+    return false;
+}
+}
+
+bool CSubtitle::MakeVerticalLines(int maxHeight, CSize& bounds)
+{
+    if (m_curveShapeFailed || m_words.IsEmpty()) return false;
+    std::vector<ShapedWord*> words;
+    int directionScore = 0, firstDirection = 0;
+    for (auto pos = m_words.GetHeadPosition(); pos;)
+    {
+        auto* word = m_words.GetNext(pos);
+        auto* shaped = dynamic_cast<ShapedWord*>(word);
+        if (!word->m_fLineBreak && !shaped) return false;
+        words.push_back(shaped);
+        if (!shaped) continue;
+        const unsigned c = FirstScalar(shaped->Text());
+        const bool latin = (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z') ||
+            (c >= 0xc0 && c <= 0x2af);
+        const int strength = CoreCjk(c) ? 1 : Myanmar(c) || latin ? -1 : 0;
+        directionScore += strength;
+        if (!firstDirection) firstDirection = strength;
+    }
+    if (words.size() > 8192) return false;
+    const bool leftward = m_verticalDirection ? m_verticalDirection == 1 :
+        directionScore > 0 || (!directionScore && firstDirection > 0);
+
+    struct Unit
+    {
+        size_t first, last;
+        double left, top, width, height, gap;
+        bool sideways, canBreak;
+    };
+    struct Column { size_t first, last; double width, height; int anchor; };
+    std::vector<Unit> units;
+    std::vector<Column> columns;
+    const auto boundSpacing = [](double value) {
+        return (std::max)(-65536., (std::min)(65536., value));
+    };
+    const auto extra = boundSpacing(m_verticalSpacing * m_scaley * m_curveScale * 8);
+    const auto columnGap = boundSpacing(m_verticalColumnGap * m_scalex * m_curveScale * 8);
+    const auto gapAfter = [&](size_t at) { return (std::max)(units[at].gap, units[at + 1].gap); };
+    for (size_t start = 0; start < words.size();)
+    {
+        if (!words[start]) { ++start; continue; }
+        const size_t begin = units.size();
+        const auto logical = words[start]->m_logicalLine;
+        const auto selected = m_lineAlignment.find(logical);
+        const int alignment = selected != m_lineAlignment.end() ? selected->second.full :
+            m_verticalAnchor ? m_verticalAnchor : m_scrAlignment;
+        for (; start < words.size() && words[start];)
+        {
+            const auto c = FirstScalar(words[start]->Text());
+            const int profile = m_verticalProfile ? m_verticalProfile : CjkVerticalForm(c) ? 1 : Myanmar(c) ? 3 : 2;
+            const bool sideways = profile == 1 && c >= 0x21 && c != 0xa0 && !CjkVerticalForm(c) && !Myanmar(c);
+            size_t end = start + 1;
+            if (Myanmar(c))
+                while (end < words.size() && words[end] && MyanmarContinuation(words, end)) ++end;
+            double left = 0, right = 0, top = 0, bottom = 0, emX = 1, emY = 1, pen = 0;
+            bool ink = false;
+            for (size_t i = start; i < end; ++i)
+            {
+                auto& word = *words[i];
+                emX = (std::max)(emX, word.m_style.fontSize / 8 * word.m_style.fontScaleX / 100);
+                emY = (std::max)(emY, word.m_style.fontSize / 8 * word.m_style.fontScaleY / 100);
+                word.OutlinePoints([&](RenderGeometry::Point p) {
+                    p.x += pen;
+                    if (sideways) p = {-p.y, p.x};
+                    left = ink ? (std::min)(left, p.x) : p.x;
+                    right = ink ? (std::max)(right, p.x) : p.x;
+                    top = ink ? (std::min)(top, p.y) : p.y;
+                    bottom = ink ? (std::max)(bottom, p.y) : p.y;
+                    ink = true;
+                });
+                pen += word.m_width;
+            }
+            const double width = (std::max)(right - left, emX * (profile == 1 ? 1. : profile == 2 ? .4 : .65));
+            double height = (std::max)(bottom - top, emY * (profile == 1 ? 1. : profile == 2 ? .36 : .55));
+            if (!ink && profile != 1) height = (std::max)(height, (std::min)(pen, emY * .6));
+            const double gap = (std::max)(-.9 * height, extra + emY * (profile == 1 ? 0. : profile == 2 ? .14 : .18));
+            units.push_back({start, end, (left + right - width) / 2, (top + bottom - height) / 2,
+                width, height, gap, sideways, profile != 2 || words[end - 1]->m_wrapAfter});
+            start = end;
+        }
+
+        size_t first = begin;
+        while (first < units.size())
+        {
+            size_t last = first, legal = first;
+            double width = 0, height = 0;
+            for (; last < units.size(); ++last)
+            {
+                const auto candidate = height + units[last].height + (last == first ? 0 : gapAfter(last - 1));
+                if (last > first && m_wrapStyle != 2 && candidate > maxHeight) break;
+                height = candidate;
+                width = (std::max)(width, units[last].width);
+                if (units[last].canBreak) legal = last + 1;
+            }
+            if (last < units.size() && legal > first && legal < last)
+            {
+                last = legal;
+                width = height = 0;
+                for (size_t i = first; i < last; ++i)
+                {
+                    height += units[i].height + (i == first ? 0 : gapAfter(i - 1));
+                    width = (std::max)(width, units[i].width);
+                }
+            }
+            columns.push_back({first, last, width, height, alignment});
+            first = last;
+        }
+    }
+    if (columns.empty()) return false;
+    const auto advanceColumn = [&](double width) { return (std::max)(width * .1, width + columnGap); };
+    double width = 0, height = 0;
+    for (size_t i = 0; i < columns.size(); ++i)
+    {
+        width += i + 1 == columns.size() ? columns[i].width : advanceColumn(columns[i].width);
+        height = (std::max)(height, columns[i].height);
+    }
+    if (width > 4000000 || height > 4000000) return false;
+    auto line = std::make_unique<CLine>();
+    line->m_width = int(std::ceil(width));
+    line->m_descent = 0;
+    line->m_ascent = int(std::ceil(height));
+    line->m_borderX = line->m_borderY = 0;
+    double columnStart = 0;
+    for (const auto& column : columns)
+    {
+        const int horizontal = column.anchor % 3;
+        const double fx = horizontal == 1 ? 0 : horizontal == 2 ? .5 : 1;
+        const double fy = column.anchor <= 3 ? 1 : column.anchor <= 6 ? .5 : 0;
+        const double columnX = leftward ? width - columnStart - column.width : columnStart;
+        double y = fy * (height - column.height);
+        for (size_t i = column.first; i < column.last; ++i)
+        {
+            const auto& unit = units[i];
+            const double x = columnX + fx * (column.width - unit.width) - unit.left;
+            double pen = 0;
+            for (size_t j = unit.first; j < unit.last; ++j)
+            {
+                auto word = std::unique_ptr<CWord>(words[j]->Copy());
+                const double targetX = x + (unit.sideways ? 0 : pen);
+                const double targetY = y - unit.top + (unit.sideways ? pen : 0);
+                word->PlaceLayout(CPoint(LONG(std::lround(targetX)),
+                    LONG(std::lround(targetY - line->m_ascent + word->m_ascent))),
+                    unit.sideways ? 0 : 1, unit.sideways ? 1 : 0, 0, 0);
+                pen += word->m_width;
+                word->m_width = 0;
+                word->m_verticalWord = true;
+                line->AddTail(word.get());
+                word.release();
+            }
+            y += unit.height + (i + 1 == column.last ? 0 : gapAfter(i));
+        }
+        columnStart += advanceColumn(column.width);
+    }
+    bounds = CSize(line->m_width, line->m_ascent);
+    m_textWidth = line->m_width;
+    AddTail(line.get());
+    line.release();
+    m_verticalLaidOut = true;
+    return true;
+}
+
 void CSubtitle::CurveLines()
 {
-    if (!m_curve || m_curveShapeFailed || IsEmpty()) return;
+    if (m_vertical || !m_curve || m_curveShapeFailed || IsEmpty()) return;
     using namespace RenderGeometry;
     const auto fraction = [](int align) { return align == 1 ? 0. : align == 2 ? .5 : 1.; };
     const int attach = m_curveAnchor ? m_curveAnchor : m_scrAlignment;
@@ -3534,10 +3803,10 @@ void CRenderedTextSubtitle::ParseString(CSubtitle* sub, CStringW str, STSStyle& 
     PROFILE_RENDER_STAGE(Layout);
     if(!sub) return;
 #ifdef _VSMOD
-    if (sub->m_curve && !sub->m_curveShapeFailed)
+    if ((sub->m_curve || sub->m_vertical) && !sub->m_curveShapeFailed)
     {
         if (sub->m_words.IsEmpty()) sub->m_curveScale = style.objectScale / 100;
-        if (ParseShapedString(sub, str, style, false))
+        if (ParseShapedString(sub, str, style, sub->m_vertical && sub->m_verticalProfile <= 1))
             return;
         sub->m_curveShapeFailed = true;
     }
@@ -4556,6 +4825,16 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
             ;
         else if(!cmd.Find(L"u"))
             params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+#ifdef _VSMOD
+        else if (!cmd.Find(L"vert") || !cmd.Find(L"vdir"))
+            params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
+        else if (!cmd.Find(L"vtype"))
+            params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
+        else if (!cmd.Find(L"vcolsp"))
+            params.push_back(cmd.Mid(6)), cmd = cmd.Left(6);
+        else if (!cmd.Find(L"vsp"))
+            params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+#endif
         else if(!cmd.Find(L"xbord"))
             params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
         else if(!cmd.Find(L"xshad"))
@@ -4778,6 +5057,28 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         CStringW p = params.size() > 0 ? params[0] : L"";
 
 #ifdef _VSMOD
+        if (cmd == L"vert" || cmd == L"vtype" || cmd == L"vdir" || cmd == L"vsp" || cmd == L"vcolsp")
+        {
+            if (fAnimate || !sub->m_words.IsEmpty()) continue;
+            if (cmd == L"vsp" || cmd == L"vcolsp")
+            {
+                AssNumeric::Operand operand;
+                auto& spacing = cmd == L"vsp" ? sub->m_verticalSpacing : sub->m_verticalColumnGap;
+                if (p.IsEmpty()) spacing = 0;
+                else if (readOperand(p, false, false, operand)) spacing = operand.Resolve(spacing);
+            }
+            else
+            {
+                const wchar_t* value = p;
+                const int digit = p.IsEmpty() ? 0 : ReadDecimalDigit(value);
+                const int upper = cmd == L"vert" ? 1 : cmd == L"vdir" ? 2 : 3;
+                if (digit < 0 || digit > upper || *value) continue;
+                if (cmd == L"vert") sub->m_vertical = digit != 0;
+                if (cmd == L"vdir") sub->m_verticalDirection = digit;
+                if (cmd == L"vtype") sub->m_verticalProfile = digit;
+            }
+            continue;
+        }
         if (cmd == L"ct" || cmd == L"ctan" || cmd == L"ctx" || cmd == L"cty")
         {
             if (cmd == L"ctan" && !fAnimate && !sub->m_curveAnchor)
@@ -6458,11 +6759,14 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             if (alignment < 1 || alignment > 9) continue;
             const int horizontal = alignment % 3;
             if (cmd == L"tan")
+            {
                 sub->m_textAnchor = horizontal;
+                sub->m_verticalAnchor = alignment;
+            }
             else
             {
                 const auto inserted = sub->m_lineAlignment.emplace(sub->m_logicalLine,
-                    CSubtitle::LineAlignment{horizontal, horizontal});
+                    CSubtitle::LineAlignment{horizontal, horizontal, alignment});
                 inserted.first->second.inherited = horizontal;
             }
         }

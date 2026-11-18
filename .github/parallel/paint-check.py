@@ -484,6 +484,46 @@ if ROUND3:
     for workers in (2, 4, 6, 8):
         assert benchmark(CANDIDATE, curved, workers, "regression")["hashes"] == expected
 
+    vertical = write("native-vertical-text", [
+        (220, 200, r"\fs48\1c$white\vert1\vtype2\vsp3", "minimum"),
+        (520, 200, r"\fs48\1c$white\vert1\vtype3\fnMyanmar Text", "မြန်မာနိုင်ငံ"),
+        (860, 200, r"\fs45\1c$white\vert1\vdir1\vcolsp30", r"日A\N日本"),
+        (1260, 200, r"\fs45\1c$white\vert1\vdir2\vcolsp30", r"日A\N日本"),
+        (220, 690, r"\fs48\1c$white\vert0", r"minimum{\vert1}"),
+        (520, 690, r"\fs48\1c$white\vert1\vtype2\1c$red\2c$blue\kf100", "MMMM"),
+    ])
+    centers = {"latin": (220, 200), "myanmar": (520, 200), "left": (860, 200),
+               "right": (1260, 200), "disabled": (220, 690), "karaoke": (520, 690)}
+    playback("csri", CANDIDATE, vertical, ROOT / "vertical")
+    playback("rgba", MANG, vertical, ROOT / "vertical-reference")
+    for getter in (captures(ROOT / "vertical", centers), captures(ROOT / "vertical-reference", centers)):
+        latin = ink_bounds(getter, 60, "latin", top=-5, bottom=300)
+        myanmar = ink_bounds(getter, 60, "myanmar", top=-5, bottom=330)
+        flat = ink_bounds(getter, 60, "disabled", top=-5, right=350)
+        assert latin[3] - latin[1] > 2 * (latin[2] - latin[0]), latin
+        assert myanmar[3] - myanmar[1] > myanmar[2] - myanmar[0], myanmar
+        assert flat[2] - flat[0] > 2 * (flat[3] - flat[1]), flat
+        for case, sign in (("left", 1), ("right", -1)):
+            bounds = ink_bounds(getter, 60, case, top=-5, bottom=210, right=170)
+            midpoint = (bounds[0] + bounds[2]) // 2
+            left = sum(min(getter(60, case, x, y)) > 200
+                       for y in range(45, 130) for x in range(bounds[0], midpoint))
+            right = sum(min(getter(60, case, x, y)) > 200
+                        for y in range(45, 130) for x in range(midpoint, bounds[2] + 1))
+            assert sign * (left - right) > 30, (case, left, right)
+        red, blue = [], []
+        for y in range(240):
+            for x in range(-15, 100):
+                r, _, b = getter(90, "karaoke", x, y)
+                if r > 210 and b < 40:
+                    red.append(y)
+                if b > 210 and r < 40:
+                    blue.append(y)
+        assert red and blue and max(red) <= min(blue) + 3
+    expected = benchmark(CANDIDATE, vertical, 1, "regression")["hashes"]
+    for workers in (2, 4, 6, 8):
+        assert benchmark(CANDIDATE, vertical, workers, "regression")["hashes"] == expected
+
 # Check old corner math against the validated VSFilterMod path rather than
 # requiring its different legacy bitmap geometry to agree with libass.
 playback("csri", Path("threading-baseline/renderer/renderer.dll").resolve(), grid, ROOT / "previous")

@@ -108,6 +108,11 @@ public:
 #ifdef _VSMOD
     CPoint LayoutPosition(CPoint flat) const;
     void PlaceLayout(CPoint offset, double cosine, double sine, double center, double baseline);
+    bool m_verticalWord = false;
+    int VerticalPaintSplit(int y, double progress) const
+    {
+        return ((y + mOffsetY + 4) >> 3) + int(progress * mOverlayHeight);
+    }
     bool m_wrapAfter = false;
     bool HasNativeOutline() const;
     CRect DrawNativeOutline(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int y, int time, int fade,
@@ -115,7 +120,7 @@ public:
     CRect DrawNativeShadow(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int y, DWORD* colors,
         MOD_MOVEVC& vectorClip);
     CRect DrawBodyPaint(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int y, const DWORD* colors,
-        MOD_MOVEVC& vectorClip, bool reverse);
+        MOD_MOVEVC& vectorClip, bool reverse, int channel = 0);
 #endif
 
 #if defined (_VSMOD) && defined(_LUA)
@@ -265,9 +270,13 @@ public:
     int m_curveAnchor = 0;
     bool m_curveShapeFailed = false;
     void CurveLines();
+    bool m_vertical = false, m_verticalLaidOut = false;
+    int m_verticalProfile = 0, m_verticalDirection = 0, m_verticalAnchor = 0;
+    double m_verticalSpacing = 0, m_verticalColumnGap = 0;
+    bool MakeVerticalLines(int height, CSize& bounds);
     double m_clipOffsetX = 0, m_clipOffsetY = 0;
     bool m_hasRectClip = false;
-    struct LineAlignment { int first, inherited; };
+    struct LineAlignment { int first, inherited, full; };
     std::map<int, LineAlignment> m_lineAlignment;
     int m_logicalLine = 0, m_textAnchor = -1, m_textWidth = 0;
     unsigned m_positionedAlphaScopes = 0;
