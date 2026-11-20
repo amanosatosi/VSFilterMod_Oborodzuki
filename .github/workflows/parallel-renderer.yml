@@ -7,7 +7,7 @@ on:
         type: boolean
         default: true
   push:
-    branches: [feature/parallel-event-rendering, codex/kfx-paint-extensions, codex/mangetsu-extensions-round-2, codex/mangetsu-extensions-round-3]
+    branches: [feature/parallel-event-rendering, codex/kfx-paint-extensions, codex/mangetsu-extensions-round-2, codex/mangetsu-extensions-round-3, codex/mangetsu-extensions-round-4]
     paths: ['src/**', '.github/parallel/**', '.github/workflows/parallel-renderer.yml']
 permissions:
   contents: read
@@ -15,8 +15,9 @@ permissions:
 env:
   PARALLEL_FULL: "${{ inputs.full || contains(github.event.head_commit.message, 'Parallel-KFX full') }}"
   PARALLEL_QUICK: "${{ contains(github.event.head_commit.message, 'Parallel-KFX quick') }}"
-  KFX_ROUND2: "${{ github.ref_name == 'codex/mangetsu-extensions-round-2' || github.ref_name == 'codex/mangetsu-extensions-round-3' }}"
-  KFX_ROUND3: "${{ github.ref_name == 'codex/mangetsu-extensions-round-3' }}"
+  KFX_ROUND2: "${{ github.ref_name == 'codex/mangetsu-extensions-round-2' || (github.ref_name == 'codex/mangetsu-extensions-round-3' || github.ref_name == 'codex/mangetsu-extensions-round-4') }}"
+  KFX_ROUND4: "${{ github.ref_name == 'codex/mangetsu-extensions-round-4' }}"
+  KFX_ROUND3: "${{ (github.ref_name == 'codex/mangetsu-extensions-round-3' || github.ref_name == 'codex/mangetsu-extensions-round-4') }}"
 jobs:
   build:
     runs-on: windows-2022
@@ -62,8 +63,8 @@ jobs:
       - name: Download the previous parallel renderer
         uses: actions/download-artifact@v4
         with:
-          name: parallel-hosts-${{ env.KFX_ROUND3 == 'true' && 'ddaec6149e323f8d0d690e60af0e7ea8a6ad1acc' || (env.KFX_ROUND2 == 'true' && 'f81f31adac460894914aeab362b9906ce50d603a' || (github.ref_name == 'codex/kfx-paint-extensions' && '20c6174b9cc15292f77ea99605f22df39faf539c' || 'b110ccac5d1b9b55410b1d50df46dfaf29468503')) }}
-          run-id: ${{ env.KFX_ROUND3 == 'true' && '44317693536' || (env.KFX_ROUND2 == 'true' && '44218421620' || (github.ref_name == 'codex/kfx-paint-extensions' && '44199501549' || '44151605518')) }}
+          name: parallel-hosts-${{ env.KFX_ROUND4 == 'true' && '393b0acc89129a4531fb95bd0367c52be5532951' || env.KFX_ROUND3 == 'true' && 'ddaec6149e323f8d0d690e60af0e7ea8a6ad1acc' || (env.KFX_ROUND2 == 'true' && 'f81f31adac460894914aeab362b9906ce50d603a' || (github.ref_name == 'codex/kfx-paint-extensions' && '20c6174b9cc15292f77ea99605f22df39faf539c' || 'b110ccac5d1b9b55410b1d50df46dfaf29468503')) }}
+          run-id: ${{ env.KFX_ROUND4 == 'true' && '44356341316' || env.KFX_ROUND3 == 'true' && '44317693536' || (env.KFX_ROUND2 == 'true' && '44218421620' || (github.ref_name == 'codex/kfx-paint-extensions' && '44199501549' || '44151605518')) }}
           github-token: ${{ github.token }}
           path: threading-baseline
       - name: Record actual runner hardware

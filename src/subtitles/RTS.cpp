@@ -5734,6 +5734,37 @@ CStringW NormalizeNumericDigits(const CStringW& input)
     return CStringW(AssNumeric::NormalizeDigits(input).c_str());
 }
 
+bool HasOverrideAnnotations(const CStringW& text)
+{
+    return text.Find(L'[') >= 0 || text.Find(L"\\N") >= 0;
+}
+
+CStringW NormalizeOverrideBlock(const CStringW& text)
+{
+    if (!HasOverrideAnnotations(text))
+        return text;
+    CStringW result;
+    const int length = text.GetLength();
+    auto* output = result.GetBuffer(length);
+    int written = 0;
+    for (int i = 0; i < length;)
+    {
+        const wchar_t c = text[i++];
+        if (c == L'[')
+        {
+            const int end = text.Find(L']', i);
+            if (end < 0) break;
+            i = end + 1;
+        }
+        else if (c == L'\\' && i < length && text[i] == L'N')
+            ++i;
+        else
+            output[written++] = c;
+    }
+    result.ReleaseBufferSetLength(written);
+    return result;
+}
+
 bool NeedsLayoutVariables(const CStringW& event)
 {
     int position = 0;
@@ -5741,9 +5772,11 @@ bool NeedsLayoutVariables(const CStringW& event)
     {
         const int stop = event.Find(L'}', ++position);
         if (stop < 0) return false;
-        while ((position = event.Find(L'$', position)) >= 0 && position < stop)
+        const auto block = NormalizeOverrideBlock(event.Mid(position, stop - position));
+        int offset = 0;
+        while ((offset = block.Find(L'$', offset)) >= 0)
         {
-            const wchar_t* name = event.GetString() + ++position;
+            const wchar_t* name = block.GetString() + ++offset;
             for (const auto* variable : {L"width", L"height", L"left", L"right", L"center", L"top", L"bottom", L"middle"})
                 if (!wcsncmp(name, variable, wcslen(variable)))
                     return true;
@@ -5963,10 +5996,12 @@ void ApplyCycleColors(STSStyle& style, const KfxPaint::CycleIndices& colors)
 
 static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& text)
 {
-    CStringW str = text;
 #ifdef _VSMOD
+    CStringW str = NormalizeOverrideBlock(text);
     if (str.Find(L"\\~") >= 0)
         str.Replace(L"\\~", L"~");
+#else
+    CStringW str = text;
 #endif
     auto result = std::make_shared<OverrideTags>();
     const auto append = [&](OverrideTag tag) {
@@ -8966,7 +9001,9 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
 #ifdef _VSMOD
     const bool escapedAngles = str.Find(L'<') >= 0 &&
         (str.Find(L"\\<") >= 0 || str.Find(L"\\>") >= 0 || str.Find(L"\\|\\") >= 0);
-    if (str.Find(L"\\ct(") >= 0 && !sub->m_effects[EF_SCROLL] && !sub->m_effects[EF_BANNER]
+    if ((str.Find(L"\\ct(") >= 0 || str.Find(L'[') >= 0 ||
+         (str.Find(L"\\N") >= 0 && str.Find(L"\\c") >= 0)) &&
+        !sub->m_effects[EF_SCROLL] && !sub->m_effects[EF_BANNER]
 #ifdef _LUA
         && !hasExternalLua
 #endif

@@ -17,6 +17,7 @@ CANDIDATE = Path("renderer/renderer.dll").resolve()
 MANG = Path("mangetsu-paint/renderer.dll").resolve()
 ROUND2 = os.environ.get("KFX_ROUND2") == "true"
 ROUND3 = os.environ.get("KFX_ROUND3") == "true"
+ROUND4 = os.environ.get("KFX_ROUND4") == "true"
 
 
 def gd(angle, *stops):
@@ -757,6 +758,29 @@ if ROUND3:
     expected = benchmark(CANDIDATE, patterns, 1, "regression")["hashes"]
     for workers in (2, 4, 6, 8):
         assert benchmark(CANDIDATE, patterns, workers, "regression")["hashes"] == expected
+
+if ROUND4:
+    annotation_cases = [
+        (r"\f[split]s\N56\bord[\fs999\bord999]3", r"\fs56\bord3", "Text [visible]"),
+        (r"\fnAr[font]ial\t([start]\N300,(end)[invalid],\fs20)",
+         r"\fnArial\t(300,(end),\fs20)", "Animation"),
+        (r"\t([start]\N300,[a,b, (c)]500,[\fs999]\N\fs20)",
+         r"\t(300,500,\fs20)", "Animation"),
+        (r"\b[split]s4\boxp([left]10,9,8,7)\4a&H00&\fs50",
+         r"\bs4\boxp(10,9,8,7)\4a&H00&\fs50", "Box"),
+        (r"\c[split]t(m 0 0 b 50 60 110 -60 240 0)", r"\ct(m 0 0 b 50 60 110 -60 240 0)", "Path"),
+        (r"\fs42[\ct(m 0 0 l 0 300)\col1\vert1", r"\fs42", r"A|B\NNext"),
+        (r"\bord($he[embedded]ight/10)\1grd(0,&HFF[blue]0000&,&H0000[red]FF&)",
+         r"\bord($height/10)\1grd(0,&HFF0000&,&H0000FF&)", "Gradient"),
+        ("", "", r"<病|{\k[hold]\N30}やまい>"),
+    ]
+    annotated = write("annotated-tags", [(165 + i % 3 * 535, 255 + i // 3 * 225, a, body)
+        for i, (a, _, body) in enumerate(annotation_cases)])
+    clean = write("clean-tags", [(165 + i % 3 * 535, 255 + i // 3 * 225, b,
+        body.replace(r"\k[hold]\N30", r"\k30")) for i, (_, b, body) in enumerate(annotation_cases)])
+    expected = benchmark(CANDIDATE, clean, 1, "regression")["hashes"]
+    for workers in (1, 2, 4, 6, 8):
+        assert benchmark(CANDIDATE, annotated, workers, "regression")["hashes"] == expected
 
 # Check old corner math against the validated VSFilterMod path rather than
 # requiring its different legacy bitmap geometry to agree with libass.
