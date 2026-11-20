@@ -353,6 +353,9 @@ class CSimpleTextSubtitle : public CAtlArray<STSEntry>
 
 protected:
     CAtlArray<STSSegment> m_segments;
+#ifdef _VSMOD
+    std::vector<STSEntry> m_metadataCarriers;
+#endif
     virtual void OnChanged() {}
 
 public:

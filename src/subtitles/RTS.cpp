@@ -4844,6 +4844,9 @@ struct OverrideTagCache {
     std::array<std::map<CStringW, AssNumeric::Program>, 2> programs;
     std::map<int, AssNumeric::Context> layout;
     std::map<CStringW, std::shared_ptr<const RenderGeometry::Curve>> curves;
+    std::map<CString, OverrideTags> styleMetadata, actorMetadata;
+    std::vector<CString> actorStyles;
+    bool metadataReady = false;
 
     std::shared_ptr<const RenderGeometry::Curve> Curve(const CStringW& path)
     {
@@ -4933,7 +4936,10 @@ void CRenderedTextSubtitle::OnChanged()
         m_textGeometry->Clear();
 #ifdef _VSMOD
     if (m_overrideTags)
+    {
         m_overrideTags->layout.clear();
+        m_overrideTags->metadataReady = false;
+    }
 #endif
 
     POSITION pos = m_subtitleCache.GetStartPosition();
@@ -6470,8 +6476,167 @@ std::shared_ptr<const OverrideTags> OverrideTagCache::Get(const CStringW& text)
     return tags;
 }
 
+#ifdef _VSMOD
+namespace
+{
+bool MetadataTag(const OverrideTag& tag, bool actor)
+{
+    const auto& cmd = tag.command;
+    if (tag.extension == ExtensionTag::Gradient)
+    {
+        PaintTag paint{};
+        ReadPaintTag(cmd, paint);
+        return !actor || (!paint.positioned && !paint.slide);
+    }
+    if (tag.extension == ExtensionTag::Outline)
+    {
+        OutlineTag outline;
+        ReadOutlineTag(cmd, outline);
+        using P = OutlineProperty;
+        return !actor || (!outline.box && outline.property != P::Positioned &&
+            outline.property != P::Blur && outline.property != P::EdgeBlur &&
+            outline.property != P::Slide && outline.property != P::AlphaSlide &&
+            outline.property != P::Waiting && outline.property != P::WaitingCorners &&
+            outline.property != P::WaitingGradient && outline.property != P::WaitingSlide);
+    }
+    if (tag.extension == ExtensionTag::Layout)
+        return !actor && (!cmd.Find(L"furi") || cmd == L"vert" || cmd == L"vtype" ||
+            cmd == L"vdir" || cmd == L"vsp" || cmd == L"vcolsp");
+    if (!actor && (cmd == L"q" || cmd == L"ta" || cmd == L"fshp" || cmd == L"ortho" ||
+        !cmd.Find(L"box")))
+        return true;
+    const int size = cmd.GetLength();
+    if ((size == 3 && cmd[0] >= L'1' && cmd[0] <= L'4' && cmd[1] == L'v' &&
+            (cmd[2] == L'c' || cmd[2] == L'a')) || cmd == L"vc" || cmd == L"va")
+        return tag.parameters.size() == 4;
+    return actor && (SemanticColumns::DefaultFields(cmd) || tag.extension == ExtensionTag::Decoration);
+}
+
+int MetadataPaintSlot(const OverrideTag& tag)
+{
+    if (tag.extension == ExtensionTag::Gradient)
+    {
+        PaintTag paint{};
+        ReadPaintTag(tag.command, paint);
+        return paint.slide ? -1 : paint.part;
+    }
+    if (tag.extension == ExtensionTag::Outline)
+    {
+        OutlineTag border;
+        ReadOutlineTag(tag.command, border);
+        using P = OutlineProperty;
+        const int base = border.box ? KfxPaint::BoxSlideStart + 2 * border.layer :
+            border.layer ? KfxPaint::NativeSlideStart + 2 * (border.layer - 1) : 4;
+        if (border.property == P::WaitingGradient || border.property == P::WaitingCorners)
+            return KfxPaint::WaitingSlidePart;
+        if (border.property == P::Gradient || border.property == P::Corners || border.property == P::Positioned)
+            return base;
+        if (border.property == P::AlphaGradient || border.property == P::AlphaCorners)
+            return base + 1;
+    }
+    const auto& cmd = tag.command;
+    if (cmd.GetLength() == 3 && cmd[0] >= L'1' && cmd[0] <= L'4' && cmd[1] == L'v' &&
+        (cmd[2] == L'c' || cmd[2] == L'a'))
+        return 2 * (cmd[0] - L'1') + (cmd[2] == L'a');
+    return -1;
+}
+}
+
+void CRenderedTextSubtitle::ApplyMetadata(CSubtitle& sub, const CString& styleName, STSStyle& style, bool initial, bool named)
+{
+    if (!m_overrideTags) m_overrideTags = std::make_unique<OverrideTagCache>();
+    auto& cache = *m_overrideTags;
+    if (!cache.metadataReady)
+    {
+        cache.styleMetadata.clear();
+        cache.actorMetadata.clear();
+        cache.actorStyles.clear();
+        for (const auto& carrier : m_metadataCarriers)
+        {
+            const bool actor = carrier.effect == L"oborodzuki-colorcoding";
+            const bool whitelist = actor && carrier.actor == L"oborodzuki-colorcode-applied-styles";
+            OverrideTags tags;
+            std::vector<CString> styles;
+            const auto& source = carrier.str;
+            for (int i = 0; (i = source.Find(L'{', i)) >= 0;)
+            {
+                const int end = source.Find(L'}', i + 1);
+                if (end < 0) break;
+                const auto block = source.Mid(i + 1, end - i - 1);
+                if (whitelist)
+                {
+                    if (!block.IsEmpty()) styles.emplace_back(block);
+                }
+                else
+                {
+                    const auto parsed = cache.Get(block);
+                    for (auto tag : *parsed)
+                        if (MetadataTag(tag, actor))
+                        {
+                            if (tag.command == L"vc" || tag.command == L"va")
+                                tag.command = L"1" + tag.command;
+                            tags.push_back(std::move(tag));
+                        }
+                }
+                i = end + 1;
+            }
+            if (whitelist)
+                cache.actorStyles = std::move(styles);
+            else if (!tags.empty())
+            {
+                if (actor && !carrier.actor.IsEmpty()) cache.actorMetadata[carrier.actor] = std::move(tags);
+                else if (!actor)
+                {
+                    auto& target = cache.styleMetadata[carrier.style];
+                    target.insert(target.end(), std::make_move_iterator(tags.begin()), std::make_move_iterator(tags.end()));
+                }
+            }
+        }
+        cache.metadataReady = true;
+    }
+    STSStyle base(style);
+    const auto select = cache.styleMetadata.find(styleName);
+    if (select != cache.styleMetadata.end())
+    {
+        std::array<bool, KfxPaint::DecorationSlideStart + 2> chosen{};
+        OverrideTags one;
+        for (const auto& tag : select->second)
+        {
+            const auto& name = tag.command;
+            if (!initial && (name == L"q" || name == L"ta" || name == L"vert" ||
+                name == L"vtype" || name == L"vdir" || name == L"vsp" || name == L"vcolsp"))
+                continue;
+            const int slot = MetadataPaintSlot(tag);
+            if (slot >= 0 && (chosen[slot] || tag.parameters.empty())) continue;
+            const auto before = style.mod_grad.paint;
+            const auto opacity = style.mod_grad.positionedOpacity;
+            const auto outline = style.nativeOutline;
+            const auto box = style.boxRings;
+            const auto decor = style.decoration;
+            const unsigned bits = style.mod_grad.legacyParts;
+            one.assign(1, tag);
+            ParseSSATag(&sub, {}, style, base, false, nullptr, &one);
+            if (slot >= 0)
+                chosen[slot] = before != style.mod_grad.paint || opacity != style.mod_grad.positionedOpacity ||
+                    outline != style.nativeOutline || box != style.boxRings || decor != style.decoration ||
+                    bits != style.mod_grad.legacyParts;
+        }
+    }
+    if (cache.actorStyles.empty() ? !named :
+        std::find(cache.actorStyles.begin(), cache.actorStyles.end(), styleName) != cache.actorStyles.end())
+    {
+        const auto actor = cache.actorMetadata.find(sub.m_inherited->actor);
+        if (actor != cache.actorMetadata.end())
+        {
+            STSStyle inherited(style);
+            ParseSSATag(&sub, {}, style, inherited, false, nullptr, &actor->second);
+        }
+    }
+}
+#endif
+
 bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org, bool fAnimate,
-    const KfxPaint::SlideSettings* inheritedSlides)
+    const KfxPaint::SlideSettings* inheritedSlides, const std::vector<OverrideTag>* compiled)
 {
     PROFILE_RENDER_STAGE(Overrides);
     if (!sub)
@@ -6480,7 +6645,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
     if (!m_overrideTags)
         m_overrideTags = std::make_unique<OverrideTagCache>();
     // A nested transform can rotate the cache while this block is being applied.
-    const auto tags = m_overrideTags->Get(str);
+    const auto tags = compiled ? std::shared_ptr<const OverrideTags>{} : m_overrideTags->Get(str);
 #ifdef _VSMOD
     std::unique_ptr<KfxPaint::SlideSettings> localSlides;
     const auto slides = [&]() {
@@ -6588,13 +6753,13 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         style.nativeOutline = std::move(state);
     };
 #endif
-    for (const auto& tag : *tags)
+    for (const auto& tag : compiled ? *compiled : *tags)
     {
         const auto& cmd = tag.command;
         const auto& params = tag.parameters;
 #ifdef _LUA
         // Direct function call!
-        if(!sub->m_measuringLayout && m_overrideTags->IsLuaFunction(*this, tag.rawCommand))
+        if(!compiled && !sub->m_measuringLayout && m_overrideTags->IsLuaFunction(*this, tag.rawCommand))
         {
             hasExternalLua = true;
             // Find function =D
@@ -6821,6 +6986,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         if (layout && !cmd.Find(L"furi"))
         {
             auto& ruby = sub->m_rubyOptions;
+            const auto defaults = !compiled && sub->m_inherited ? sub->m_inherited->ruby : Furigana::Options{};
             if (cmd == L"furipos")
             {
                 AssNumeric::Operand x, y;
@@ -6834,8 +7000,9 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 }
                 else if (p.IsEmpty())
                 {
-                    ruby.offsetX = ruby.offsetY = 0;
-                    ruby.manual = false;
+                    ruby.offsetX = defaults.offsetX;
+                    ruby.offsetY = defaults.offsetY;
+                    ruby.manual = defaults.manual;
                 }
             }
             else if (cmd == L"furis" || cmd == L"furisx" || cmd == L"furisy" || cmd == L"furifsp")
@@ -6843,15 +7010,15 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 const bool spacing = cmd == L"furifsp";
                 AssNumeric::Operand value;
                 if (!p.IsEmpty() && !readOperand(p, false, false, value)) continue;
-                const auto update = [&](double& current) {
-                    const double target = p.IsEmpty() ? spacing ? 0. : 50. : value.Resolve(current);
+                const auto update = [&](double& current, double inherited) {
+                    const double target = p.IsEmpty() ? inherited : value.Resolve(current);
                     current = CalcAnimation((std::max)(spacing ? -512. : 0., (std::min)(512., target)), current, fAnimate);
                 };
-                if (spacing) update(ruby.spacing);
+                if (spacing) update(ruby.spacing, defaults.spacing);
                 else
                 {
-                    if (cmd != L"furisy") update(ruby.scaleX);
-                    if (cmd != L"furisx") update(ruby.scaleY);
+                    if (cmd != L"furisy") update(ruby.scaleX, defaults.scaleX);
+                    if (cmd != L"furisx") update(ruby.scaleY, defaults.scaleY);
                 }
             }
             else if (!fAnimate)
@@ -6860,11 +7027,11 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 wchar_t* end = nullptr;
                 const long value = std::wcstol(begin, &end, 10);
                 if (*end) continue;
-                if (cmd == L"furi") ruby.enabled = p.IsEmpty() || value != 0;
-                if (cmd == L"furiap") ruby.autoGap = p.IsEmpty() || value != 0;
-                if (cmd == L"furiplaceauto") ruby.outward = value == 1;
-                if (cmd == L"furichangepos") ruby.placement = value == 2 ? 2 : value ? 1 : 0;
-                if (cmd == L"furistyle" && value >= 0 && value <= 2) ruby.style = int(value);
+                if (cmd == L"furi") ruby.enabled = p.IsEmpty() ? defaults.enabled : value != 0;
+                if (cmd == L"furiap") ruby.autoGap = p.IsEmpty() ? defaults.autoGap : value != 0;
+                if (cmd == L"furiplaceauto") ruby.outward = p.IsEmpty() ? defaults.outward : value == 1;
+                if (cmd == L"furichangepos") ruby.placement = p.IsEmpty() ? defaults.placement : value == 2 ? 2 : value ? 1 : 0;
+                if (cmd == L"furistyle" && value >= 0 && value <= 2) ruby.style = p.IsEmpty() ? defaults.style : int(value);
             }
             continue;
         }
@@ -8563,6 +8730,9 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             int n = wcstol(p, NULL, 10);
             sub->m_wrapStyle = !p.IsEmpty() && (0 <= n && n <= 3)
                                ? n
+#ifdef _VSMOD
+                               : !compiled && sub->m_inherited ? sub->m_inherited->wrap
+#endif
                                : m_defaultWrapStyle;
         }
 #ifdef _VSMOD // patch m003. random text points
@@ -8618,6 +8788,18 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             if (slides()) editSlides() = {};
 #endif
             STSStyle* val;
+#ifdef _VSMOD
+            if (!fAnimate && sub->m_inherited)
+            {
+                auto& defaults = *sub->m_inherited;
+                const bool named = !p.IsEmpty() && m_styles.Lookup(CString(p), val) && val;
+                style = named ? *val : defaults.original;
+                ApplyMetadata(*sub, named ? CString(p) : defaults.style, style, false, named);
+                defaults.ruby = sub->m_rubyOptions;
+                org = style;
+                continue;
+            }
+#endif
             style = (!p.IsEmpty() && m_styles.Lookup(CString(p), val) && val) ? *val : org;
         }
         else if(cmd == L"shad")
@@ -9123,6 +9305,19 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
 #endif
     ParseEffect(sub, GetAt(entry).effect);
 #ifdef _VSMOD
+    if (!m_metadataCarriers.empty() && !m_doOverrideStyle)
+    {
+        const auto& source = GetAt(entry);
+        sub->m_inherited = std::make_unique<CSubtitle::InheritedMetadata>();
+        auto& defaults = *sub->m_inherited;
+        defaults.style = source.style;
+        defaults.actor = source.actor;
+        defaults.original = stss;
+        ApplyMetadata(*sub, defaults.style, stss, true, false);
+        defaults.ruby = sub->m_rubyOptions;
+        defaults.wrap = sub->m_wrapStyle;
+        orgstss = stss;
+    }
     const bool escapedAngles = str.Find(L'<') >= 0 &&
         (str.Find(L"\\<") >= 0 || str.Find(L"\\>") >= 0 || str.Find(L"\\|\\") >= 0);
     if ((str.Find(L"\\ct(") >= 0 || str.Find(L'[') >= 0 ||

@@ -802,6 +802,29 @@ if ROUND4:
     for workers in (2, 4, 6, 8):
         assert benchmark(CANDIDATE, scroll, workers, "regression")["hashes"] == expected
 
+    # These hosts open the supplied script bytes with csri_open_mem.
+    carriers = (
+        "Dialogue: 0,0:00:00.00,9:59:59.99,Default,,0,0,0,oborodzuki-style,{\\furis70}\n"
+        f"Dialogue: 0,0:00:00.00,9:59:59.99,Default,Nene,0,0,0,oborodzuki-colorcoding,"
+        f"{{\\f[annotation]s50\\1c{GREEN}\\pos(10,10)}}\n"
+    )
+    inherited = write("metadata-carriers", [
+        (400, 250, "", "<漢字|かんじ>"),
+        (815, 250, "", r"{\fs30\fs\furis30\furis}<明日|あした>"),
+        (1160, 350, "", r"{\fs30\r}<病|やまい>"),
+    ])
+    source = inherited[0].read_text(encoding="utf-8-sig")
+    inherited[0].write_text(source.replace("Dialogue:", carriers + "Dialogue:", 1)
+        .replace("Default,,0,0,0,,", "Default,Nene,0,0,0,,"), encoding="utf-8-sig")
+    inline = write("metadata-inline-reference", [
+        (400, 250, rf"\fs50\1c{GREEN}\furis70", "<漢字|かんじ>"),
+        (815, 250, rf"\fs50\1c{GREEN}\furis70", "<明日|あした>"),
+        (1160, 350, rf"\fs50\1c{GREEN}\furis70", "<病|やまい>"),
+    ])
+    expected = benchmark(CANDIDATE, inline, 1, "regression")["hashes"]
+    for workers in (1, 2, 4, 6, 8):
+        assert benchmark(CANDIDATE, inherited, workers, "regression")["hashes"] == expected
+
 # Check old corner math against the validated VSFilterMod path rather than
 # requiring its different legacy bitmap geometry to agree with libass.
 playback("csri", Path("threading-baseline/renderer/renderer.dll").resolve(), grid, ROOT / "previous")

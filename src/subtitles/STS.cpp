@@ -2394,6 +2394,9 @@ CSimpleTextSubtitle& CSimpleTextSubtitle::operator = (CSimpleTextSubtitle& sts)
 void CSimpleTextSubtitle::Copy(CSimpleTextSubtitle& sts)
 {
     Empty();
+#ifdef _VSMOD
+    m_metadataCarriers = sts.m_metadataCarriers;
+#endif
 
 #ifdef _VSMOD
 #ifdef _LUA
@@ -2435,6 +2438,11 @@ void CSimpleTextSubtitle::Append(CSimpleTextSubtitle& sts, int timeoff)
     }
 
     CopyStyles(sts.m_styles, true);
+#ifdef _VSMOD
+    for (const auto& carrier : sts.m_metadataCarriers)
+        if (m_metadataCarriers.size() < 8192)
+            m_metadataCarriers.push_back(carrier);
+#endif
 
     for(ptrdiff_t i = 0, j = sts.GetCount(); i < j; i++)
     {
@@ -2486,6 +2494,9 @@ bool CSimpleTextSubtitle::CopyStyles(const CSTSStyleMap& styles, bool fAppend)
 
 void CSimpleTextSubtitle::Empty()
 {
+#ifdef _VSMOD
+    m_metadataCarriers.clear();
+#endif
     m_dstScreenSize = CSize(0, 0);
     m_styles.Free();
     m_segments.RemoveAll();
@@ -2526,6 +2537,17 @@ void CSimpleTextSubtitle::Add(CStringW str, bool fUnicode, int start, int end, C
     sub.end = end;
     sub.readorder = readorder < 0 ? GetCount() : readorder;
 
+#ifdef _VSMOD
+    if (effect == L"oborodzuki-style" || effect == L"oborodzuki-colorcoding")
+    {
+        if (start < end && m_metadataCarriers.size() < 8192 && str.GetLength() <= 16384)
+        {
+            m_metadataCarriers.push_back(std::move(sub));
+            OnChanged();
+        }
+        return;
+    }
+#endif
     int n = (int)__super::GetCount();
     
     // Entries with a null duration don't belong to any segments since

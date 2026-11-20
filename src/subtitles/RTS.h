@@ -336,6 +336,15 @@ public:
     };
     std::vector<RubyGroup> m_rubyGroups;
     Furigana::Options m_rubyOptions;
+    struct InheritedMetadata
+    {
+        CString style, actor;
+        STSStyle original;
+        Furigana::Options ruby;
+        int wrap = 0, boxMode = -1;
+        std::unique_ptr<KfxPaint::SlideSettings> slides;
+    };
+    std::unique_ptr<InheritedMetadata> m_inherited;
     int m_annotationLeft = 0, m_annotationRight = 0;
     bool m_keepRubyKaraoke = false;
     void PlaceHorizontalRuby();
@@ -407,6 +416,7 @@ public:
 };
 
 struct OverrideTagCache;
+struct OverrideTag;
 struct TextGeometryCache;
 struct TextDeviceContext;
 class EventWorkerPool;
@@ -453,7 +463,10 @@ class CRenderedTextSubtitle : public CSimpleTextSubtitle, public ISubPicProvider
     void ParseString(CSubtitle* sub, CStringW str, STSStyle& style);
     void ParsePolygon(CSubtitle* sub, CStringW str, STSStyle& style);
     bool ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org, bool fAnimate = false,
-        const KfxPaint::SlideSettings* inheritedSlides = nullptr);
+        const KfxPaint::SlideSettings* inheritedSlides = nullptr, const std::vector<OverrideTag>* compiled = nullptr);
+#ifdef _VSMOD
+    void ApplyMetadata(CSubtitle& subtitle, const CString& styleName, STSStyle& style, bool initial, bool named);
+#endif
     bool ParseHtmlTag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org);
 
 #if defined(_VSMOD) && defined(_LUA)
