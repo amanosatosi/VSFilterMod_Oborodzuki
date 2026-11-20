@@ -1,16 +1,21 @@
+// DirectWrite's newer SDK declarations must see their version guards
+// before any Windows headers, including the precompiled header.
+#ifdef WINVER
+#undef WINVER
+#endif
+#define WINVER 0x0A00
+#ifdef _WIN32_WINNT
+#undef _WIN32_WINNT
+#endif
+#define _WIN32_WINNT 0x0A00
+#ifdef NTDDI_VERSION
+#undef NTDDI_VERSION
+#endif
+#define NTDDI_VERSION 0x0A000004 // Windows 10 RS3
 #include "stdafx.h"
 #include "ShapedText.h"
 #include "RenderProfile.h"
-// The legacy project targets older Windows versions. Expose the newer
-// DirectWrite declarations only in this translation unit: QueryInterface
-// below still gates their use at runtime, without raising the DLL's OS target.
-#pragma push_macro("NTDDI_VERSION")
-#if NTDDI_VERSION < NTDDI_WIN10_RS3
-#undef NTDDI_VERSION
-#define NTDDI_VERSION NTDDI_WIN10_RS3
-#endif
 #include <dwrite_3.h>
-#pragma pop_macro("NTDDI_VERSION")
 #include <d2d1.h>
 #include <algorithm>
 #include <cmath>

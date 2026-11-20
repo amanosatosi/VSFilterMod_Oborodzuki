@@ -171,7 +171,9 @@
     <ClCompile Include="RealTextParser.cpp" />
     <ClCompile Include="RenderedHdmvSubtitle.cpp" />
     <ClCompile Include="RTS.cpp" />
-    <ClCompile Include="ShapedText.cpp" />
+    <ClCompile Include="ShapedText.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="SSF.cpp">
       <AssemblerOutput Condition="'$(Configuration)|$(Platform)'=='Release (MOD)|Win32'">AssemblyAndSourceCode</AssemblerOutput>
       <AssemblerOutput Condition="'$(Configuration)|$(Platform)'=='Debug (MOD)|Win32'">AssemblyAndSourceCode</AssemblerOutput>
