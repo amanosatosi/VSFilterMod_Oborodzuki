@@ -1,7 +1,16 @@
 #include "stdafx.h"
 #include "ShapedText.h"
 #include "RenderProfile.h"
+// The legacy project targets older Windows versions. Expose the newer
+// DirectWrite declarations only in this translation unit: QueryInterface
+// below still gates their use at runtime, without raising the DLL's OS target.
+#pragma push_macro("NTDDI_VERSION")
+#if NTDDI_VERSION < NTDDI_WIN10_RS3
+#undef NTDDI_VERSION
+#define NTDDI_VERSION NTDDI_WIN10_RS3
+#endif
 #include <dwrite_3.h>
+#pragma pop_macro("NTDDI_VERSION")
 #include <d2d1.h>
 #include <algorithm>
 #include <cmath>
