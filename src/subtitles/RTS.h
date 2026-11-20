@@ -30,6 +30,7 @@
 #include "ShapedText.h"
 #include "Furigana.h"
 #include "NativeScroll.h"
+#include "NativeChat.h"
 #ifdef _VSMOD
 #include "ColumnLayout.h"
 #endif
@@ -136,6 +137,7 @@ public:
     bool m_isRubyReading = false;
     unsigned m_rubyGroup = 0;
     unsigned m_scrollGroup = 0;
+    int m_chatReceipt = 0;
     unsigned m_columnCell = 0;
     int VerticalPaintSplit(int y, double progress) const
     {
@@ -359,6 +361,8 @@ public:
     unsigned m_scrollGroup = 0;
     int m_scrollDuration = 300, m_scrollRows = 0;
     std::vector<NativeScroll::Context> m_scrollContexts;
+    std::unique_ptr<NativeChat::Scene> m_chat;
+    void ArrangeChat(STSStyle& style, int frameHeight);
     void MeasureScrollRows();
     std::vector<NativeScroll::Frame> ScrollFrame(int time, int top) const;
     double m_clipOffsetX = 0, m_clipOffsetY = 0;

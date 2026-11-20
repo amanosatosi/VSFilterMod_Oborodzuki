@@ -744,7 +744,8 @@ CRect CWord::RubyClip(const CRect& clip, int x, int y) const
 {
     CRect result = clip;
     if (const auto* scroll = WordScroll(*this))
-        if (scroll->clipped)
+        if (scroll->hidden) result.SetRectEmpty();
+        else if (scroll->clipped)
         {
             result.top = (std::max)(result.top, LONG(scroll->top));
             result.bottom = (std::min)(result.bottom, LONG(scroll->bottom));
@@ -1150,6 +1151,7 @@ CWord::CWord(CWord& word)
     m_isRubyReading = word.m_isRubyReading;
     m_rubyGroup = word.m_rubyGroup;
     m_scrollGroup = word.m_scrollGroup;
+    m_chatReceipt = word.m_chatReceipt;
     m_columnCell = word.m_columnCell;
 #endif
 }
@@ -3163,7 +3165,11 @@ CLine* CSubtitle::GetNextLine(POSITION& pos, int maxwidth)
 
     ret->m_width = ret->m_ascent = ret->m_descent = ret->m_borderX = ret->m_borderY = 0;
 
-    maxwidth = GetWrapWidth(pos, maxwidth);
+#ifdef _VSMOD
+    if (m_chat) maxwidth = m_chat->textWidth;
+    else
+#endif
+        maxwidth = GetWrapWidth(pos, maxwidth);
 
     bool fEmptyLine = true;
 
@@ -3423,6 +3429,20 @@ void CSubtitle::AppendWord(CWord* word)
 {
 #ifdef _VSMOD
     word->m_scrollGroup = m_scrollGroup;
+    if (m_chat)
+    {
+        auto& chat = *m_chat;
+        if (chat.current && chat.previousWord && chat.previousWord != chat.current &&
+            !m_words.IsEmpty() && !m_words.GetTail()->m_fLineBreak)
+        {
+            auto lineBreak = std::make_unique<CText>(word->m_style, CStringW(), 0, 0, 0, m_scalex, m_scaley);
+            lineBreak->m_logicalLine = m_logicalLine++;
+            m_words.AddTail(lineBreak.get());
+            lineBreak.release();
+        }
+        chat.previousWord = chat.current;
+        word->m_scrollGroup = chat.current;
+    }
     if (m_columns && !word->m_fLineBreak)
         word->m_columnCell = (m_columns->number << 16) | m_columns->current;
     word->m_logicalLine = m_logicalLine;
@@ -3457,6 +3477,7 @@ void CSubtitle::MeasureScrollRows()
 
 std::vector<NativeScroll::Frame> CSubtitle::ScrollFrame(int time, int top) const
 {
+    if (m_chat) return m_chat->Frame(time, top);
     std::vector<NativeScroll::Frame> frame;
     frame.reserve(m_scrollContexts.size());
     for (const auto& context : m_scrollContexts) frame.push_back(context.At(time, top));
@@ -3516,6 +3537,19 @@ public:
     }
 
     CWord* Copy() override { return new EventBoxPath(*this); }
+
+    void AddPolygon(std::initializer_list<RenderGeometry::Point> polygon)
+    {
+        const auto first = types.size();
+        for (const auto& point : polygon)
+        {
+            points.push_back({LONG(std::lround(point.x * 8)), LONG(std::lround(point.y * 8))});
+            types.push_back(PT_LINETO);
+        }
+        if (!polygon.size()) return;
+        types[first] = PT_MOVETO;
+        types.back() |= PT_CLOSEFIGURE;
+    }
 
     void AddContour(KfxPaint::Rect rect, double rx, double ry, bool hole)
     {
@@ -3626,6 +3660,147 @@ void CSubtitle::CreateEventBox(int borderStyle, int time, bool scaledBorder)
             x = outerX;
             y = outerY;
         }
+}
+
+void CSubtitle::ArrangeChat(STSStyle& style, int frameHeight)
+{
+    if (IsEmpty() || m_chat->messages.empty()) return;
+    auto& chat = *m_chat;
+    const int pad = chat.pad;
+    const int oldHeight = m_rect.Height(), oldWidth = m_rect.Width();
+    const int alignX = m_scrAlignment % 3;
+    const int left = alignX == 1 ? 0 : alignX == 2 ? -chat.width / 2 : -chat.width;
+    const int fontHeight = (std::max)(8, int(style.fontSize * m_scaley * 8));
+    chat.headerHeight = chat.title.IsEmpty() ? pad : fontHeight + pad * 2;
+    struct Row { CLine* line; int top; };
+    std::vector<std::vector<Row>> messageRows(chat.messages.size());
+    int originalY = 0;
+    for (auto at = GetHeadPosition(); at;)
+    {
+        auto* line = GetNext(at);
+        if (!line->IsEmpty())
+        {
+            const auto group = line->GetHead()->m_scrollGroup;
+            if (group && group <= messageRows.size())
+                messageRows[group - 1].push_back({line, originalY});
+        }
+        originalY += line->m_ascent + line->m_descent;
+    }
+    auto labels = std::make_unique<CLine>();
+    labels->m_width = chat.width;
+    labels->m_ascent = labels->m_descent = labels->m_borderX = labels->m_borderY = 0;
+    STSStyle shapes(style);
+    shapes.fontAngleX = shapes.fontAngleY = shapes.fontAngleZ = 0;
+    shapes.fontShiftX = shapes.fontShiftY = shapes.mod_z = 0;
+    shapes.mod_distort = MOD_DISTORT();
+    shapes.mod_grad.clear();
+    shapes.mod_jitter = MOD_JITTER();
+    const auto rect = [&](KfxPaint::Rect bounds, double rad, DWORD color, BYTE inverseAlpha, unsigned group,
+                          double thickness = 0., int receipt = 0) {
+        auto shape = std::make_unique<EventBoxPath>(shapes, m_scalex, m_scaley, bounds);
+        shape->m_style.colors[3] = color;
+        shape->m_style.alpha[3] = inverseAlpha;
+        shape->m_scrollGroup = group;
+        shape->m_chatReceipt = receipt;
+        shape->AddContour(bounds, rad, rad, false);
+        if (thickness > 0 && bounds.right - bounds.left > thickness * 2 && bounds.bottom - bounds.top > thickness * 2)
+            shape->AddContour({bounds.left + thickness, bounds.top + thickness,
+                bounds.right - thickness, bounds.bottom - thickness}, rad - thickness, rad - thickness, true);
+        m_eventBox.push_back(std::move(shape));
+    };
+    const auto label = [&](const CStringW& text, int x, int y, DWORD color, BYTE inverseAlpha, unsigned group) {
+        STSStyle face(shapes);
+        face.fontSize = fontHeight * 6.;
+        face.colors[0] = color;
+        face.alpha[0] = inverseAlpha;
+        face.outlineWidthX = face.outlineWidthY = face.shadowDepthX = face.shadowDepthY = 0;
+        face.borderStyle = 0;
+        auto word = std::make_unique<CText>(face, text, 0, 0, 0, m_scalex, m_scaley);
+        word->m_scrollGroup = group;
+        word->PlaceLayout(CPoint(x, y - originalY + word->m_ascent), 1, 0, 0, 0);
+        word->m_width = 0;
+        labels->AddTail(word.get());
+        word.release();
+    };
+    int y = chat.headerHeight + pad;
+    for (size_t i = 0; i < messageRows.size(); ++i)
+    {
+        auto& message = chat.messages[i];
+        message.start = chat.AppearanceTime(i);
+        message.top = y;
+        if (messageRows[i].empty()) { message.bottom = y; continue; }
+        int width = 0;
+        for (const auto& row : messageRows[i]) width = (std::max)(width, row.line->m_width);
+        const auto& skin = message.skin;
+        const int border = (std::min)(pad * 2, int(skin.border * m_scalex * 8));
+        const int bubbleWidth = (std::min)(chat.width - pad * 2, width + (pad + border) * 2);
+        const int x = message.right ? chat.width - pad - bubbleWidth : pad;
+        y += pad + border;
+        if (message.showName && !message.name.IsEmpty())
+        {
+            label(message.name, x + pad + border, y, message.colors[1], message.alpha[1], unsigned(i + 1));
+            y += fontHeight;
+        }
+        for (const auto& row : messageRows[i])
+        {
+            for (auto words = row.line->GetHeadPosition(); words;)
+                row.line->GetNext(words)->OffsetLayout(CPoint(x + pad + border, y - row.top));
+            row.line->m_width = chat.width;
+            row.line->m_horizontalAnchor = -1;
+            y += row.line->m_ascent + row.line->m_descent;
+        }
+        y += pad + border;
+        message.bottom = y;
+        const KfxPaint::Rect bubble{double(left + x), double(message.top), double(left + x + bubbleWidth), double(y)};
+        if (message.right && message.receipt > 0)
+        {
+            // Small paired strokes live in the bubble's padding.
+            const int right = int(bubble.right) - pad / 2;
+            const int bottom = y - pad / 3;
+            const auto check = [&](int dx, int stage) {
+                const int length = (std::max)(8, pad / 3);
+                const int weight = (std::max)(6, pad / 10);
+                const int px = right - dx;
+                auto draw = std::make_unique<EventBoxPath>(shapes, m_scalex, m_scaley, bubble);
+                draw->AddPolygon({{double(px-2*length),double(bottom-length)}, {double(px-length),double(bottom)},
+                    {double(px),double(bottom-2*length)}, {double(px-weight),double(bottom-2*length-weight)},
+                    {double(px-length),double(bottom-weight)}, {double(px-2*length+weight),double(bottom-length-weight)}});
+                draw->m_style.colors[3] = message.colors[0];
+                draw->m_style.alpha[3] = message.alpha[0];
+                draw->m_scrollGroup = unsigned(i + 1);
+                draw->m_chatReceipt = stage;
+                m_eventBox.push_back(std::move(draw));
+            };
+            if (message.receipt == 2) check(pad / 4, 2);
+            check(0, 1);
+        }
+        if (border)
+            rect(bubble, pad, skin.borderColor >= 0 ? revcolor(skin.borderColor) : 0,
+                BYTE(skin.borderAlpha >= 0 ? skin.borderAlpha : 0), unsigned(i + 1), border);
+        rect(bubble, pad, message.colors[2], message.alpha[2], unsigned(i + 1));
+        y += pad;
+    }
+    chat.viewport = (std::max)(pad * 2, (std::min)(int(frameHeight * .68), y - chat.headerHeight));
+    const int height = chat.headerHeight + chat.viewport;
+    const DWORD panel = style.colors[3] & 0xffffff;
+    const bool dark = ((panel & 255) + ((panel >> 8) & 255) + ((panel >> 16) & 255)) < 384;
+    if (!chat.title.IsEmpty())
+    {
+        label(chat.title, pad * 2, pad, chat.headerColor >= 0 ? revcolor(chat.headerColor) :
+            dark ? 0xffffff : 0, 0, 0);
+        rect({double(left), 0, double(left + chat.width), double(chat.headerHeight)}, pad,
+            chat.headerBackground >= 0 ? revcolor(chat.headerBackground) : dark ? 0 : 0xffffff, 0, 0);
+    }
+    rect({double(left), 0, double(left + chat.width), double(height)}, pad, panel, style.alpha[3], 0);
+    if (!labels->IsEmpty()) { AddTail(labels.get()); labels.release(); }
+    const int dx = chat.width - oldWidth, dy = height - oldHeight;
+    const int xShift = alignX == 1 ? 0 : alignX == 2 ? dx / 2 : dx;
+    const int yShift = m_scrAlignment <= 3 ? dy : m_scrAlignment <= 6 ? dy / 2 : 0;
+    m_rect.left -= xShift;
+    m_rect.right += dx - xShift;
+    m_rect.top -= yShift;
+    m_rect.bottom += dy - yShift;
+    m_textWidth = chat.width;
 }
 
 namespace
@@ -5051,7 +5226,7 @@ void CRenderedTextSubtitle::ParseString(CSubtitle* sub, CStringW str, STSStyle& 
     PROFILE_RENDER_STAGE(Layout);
     if(!sub) return;
 #ifdef _VSMOD
-    if ((sub->m_curve || sub->m_vertical || sub->m_columns || (sub->m_cycles && sub->m_cycles->active)) &&
+    if ((sub->m_curve || sub->m_vertical || sub->m_columns || sub->m_chat || (sub->m_cycles && sub->m_cycles->active)) &&
         !sub->m_curveShapeFailed)
     {
         if (sub->m_words.IsEmpty()) sub->m_curveScale = style.objectScale / 100;
@@ -5306,7 +5481,7 @@ bool CRenderedTextSubtitle::ParseFurigana(CSubtitle* sub, Furigana::Fields& fiel
             auto word = std::make_unique<ShapedWord>(selected, plain.Mid(cluster.start, cluster.length), run, i,
                 segment->type, segment->start, segment->end, sub->m_scalex, sub->m_scaley);
             word->m_isRubyReading = side != 0;
-            word->m_scrollGroup = sub->m_scrollGroup;
+            word->m_scrollGroup = sub->m_chat ? sub->m_chat->current : sub->m_scrollGroup;
             const double width = word->m_fWhiteSpaceChar ? 0 : (std::max)(1, word->m_width);
             if (side == owner && width && (segment->explicitTag || timing.size() > 1))
             {
@@ -5619,7 +5794,7 @@ bool NativeLayoutTag(const CStringW& name)
     switch (name[0])
     {
     case L'c': return name == L"ct" || name == L"ctan" || name == L"ctx" || name == L"cty" ||
-                    name == L"col" || name == L"colan" || name == L"colsp";
+                    name == L"col" || name == L"colan" || name == L"colsp" || name == L"chatmode";
     case L'f': return !name.Find(L"furi");
     case L'm': return name == L"mpersp";
     case L's': return name == L"scroll" || name == L"scrollt" ||
@@ -6233,6 +6408,22 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
             append({cmd, cmd, std::move(params), rawCount});
             continue;
         }
+        const std::pair<const wchar_t*, int> chatScalars[] = {
+            {L"chatmode", 8}, {L"msgtitlegbc", 11}, {L"msgtitlec", 9}, {L"msgshowname", 11},
+            {L"readmark", 8}, {L"readtime", 8}, {L"bubbc", 5}, {L"bubba", 5}, {L"bubbs", 5},
+            {L"bubc", 4}, {L"buba", 4}, {L"bc", 2}, {L"ba", 2}
+        };
+        bool chatScalar = false;
+        if (cmd[0] == L'm' || cmd[0] == L'c' || cmd[0] == L'r' || cmd[0] == L'b')
+            for (const auto& item : chatScalars)
+                if (!cmd.Find(item.first))
+                {
+                    params.push_back(cmd.Mid(item.second));
+                    append({cmd, cmd.Left(item.second), std::move(params), rawCount, parenthesized});
+                    chatScalar = true;
+                    break;
+                }
+        if (chatScalar) continue;
 #endif
         if(!cmd.Find(L"1c") || !cmd.Find(L"2c") || !cmd.Find(L"3c") || !cmd.Find(L"4c"))
             params.push_back(cmd.Mid(2).Trim(L"&H")), cmd = cmd.Left(2);
@@ -6479,6 +6670,163 @@ std::shared_ptr<const OverrideTags> OverrideTagCache::Get(const CStringW& text)
 #ifdef _VSMOD
 namespace
 {
+void BeginChatMessage(NativeChat::Scene& chat, const NativeChat::Boundary& next, STSStyle& style)
+{
+    if (chat.messages.size() >= 128) return;
+    if (chat.beforePreset)
+    {
+        std::copy_n(chat.beforePreset->colors, 4, style.colors);
+        std::copy_n(chat.beforePreset->alpha, 4, style.alpha);
+        chat.skin = chat.beforeSkin;
+        chat.beforePreset.reset();
+    }
+    const bool right = next.side > 0 || (!next.side && !chat.main.IsEmpty() && next.name == chat.main);
+    const auto& preset = chat.presets[unsigned(right)];
+    if (preset)
+    {
+        chat.beforePreset = std::make_unique<STSStyle>(style);
+        chat.beforeSkin = chat.skin;
+        const auto& p = *preset;
+        for (int i = 0; i < 3; ++i)
+        {
+            style.colors[i] = revcolor(DWORD(p[2*i]));
+            style.alpha[i] = BYTE(p[2*i+1]);
+        }
+        chat.skin.borderColor = int(p[6]);
+        chat.skin.borderAlpha = int(p[7]);
+        chat.skin.border = p[8];
+        chat.skin.outlineColor = int(p[9]);
+        chat.skin.outlineAlpha = int(p[10]);
+        chat.skin.outline = p[11];
+    }
+    chat.messages.emplace_back();
+    auto& message = chat.messages.back();
+    message.name = next.name;
+    message.right = right;
+    chat.current = unsigned(chat.messages.size());
+}
+
+bool ApplyChatTag(NativeChat::Scene& chat, const OverrideTag& tag, STSStyle& style, bool animate)
+{
+    const auto& cmd = tag.command;
+    const auto& params = tag.parameters;
+    const CStringW argument = params.empty() ? CStringW{} : params[0];
+    if (cmd == L"chatmode") return true;
+    if (cmd == L"msg" || cmd == L"msgmarker")
+    {
+        if (animate) return true;
+        if (cmd == L"msgmarker" && chat.mode != 1 && chat.nextBoundary < chat.boundaries.size())
+            BeginChatMessage(chat, chat.boundaries[chat.nextBoundary++], style);
+        else if (cmd == L"msg" && chat.mode == 1 && !argument.IsEmpty() && params.size() <= 2)
+        {
+            const int side = params.size() == 1 ? 0 : params[1] == L"right" ? 1 : params[1] == L"left" ? -1 : 2;
+            if (side != 2) BeginChatMessage(chat, {argument, side}, style);
+        }
+        return true;
+    }
+    if (cmd == L"msgm" || cmd == L"msgtitle" || cmd == L"msgshowname" ||
+        cmd == L"msgstartcount" || cmd == L"msganim" || cmd == L"readmark" || cmd == L"readtime")
+    {
+        if (animate) return true;
+        int value;
+        if (cmd == L"msgm") chat.main = argument;
+        else if (cmd == L"msgtitle" && !chat.gotTitle) { chat.gotTitle = true; chat.title = argument; }
+        else if (NativeScroll::Integer(argument, value) && value >= 0)
+        {
+            if (cmd == L"msgshowname" && value <= 1) chat.showNames = value != 0;
+            if (cmd == L"msgstartcount") chat.initial = value;
+            if (cmd == L"msganim") chat.slide = value;
+            if (cmd == L"readmark" && value <= 2) chat.receipt = value;
+            if (cmd == L"readtime") { chat.readDelay = value; if (!chat.receipt) chat.receipt = 2; }
+        }
+        return true;
+    }
+    if (cmd == L"msgtime")
+    {
+        if (animate || params.size() > 128) return true;
+        std::vector<int> times;
+        int previous = 0;
+        for (const auto& param : params)
+        {
+            int time;
+            if (!NativeScroll::Integer(param, time)) return true;
+            time = (std::max)(previous, time);
+            times.push_back(time);
+            previous = time;
+        }
+        chat.hasTimes = true;
+        chat.times = std::move(times);
+        return true;
+    }
+    if (cmd == L"msgleft" || cmd == L"msgright")
+    {
+        if (animate || !tag.parenthesized) return true;
+        auto& state = chat.presets[cmd == L"msgright"];
+        if (params.empty()) state.reset();
+        else if (params.size() == 12)
+        {
+            auto preset = std::make_unique<std::array<double,12>>();
+            for (size_t i = 0; i < preset->size(); ++i)
+            {
+                if (i == 8 || i == 11)
+                {
+                    wchar_t* end;
+                    const wchar_t* start = params[i];
+                    const double size = std::wcstod(start, &end);
+                    if (start == end || *end || !std::isfinite(size) || size < 0 || size > 512) return true;
+                    (*preset)[i] = size;
+                }
+                else
+                {
+                    KfxPaint::Value rgb;
+                    if (!ReadPaintValue(params[i], i == 10 || (i < 8 && i % 2), rgb)) return true;
+                    (*preset)[i] = rgb;
+                }
+            }
+            state = std::move(preset);
+        }
+        return true;
+    }
+    auto& skin = chat.skin;
+    if (cmd == L"msgtitlec" || cmd == L"msgtitlegbc" || cmd == L"bubc" || cmd == L"buba" ||
+        cmd == L"bubbc" || cmd == L"bubba" || cmd == L"bc" || cmd == L"ba")
+    {
+        const bool alpha = cmd[cmd.GetLength()-1] == L'a';
+        KfxPaint::Value value;
+        if (animate || !ReadPaintValue(argument, alpha, value)) return true;
+        if (cmd == L"msgtitlec") chat.headerColor = value;
+        if (cmd == L"msgtitlegbc") chat.headerBackground = value;
+        if (cmd == L"bubc") style.colors[2] = revcolor(value);
+        if (cmd == L"buba") style.alpha[2] = BYTE(value);
+        if (cmd == L"bubbc") skin.borderColor = value;
+        if (cmd == L"bubba") skin.borderAlpha = value;
+        if (cmd == L"bc") skin.outlineColor = value;
+        if (cmd == L"ba") skin.outlineAlpha = value;
+        return true;
+    }
+    if (cmd == L"bubbs" || (!cmd.Find(L"bs") && cmd.GetLength() > 2))
+    {
+        const CStringW number = cmd == L"bubbs" ? argument : cmd.Mid(2);
+        const wchar_t* start = number;
+        wchar_t* end;
+        const double value = std::wcstod(start, &end);
+        if (!animate && start != end && !*end && std::isfinite(value))
+            (cmd == L"bubbs" ? skin.border : skin.outline) = (std::max)(0., (std::min)(512., value));
+        return true;
+    }
+    if (cmd == L"2c" && !argument.IsEmpty())
+    {
+        KfxPaint::Value rgb;
+        if (ReadPaintValue(argument, false, rgb)) chat.headerColor = rgb;
+    }
+    if (cmd == L"r" && !animate)
+    {
+        chat.skin = {};
+        chat.receipt = chat.readDelay = 0;
+    }
+    return false;
+}
+
 bool MetadataTag(const OverrideTag& tag, bool actor)
 {
     const auto& cmd = tag.command;
@@ -6509,7 +6857,8 @@ bool MetadataTag(const OverrideTag& tag, bool actor)
     if ((size == 3 && cmd[0] >= L'1' && cmd[0] <= L'4' && cmd[1] == L'v' &&
             (cmd[2] == L'c' || cmd[2] == L'a')) || cmd == L"vc" || cmd == L"va")
         return tag.parameters.size() == 4;
-    return actor && (SemanticColumns::DefaultFields(cmd) || tag.extension == ExtensionTag::Decoration);
+    return actor && (SemanticColumns::DefaultFields(cmd) || tag.extension == ExtensionTag::Decoration ||
+        cmd == L"msgleft" || cmd == L"msgright" || cmd == L"readmark" || cmd == L"readtime");
 }
 
 int MetadataPaintSlot(const OverrideTag& tag)
@@ -6818,6 +7167,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         CStringW p = params.size() > 0 ? params[0] : L"";
 
 #ifdef _VSMOD
+        if (sub->m_chat && ApplyChatTag(*sub->m_chat, tag, style, fAnimate)) continue;
         if (tag.extension == ExtensionTag::Pattern)
         {
             using P = PatternTag;
@@ -6893,7 +7243,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         const bool layout = tag.extension == ExtensionTag::Layout;
         if (layout && !cmd.Find(L"scroll"))
         {
-            if (fAnimate || sub->m_measuringLayout) continue;
+            if (fAnimate || sub->m_measuringLayout || sub->m_chat) continue;
             if (cmd == L"scroll0" && params.empty())
                 sub->m_scrollGroup = 0;
             else if (cmd == L"scroll" && tag.parenthesized && sub->m_scrollContexts.size() < 64)
@@ -9305,6 +9655,82 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
 #endif
     ParseEffect(sub, GetAt(entry).effect);
 #ifdef _VSMOD
+    if (str.Find(L"chatmode") >= 0 || str.Find(L'[') >= 0)
+        for (int left = 0; !sub->m_chat && (left = str.Find(L'{', left)) >= 0;)
+        {
+            const int right = str.Find(L'}', left + 1);
+            if (right < 0) break;
+            if (!m_overrideTags) m_overrideTags = std::make_unique<OverrideTagCache>();
+            const auto tags = m_overrideTags->Get(str.Mid(left + 1, right - left - 1));
+            for (const auto& tag : *tags)
+                if (tag.command == L"chatmode" && !tag.parameters.empty())
+                {
+                    int value;
+                    if (!NativeScroll::Integer(tag.parameters[0], value) || value < 1 || value > 3) continue;
+                    sub->m_chat = std::make_unique<NativeChat::Scene>();
+                    sub->m_chat->mode = value;
+                    sub->m_chat->width = (std::max)(80 * 8, int(m_size.cx * .48));
+                    sub->m_chat->pad = (std::max)(16, int(12 * sub->m_scalex * 8));
+                    sub->m_chat->textWidth = (std::max)(64, int(sub->m_chat->width * .75) - sub->m_chat->pad * 4);
+                    break;
+                }
+            left = right + 1;
+        }
+    if (sub->m_chat && sub->m_chat->mode == 2)
+        str = NativeChat::LazyMessages(str, *sub->m_chat);
+    else if (sub->m_chat && sub->m_chat->mode == 3)
+    {
+        CStringW payload;
+        bool boundary = true;
+        int side = -1;
+        for (int i = 0; i < str.GetLength();)
+        {
+            if (str[i] == L'{')
+            {
+                const int close = str.Find(L'}', i + 1);
+                if (close >= 0)
+                {
+                    const auto body = str.Mid(i + 1, close - i - 1);
+                    bool next = boundary && body == L"|";
+                    if (boundary && !next)
+                    {
+                        const auto tags = m_overrideTags->Get(body);
+                        for (const auto& tag : *tags)
+                        {
+                            int value;
+                            if (tag.command != L"ta" || tag.parameters.empty() ||
+                                !NativeScroll::Integer(tag.parameters[0], value) || value < 1 || value > 9 || value % 3 == 2)
+                                continue;
+                            side = value % 3 ? -1 : 1;
+                            next = true;
+                            break;
+                        }
+                    }
+                    if (next && sub->m_chat->boundaries.size() < 128)
+                    {
+                        if (payload.Right(2) == L"\\N") payload.Truncate(payload.GetLength() - 2);
+                        sub->m_chat->boundaries.push_back({{}, side});
+                        payload += L"{\\msgmarker}";
+                    }
+                    if (body != L"|" || !next) payload += str.Mid(i, close - i + 1);
+                    i = close + 1;
+                    continue;
+                }
+            }
+            if (str[i] == L'\\' && str[i + 1] == L'N')
+            {
+                payload += L"\\N";
+                boundary = true;
+                i += 2;
+            }
+            else
+            {
+                if (!iswspace(str[i])) boundary = false;
+                payload.AppendChar(str[i++]);
+            }
+        }
+        str = std::move(payload);
+    }
     if (!m_metadataCarriers.empty() && !m_doOverrideStyle)
     {
         const auto& source = GetAt(entry);
@@ -9322,7 +9748,7 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
         (str.Find(L"\\<") >= 0 || str.Find(L"\\>") >= 0 || str.Find(L"\\|\\") >= 0);
     if ((str.Find(L"\\ct(") >= 0 || str.Find(L'[') >= 0 ||
          (str.Find(L"\\N") >= 0 && str.Find(L"\\c") >= 0)) &&
-        !sub->m_effects[EF_SCROLL] && !sub->m_effects[EF_BANNER]
+        !sub->m_chat && !sub->m_effects[EF_SCROLL] && !sub->m_effects[EF_BANNER]
 #ifdef _LUA
         && !hasExternalLua
 #endif
@@ -9423,7 +9849,33 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
 
         STSStyle tmp;
 
+#ifdef _VSMOD
+        if (sub->m_chat)
+        {
+            auto& chat = *sub->m_chat;
+            if (!chat.current) BeginChatMessage(chat, {}, stss);
+            auto& message = chat.messages[chat.current - 1];
+            std::copy_n(stss.colors, 4, message.colors);
+            std::copy_n(stss.alpha, 4, message.alpha);
+            message.skin = chat.skin;
+            message.showName = chat.showNames;
+            message.receipt = chat.mode == 3 || message.name == chat.main ? chat.receipt : 0;
+            message.readDelay = chat.readDelay;
+        }
+#endif
         tmp = stss;
+#ifdef _VSMOD
+        if (sub->m_chat)
+        {
+            const auto& skin = sub->m_chat->skin;
+            if (skin.outlineColor >= 0) tmp.colors[2] = revcolor(skin.outlineColor);
+            else tmp.colors[2] = 0;
+            if (skin.outlineAlpha >= 0) tmp.alpha[2] = BYTE(skin.outlineAlpha);
+            else tmp.alpha[2] = 0;
+            if (skin.outline >= 0) tmp.outlineWidthX = tmp.outlineWidthY = skin.outline;
+            tmp.borderStyle = 0;
+        }
+#endif
 
         tmp.fontSize = sub->m_scaley * tmp.fontSize * 64;
         tmp.fontSpacing = sub->m_scalex * tmp.fontSpacing * 64;
@@ -9544,14 +9996,16 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
     if (measuringLayout)
         return owned.release();
 #ifdef _VSMOD
-    if (hasBox)
+    if (sub->m_chat)
+        sub->ArrangeChat(stss, m_size.cy);
+    else if (hasBox)
     {
         if (sub->m_revealKaraoke)
             sub->m_fAnimated = true;
         sub->CreateEventBox(borderStyle, m_time, m_fScaledBAS);
     }
     sub->ConfigureDistortion();
-    if (sub->m_scrollContexts.empty()) sub->ConfigurePerspective();
+    if (sub->m_scrollContexts.empty() && !sub->m_chat) sub->ConfigurePerspective();
 #endif
 
     m_subtitleCache[entry] = sub;
@@ -10340,7 +10794,7 @@ try
 #endif
         if(!fPosOverride && !fOrgOverride && !s->m_fAnimated
 #ifdef _VSMOD
-            && !s->m_origin && s->m_scrollContexts.empty()
+            && !s->m_origin && s->m_scrollContexts.empty() && !s->m_chat
 #endif
             )
             r = m_sla.AllocRect(s, segment, entry, stse.layer, m_collisions);
@@ -10391,15 +10845,24 @@ try
 #ifdef _VSMOD
         if (!s->m_eventBox.empty())
         {
-            const CPoint origin = CPoint(org.x, p2.y) + s->m_warpedShift;
             for (auto i = s->m_eventBox.rbegin(); i != s->m_eventBox.rend(); ++i)
             {
                 auto& box = **i;
+                const auto* scrollState = WordScroll(box);
+                if (scrollState && scrollState->hidden) continue;
+                if (box.m_chatReceipt == 2 && s->m_chat && box.m_scrollGroup)
+                {
+                    const auto& message = s->m_chat->messages[box.m_scrollGroup - 1];
+                    if (int64_t(eventTime) < int64_t(message.start) + message.readDelay) continue;
+                }
+                const int dy = ScrollOffset(box);
+                const CPoint origin = CPoint(org.x, p2.y + dy) + s->m_warpedShift;
+                const CPoint boxTransform(org2.x, org2.y + dy);
                 auto& style = box.m_style;
 #ifdef _LUA
-                box.Paint(origin, org2, 4);
+                box.Paint(origin, boxTransform, 4);
 #else
-                box.Paint(origin, org2);
+                box.Paint(origin, boxTransform);
 #endif
                 const DWORD opacity = MulDiv(255 - style.alpha[3], 255 - alpha, 255);
                 const DWORD colors[4] = {DWORD(revcolor(style.colors[3])) | (opacity << 24), DWORD(-1), 0, 0};
@@ -10407,7 +10870,8 @@ try
                 style.mod_grad.subpixx = origin.x & 7;
                 style.mod_grad.subpixy = origin.y & 7;
                 const auto drawBox = [&](CRect& clip) {
-                    bbox2 |= box.Draw(spd, clip, pAlphaMask, origin.x, origin.y, colors, true, false, 3,
+                    auto visible = box.RubyClip(clip, origin.x, origin.y);
+                    bbox2 |= box.Draw(spd, visible, pAlphaMask, origin.x, origin.y, colors, true, false, 3,
                         style.mod_grad, mod_vc, style.mod_blendMode, false, false);
                 };
                 if (s->m_clipInverse)

@@ -21,7 +21,7 @@ inline bool Integer(CStringW text, int& value)
 }
 
 struct Cue { int start, duration, rows; double distance = 0; };
-struct Frame { int offset = 0, top = 0, bottom = 0; bool clipped = false; };
+struct Frame { int offset = 0, top = 0, bottom = 0; bool clipped = false, hidden = false; };
 
 struct Context
 {

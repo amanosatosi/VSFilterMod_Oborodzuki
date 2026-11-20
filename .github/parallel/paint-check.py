@@ -811,7 +811,7 @@ if ROUND4:
     inherited = write("metadata-carriers", [
         (400, 250, "", "<漢字|かんじ>"),
         (815, 250, "", r"{\fs30\fs\furis30\furis}<明日|あした>"),
-        (1160, 350, "", r"{\fs30\r}<病|やまい>"),
+        (1160, 350, "", r"{\fs30\r\bord0\shad0}<病|やまい>"),
     ])
     source = inherited[0].read_text(encoding="utf-8-sig")
     inherited[0].write_text(source.replace("Dialogue:", carriers + "Dialogue:", 1)
@@ -824,6 +824,28 @@ if ROUND4:
     expected = benchmark(CANDIDATE, inline, 1, "regression")["hashes"]
     for workers in (1, 2, 4, 6, 8):
         assert benchmark(CANDIDATE, inherited, workers, "regression")["hashes"] == expected
+
+    for mode, body in (
+        (1, r"{\msg(Miku,right)}Hello{\msg(Yurf,left)}မြန်မာ"),
+        (2, r"|Miku:\NHello||Yurf:\N<世界|せかい> မြန်မာ|"),
+        (3, r"{\ta9}Hello\N{\ta7}မြန်မာ\N{|}More"),
+    ):
+        chat = write(f"native-chat-{mode}", [
+            (240, 180, rf"\chatmode{mode}\msgtitle(Contact)\msgm(Miku)\msgshowname0"
+             rf"\msgtime(0,500,750)\msganim(0)\readmark2\readtime400\fs44\fnMyanmar Text"
+             rf"\1c{WHITE}\3c{BLUE}\4c{GREEN}\3a&H00&\4a&H00&\bubbs2", body),
+        ])
+        playback("csri", CANDIDATE, chat, ROOT / f"chat-{mode}")
+        actual = captures(ROOT / f"chat-{mode}", {"chat": (240, 180)})
+        assert sum(actual(60, "chat", x, y)[1] > 220 for y in range(80, 200)
+                   for x in range(80, 700)) > 500
+        assert sum(actual(120, "chat", x, y)[2] > 220 for y in range(100, 400)
+                   for x in range(20, 870)) > 500
+        assert any(actual(60, "chat", x, y) != actual(120, "chat", x, y)
+                   for y in range(80, 400) for x in range(20, 850))
+        expected = benchmark(CANDIDATE, chat, 1, "regression")["hashes"]
+        for workers in (2, 4, 6, 8):
+            assert benchmark(CANDIDATE, chat, workers, "regression")["hashes"] == expected
 
 # Check old corner math against the validated VSFilterMod path rather than
 # requiring its different legacy bitmap geometry to agree with libass.
