@@ -782,6 +782,26 @@ if ROUND4:
     for workers in (1, 2, 4, 6, 8):
         assert benchmark(CANDIDATE, annotated, workers, "regression")["hashes"] == expected
 
+    scroll = write("native-scroll", [
+        (230, 350, rf"\fs54\1c{WHITE}\scrollsl1\scrollt0\scroll(ue,1000,+1)",
+         r"MMMM\NMMMM\N{\scroll0}FOOT"),
+        (775, 350, rf"\fs54\1c{WHITE}\scroll(sita,0|1000,+1,500|500,-1)",
+         r"MMMM\NMMMM"),
+        (1370, 350, rf"\fs54\1c{WHITE}\scroll(ue,1000,+1,2000,0,2500,-1)",
+         r"<漢字|かんじ>\N{\fs36}MMMM\N{\scroll0}FOOT"),
+    ])
+    playback("csri", CANDIDATE, scroll, ROOT / "scroll")
+    get = captures(ROOT / "scroll", {"up": (230,350), "down": (775,350), "ruby": (1370,350)})
+    # The first row and its identical replacement must have the same viewport pixels.
+    for y in range(200):
+        for x in range(240):
+            assert get(60, "up", x, y) == get(120, "up", x, y)
+    assert ink_bounds(get, 75, "down", top=0, bottom=215)[1] > ink_bounds(get, 60, "down", top=0, bottom=215)[1]
+    assert ink_bounds(get, 120, "down", top=0, bottom=215) == ink_bounds(get, 60, "down", top=0, bottom=215)
+    expected = benchmark(CANDIDATE, scroll, 1, "regression")["hashes"]
+    for workers in (2, 4, 6, 8):
+        assert benchmark(CANDIDATE, scroll, workers, "regression")["hashes"] == expected
+
 # Check old corner math against the validated VSFilterMod path rather than
 # requiring its different legacy bitmap geometry to agree with libass.
 playback("csri", Path("threading-baseline/renderer/renderer.dll").resolve(), grid, ROOT / "previous")

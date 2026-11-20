@@ -715,9 +715,40 @@ void CWord::AddWarpedBounds(CPoint position, RenderGeometry::Point& min, RenderG
     }
 }
 
+static thread_local const std::vector<NativeScroll::Frame>* activeScroll = nullptr;
+
+class ScrollFrameScope
+{
+    const std::vector<NativeScroll::Frame>* previous;
+public:
+    explicit ScrollFrameScope(const std::vector<NativeScroll::Frame>& frame) : previous(activeScroll)
+    {
+        activeScroll = frame.empty() ? nullptr : &frame;
+    }
+    ~ScrollFrameScope() { activeScroll = previous; }
+};
+
+static const NativeScroll::Frame* WordScroll(const CWord& word)
+{
+    return word.m_scrollGroup && activeScroll && word.m_scrollGroup <= activeScroll->size() ?
+        &(*activeScroll)[word.m_scrollGroup - 1] : nullptr;
+}
+
+static int ScrollOffset(const CWord& word)
+{
+    const auto* scroll = WordScroll(word);
+    return scroll ? scroll->offset : 0;
+}
+
 CRect CWord::RubyClip(const CRect& clip, int x, int y) const
 {
     CRect result = clip;
+    if (const auto* scroll = WordScroll(*this))
+        if (scroll->clipped)
+        {
+            result.top = (std::max)(result.top, LONG(scroll->top));
+            result.bottom = (std::min)(result.bottom, LONG(scroll->bottom));
+        }
     if (m_layoutPlacement)
     {
         const auto& pose = *m_layoutPlacement;
@@ -1118,6 +1149,7 @@ CWord::CWord(CWord& word)
     m_verticalWord = word.m_verticalWord;
     m_isRubyReading = word.m_isRubyReading;
     m_rubyGroup = word.m_rubyGroup;
+    m_scrollGroup = word.m_scrollGroup;
     m_columnCell = word.m_columnCell;
 #endif
 }
@@ -1130,7 +1162,7 @@ CWord::~CWord()
 bool CWord::Append(CWord* w)
 {
 #ifdef _VSMOD
-    if (m_columnCell != w->m_columnCell) return false;
+    if (m_columnCell != w->m_columnCell || m_scrollGroup != w->m_scrollGroup) return false;
 #endif
     if(!(m_style == w->m_style)
        || m_fLineBreak || w->m_fLineBreak
@@ -2684,7 +2716,8 @@ CRect CLine::PaintShadow(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPo
             int y = p.y - w->m_style.mod_verticalSpace + m_ascent - w->m_ascent + (int)(w->m_style.shadowDepthY + 0.5);
             const auto placed = w->LayoutPosition(CPoint(x, y));
             x = placed.x;
-            y = placed.y;
+            const int scrollY = ScrollOffset(*w);
+        y = placed.y + scrollY;
 #else
             int x = p.x + (int)(w->m_style.shadowDepthX + 0.5);
             int y = p.y + m_ascent - w->m_ascent + (int)(w->m_style.shadowDepthY + 0.5);
@@ -2706,9 +2739,13 @@ CRect CLine::PaintShadow(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPo
             w->m_style.mod_grad.fadalpha = alpha;
 #endif
 #if defined (_VSMOD) && defined(_LUA)
-            w->Paint(CPoint(x, y), org, 4);
+            w->Paint(CPoint(x, y), CPoint(org.x, org.y + scrollY), 4);
+#else
+            #ifdef _VSMOD
+            w->Paint(CPoint(x, y), CPoint(org.x, org.y + scrollY));
 #else
             w->Paint(CPoint(x, y), org);
+#endif
 #endif
             if(w->m_style.borderStyle == 0 || w->m_style.borderStyle == 3)
             {
@@ -2772,7 +2809,8 @@ CRect CLine::PaintOutline(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CP
             int y = p.y - w->m_style.mod_verticalSpace + m_ascent - w->m_ascent;
             const auto placed = w->LayoutPosition(CPoint(x, y));
             x = placed.x;
-            y = placed.y;
+            const int scrollY = ScrollOffset(*w);
+        y = placed.y + scrollY;
 #else
             int x = p.x;
             int y = p.y + m_ascent - w->m_ascent;
@@ -2795,9 +2833,13 @@ CRect CLine::PaintOutline(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CP
 #endif
 
 #if defined (_VSMOD) && defined(_LUA)
-            w->Paint(CPoint(x, y), org, 3);
+            w->Paint(CPoint(x, y), CPoint(org.x, org.y + scrollY), 3);
+#else
+            #ifdef _VSMOD
+            w->Paint(CPoint(x, y), CPoint(org.x, org.y + scrollY));
 #else
             w->Paint(CPoint(x, y), org);
+#endif
 #endif
 
             if(w->m_style.borderStyle != 1)
@@ -2854,7 +2896,8 @@ CRect CLine::PaintBody(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoin
         int y = p.y - w->m_style.mod_verticalSpace + m_ascent - w->m_ascent;
         const auto placed = w->LayoutPosition(CPoint(x, y));
         x = placed.x;
-        y = placed.y;
+        const int scrollY = ScrollOffset(*w);
+        y = placed.y + scrollY;
 #else
         int x = p.x;
         int y = p.y + m_ascent - w->m_ascent;
@@ -2940,9 +2983,13 @@ CRect CLine::PaintBody(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoin
 #endif
 
 #if defined (_VSMOD) && defined(_LUA)
-            w->Paint(CPoint(x, y), org, 1);
+            w->Paint(CPoint(x, y), CPoint(org.x, org.y + scrollY), 1);
+#else
+            #ifdef _VSMOD
+            w->Paint(CPoint(x, y), CPoint(org.x, org.y + scrollY));
 #else
             w->Paint(CPoint(x, y), org);
+#endif
 #endif
 
         sw[3] = (int)(w->m_style.outlineWidthX + t * w->getOverlayWidth() + t * bluradjust) >> 3;
@@ -2960,7 +3007,7 @@ CRect CLine::PaintBody(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoin
                 bbox |= w->DrawBodyPaint(spd, clipRect, pAlphaMask, x, y, sw, mod_vc, false);
             else
             {
-                const auto boundary = w->CurvePaintBoundary(CPoint(x, y), org, t);
+                const auto boundary = w->CurvePaintBoundary(CPoint(x, y), CPoint(org.x, org.y + scrollY), t);
                 bbox |= w->DrawBodyPaint(spd, clipRect, pAlphaMask, x, y, sw, mod_vc, false, 0, &boundary);
             }
         }
@@ -3375,6 +3422,7 @@ void CSubtitle::MakeLines(CSize size, CRect marginRect)
 void CSubtitle::AppendWord(CWord* word)
 {
 #ifdef _VSMOD
+    word->m_scrollGroup = m_scrollGroup;
     if (m_columns && !word->m_fLineBreak)
         word->m_columnCell = (m_columns->number << 16) | m_columns->current;
     word->m_logicalLine = m_logicalLine;
@@ -3383,6 +3431,38 @@ void CSubtitle::AppendWord(CWord* word)
 #endif
     m_words.AddTail(word);
 }
+
+#ifdef _VSMOD
+void CSubtitle::MeasureScrollRows()
+{
+    if (m_scrollContexts.empty()) return;
+    std::vector<std::vector<std::pair<int,int>>> rows(m_scrollContexts.size());
+    int top = 0;
+    for (auto at = GetHeadPosition(); at;)
+    {
+        auto* line = GetNext(at);
+        const int bottom = top + line->m_ascent + line->m_descent;
+        for (auto pos = line->GetHeadPosition(); pos;)
+        {
+            const auto* word = line->GetNext(pos);
+            if (!word->m_scrollGroup || word->m_fWhiteSpaceChar) continue;
+            auto& group = rows[word->m_scrollGroup - 1];
+            if (group.empty() || group.back().first != top)
+                group.emplace_back(top, bottom);
+        }
+        top = bottom;
+    }
+    for (size_t i = 0; i < rows.size(); ++i) m_scrollContexts[i].Resolve(rows[i]);
+}
+
+std::vector<NativeScroll::Frame> CSubtitle::ScrollFrame(int time, int top) const
+{
+    std::vector<NativeScroll::Frame> frame;
+    frame.reserve(m_scrollContexts.size());
+    for (const auto& context : m_scrollContexts) frame.push_back(context.At(time, top));
+    return frame;
+}
+#endif
 
 int CSubtitle::LineLeft(const CLine& line, int anchor) const
 {
@@ -5220,6 +5300,7 @@ bool CRenderedTextSubtitle::ParseFurigana(CSubtitle* sub, Furigana::Fields& fiel
             auto word = std::make_unique<ShapedWord>(selected, plain.Mid(cluster.start, cluster.length), run, i,
                 segment->type, segment->start, segment->end, sub->m_scalex, sub->m_scaley);
             word->m_isRubyReading = side != 0;
+            word->m_scrollGroup = sub->m_scrollGroup;
             const double width = word->m_fWhiteSpaceChar ? 0 : (std::max)(1, word->m_width);
             if (side == owner && width && (segment->explicitTag || timing.size() > 1))
             {
@@ -5535,6 +5616,8 @@ bool NativeLayoutTag(const CStringW& name)
                     name == L"col" || name == L"colan" || name == L"colsp";
     case L'f': return !name.Find(L"furi");
     case L'm': return name == L"mpersp";
+    case L's': return name == L"scroll" || name == L"scrollt" ||
+                     name == L"scrollsl" || name == L"scroll0";
     case L'v': return name == L"vert" || name == L"vtype" || name == L"vdir" ||
                     name == L"vsp" || name == L"vcolsp";
     case L'w': return name == L"wtan";
@@ -6091,7 +6174,7 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
             PaintTag paint{};
             OutlineTag outline;
             if (ReadPaintTag(cmd, paint) || ReadOutlineTag(cmd, outline) || EventBoxTag(cmd) ||
-                cmd == L"fad" || cmd == L"distort" || cmd == L"mpersp")
+                cmd == L"fad" || cmd == L"distort" || cmd == L"mpersp" || cmd == L"scroll")
             {
                 auto fields = PaintArguments(param);
                 if (cmd == L"fad" && fields.size() != 4)
@@ -6310,6 +6393,12 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
         else if(!cmd.Find(L"shad"))
             params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
 #ifdef _VSMOD
+        else if (!cmd.Find(L"scrollsl"))
+            params.push_back(cmd.Mid(8)), cmd = cmd.Left(8);
+        else if (!cmd.Find(L"scrollt"))
+            params.push_back(cmd.Mid(7)), cmd = cmd.Left(7);
+        else if (cmd == L"scroll0" || cmd == L"scroll")
+            ;
         else if(!cmd.Find(L"scale"))
             params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
 #endif
@@ -6637,6 +6726,38 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             continue;
         }
         const bool layout = tag.extension == ExtensionTag::Layout;
+        if (layout && !cmd.Find(L"scroll"))
+        {
+            if (fAnimate || sub->m_measuringLayout) continue;
+            if (cmd == L"scroll0" && params.empty())
+                sub->m_scrollGroup = 0;
+            else if (cmd == L"scroll" && tag.parenthesized && sub->m_scrollContexts.size() < 64)
+            {
+                NativeScroll::Context context;
+                context.visibleRows = sub->m_scrollRows;
+                if (context.Parse(params, sub->m_scrollDuration))
+                {
+                    sub->m_scrollContexts.push_back(std::move(context));
+                    sub->m_scrollGroup = unsigned(sub->m_scrollContexts.size());
+                    sub->m_curve.reset();
+                }
+            }
+            else if (params.size() == 1)
+            {
+                int value;
+                if (NativeScroll::Integer(p, value))
+                {
+                    if (cmd == L"scrollt" && value >= 0) sub->m_scrollDuration = value;
+                    if (cmd == L"scrollsl" && value > 0)
+                    {
+                        sub->m_scrollRows = value;
+                        if (sub->m_scrollGroup)
+                            sub->m_scrollContexts[sub->m_scrollGroup - 1].visibleRows = value;
+                    }
+                }
+            }
+            continue;
+        }
         if (layout && cmd == L"wtan")
         {
             const wchar_t* value = p;
@@ -8488,6 +8609,9 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 sub->m_rubyOptions = Furigana::Options{};
                 sub->m_warpedAnchor = 0;
                 sub->m_cycles.reset();
+                sub->m_scrollGroup = 0;
+                sub->m_scrollDuration = 300;
+                sub->m_scrollRows = 0;
             }
 #endif
 #ifdef _VSMOD
@@ -9219,6 +9343,7 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
     if (!sub->m_columnBlocks.empty()) sub->ArrangeColumns();
     if (!sub->m_rubyGroups.empty() && !sub->m_verticalLaidOut)
         sub->PlaceHorizontalRuby();
+    sub->MeasureScrollRows();
     sub->CurveLines();
 #endif
     if (measuringLayout)
@@ -9231,7 +9356,7 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
         sub->CreateEventBox(borderStyle, m_time, m_fScaledBAS);
     }
     sub->ConfigureDistortion();
-    sub->ConfigurePerspective();
+    if (sub->m_scrollContexts.empty()) sub->ConfigurePerspective();
 #endif
 
     m_subtitleCache[entry] = sub;
@@ -9315,6 +9440,10 @@ struct PreparedWord
 static std::function<void()> PrepareEventGeometry(CSubtitle* subtitle, CPoint origin,
     CPoint transformOrigin, CRect rectangle, int time, REFERENCE_TIME timestamp)
 {
+#ifdef _VSMOD
+    auto scroll = subtitle->ScrollFrame(time, rectangle.top);
+    const ScrollFrameScope scrollScope(scroll);
+#endif
     std::vector<PreparedWord> words;
     int y = rectangle.top;
     POSITION linePosition = subtitle->GetHeadPosition();
@@ -9335,6 +9464,7 @@ static std::function<void()> PrepareEventGeometry(CSubtitle* subtitle, CPoint or
             position = word->LayoutPosition(position);
             position.x -= style.mod_horizontalSpace;
             position.y -= style.mod_verticalSpace;
+            position.y += ScrollOffset(*word);
             position += word->m_style.mod_jitter.getOffset(timestamp);
 #endif
             // Match the first Paint invocation, because its origin determines
@@ -9362,19 +9492,25 @@ static std::function<void()> PrepareEventGeometry(CSubtitle* subtitle, CPoint or
         return {};
     return [words = std::move(words), transformOrigin
 #ifdef _VSMOD
-        , subtitle, origin, rectangle, timestamp
+        , subtitle, origin, rectangle, timestamp, scroll = std::move(scroll)
 #endif
         ] {
 #ifdef _VSMOD
+        const ScrollFrameScope scrollScope(scroll);
         if (subtitle->m_perspective)
             subtitle->PreparePerspective(origin, transformOrigin, rectangle, timestamp);
 #endif
         for (const auto& prepared : words)
         {
-#if defined(_VSMOD) && defined(_LUA)
-            prepared.word->Paint(prepared.position, transformOrigin, prepared.layer);
+#ifdef _VSMOD
+            const CPoint preparedOrigin(transformOrigin.x, transformOrigin.y + ScrollOffset(*prepared.word));
 #else
-            prepared.word->Paint(prepared.position, transformOrigin);
+            const CPoint preparedOrigin = transformOrigin;
+#endif
+#if defined(_VSMOD) && defined(_LUA)
+            prepared.word->Paint(prepared.position, preparedOrigin, prepared.layer);
+#else
+            prepared.word->Paint(prepared.position, preparedOrigin);
 #endif
         }
     };
@@ -10009,7 +10145,7 @@ try
 #endif
         if(!fPosOverride && !fOrgOverride && !s->m_fAnimated
 #ifdef _VSMOD
-            && !s->m_origin
+            && !s->m_origin && s->m_scrollContexts.empty()
 #endif
             )
             r = m_sla.AllocRect(s, segment, entry, stse.layer, m_collisions);
@@ -10038,6 +10174,8 @@ try
         auto paint = [=, &spd]() mutable {
         PROFILE_RENDER_STAGE(EventPaint);
 #ifdef _VSMOD
+        const auto scroll = s->ScrollFrame(eventTime, r.top);
+        const ScrollFrameScope scrollScope(scroll);
         if (s->m_perspective)
             s->PreparePerspective(org, org2, r, rt);
 #endif

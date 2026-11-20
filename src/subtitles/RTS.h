@@ -29,6 +29,7 @@
 #include "RenderGeometry.h"
 #include "ShapedText.h"
 #include "Furigana.h"
+#include "NativeScroll.h"
 #ifdef _VSMOD
 #include "ColumnLayout.h"
 #endif
@@ -134,6 +135,7 @@ public:
     bool m_verticalWord = false;
     bool m_isRubyReading = false;
     unsigned m_rubyGroup = 0;
+    unsigned m_scrollGroup = 0;
     unsigned m_columnCell = 0;
     int VerticalPaintSplit(int y, double progress) const
     {
@@ -345,6 +347,11 @@ public:
     CPoint m_warpedShift = CPoint(0, 0);
     void ConfigureDistortion();
     std::unique_ptr<KfxPaint::Cycles> m_cycles;
+    unsigned m_scrollGroup = 0;
+    int m_scrollDuration = 300, m_scrollRows = 0;
+    std::vector<NativeScroll::Context> m_scrollContexts;
+    void MeasureScrollRows();
+    std::vector<NativeScroll::Frame> ScrollFrame(int time, int top) const;
     double m_clipOffsetX = 0, m_clipOffsetY = 0;
     bool m_hasRectClip = false;
     struct LineAlignment { int first, inherited, full; };
