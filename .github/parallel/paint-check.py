@@ -868,14 +868,16 @@ if ROUND4:
         for workers in (2, 4, 6, 8):
             assert benchmark(CANDIDATE, chat, workers, "regression")["hashes"] == expected
 
-    font = Path("hosts/furi-tight-ascent.ttf").read_bytes()
+    # Verify a real OpenType font: synthetic FreeType fixtures may not satisfy
+    # DirectWrite font validation. The expected inequality remains mandatory.
+    font = Path("hosts/NotoSansMyanmar-Regular.ttf").read_bytes()
     encoded = []
     for i in range(0, len(font), 3):
         block = font[i:i + 3]
         number = int.from_bytes(block.ljust(3, b"\0"), "big")
         encoded.extend(chr(((number >> shift) & 63) + 33) for shift in (18, 12, 6, 0)[:len(block) + 1])
     lines = ["".join(encoded[i:i + 80]) for i in range(0, len(encoded), 80)]
-    entries = [(400, 360, rf"\fs76\fnFuri Tight Ascent\1c{WHITE}", "<ABC|ABC>")]
+    entries = [(400, 360, rf"\fs76\fnNoto Sans Myanmar\1c{WHITE}", "<ဆာတို့|ဆာတို့>")]
     missing = write("private-font-missing", entries)
     attached = write("private-font-attached", entries)
     with attached[0].open("a", encoding="utf-8") as script:

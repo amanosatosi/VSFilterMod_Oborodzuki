@@ -41,6 +41,7 @@ jobs:
           pwsh -File .github\kfx\build-harness.ps1 -Revision "%GITHUB_SHA%" || exit /b 1
           move bundle hosts || exit /b 1
           copy benchmark-source\test\fonts\furi-tight-ascent.ttf hosts\furi-tight-ascent.ttf || exit /b 1
+          copy benchmark-source\test\fonts\NotoSansMyanmar-Regular.ttf hosts\NotoSansMyanmar-Regular.ttf || exit /b 1
           cl /nologo /std:c++17 /O2 /EHsc /MT /Ibenchmark-source\libass .github\ci\render-bench.cpp /Fe:hosts\render-bench.exe || exit /b 1
           cl /nologo /std:c++17 /O2 /EHsc /MT .github\parallel\concurrent.cpp /Fe:hosts\concurrent.exe user32.lib || exit /b 1
           if not "%GITHUB_REF_NAME%"=="feature/parallel-event-rendering" (
