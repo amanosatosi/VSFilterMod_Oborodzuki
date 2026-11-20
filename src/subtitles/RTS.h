@@ -372,6 +372,7 @@ public:
     int m_logicalLine = 0, m_textAnchor = -1, m_textWidth = 0;
     unsigned m_positionedAlphaScopes = 0;
     void CreateEventBox(int borderStyle, int time, bool scaledBorder);
+    void AddBoxRegion(CWord& word, double left, double top, double right, double bottom, bool scaledBorder);
 #endif
     int m_scrAlignment;
     int m_wrapStyle;

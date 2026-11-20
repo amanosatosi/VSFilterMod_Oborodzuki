@@ -324,6 +324,14 @@ struct Projection
 
 class Sampler
 {
+    static Rect Position(const Paint& paint, Rect occupied, double offsetY)
+    {
+        if (!paint.positioned) return occupied;
+        auto rect = Normalize(paint.rect);
+        rect.top += offsetY;
+        rect.bottom += offsetY;
+        return rect;
+    }
     struct Endpoint
     {
         const Paint* paint = nullptr;
@@ -331,8 +339,8 @@ class Sampler
         Rect bounds{};
 
         Endpoint() = default;
-        Endpoint(const Paint* source, Rect occupied) : paint(source),
-            bounds(source->positioned ? Normalize(source->rect) : occupied)
+        Endpoint(const Paint* source, Rect occupied, double offsetY) : paint(source),
+            bounds(Position(*source, occupied, offsetY))
         {
             if (source->kind == Paint::Kind::Field)
                 axis = Projection(bounds, source->angle);
@@ -378,22 +386,22 @@ class Sampler
     bool corners = false;
 
 public:
-    void Prepare(const Paint* paint, Rect bounds, double sx, double sy, bool inverseAlpha)
+    void Prepare(const Paint* paint, Rect bounds, double sx, double sy, bool inverseAlpha, double offsetY = 0)
     {
         PROFILE_RENDER_STAGE(PaintProjection);
         alpha = inverseAlpha;
         for (; paint->kind == Paint::Kind::Slide; paint = paint->from.get())
         {
-            const Projection axis(paint->positioned ? Normalize(paint->rect) : bounds, paint->angle);
+            const Projection axis(Position(*paint, bounds, offsetY), paint->angle);
             const double scale = sx == sy ? sx : (sx > 0 && sy > 0 ?
                 1 / std::hypot(axis.dx / sx, axis.dy / sy) : 0);
             const double limit = (std::numeric_limits<double>::max)() / 2;
             const double width = (std::min)(limit, paint->width * scale);
             corners |= paint->to->kind == Paint::Kind::Corners;
-            wipes.push_back({Endpoint(paint->to.get(), bounds), axis, width,
+            wipes.push_back({Endpoint(paint->to.get(), bounds, offsetY), axis, width,
                 paint->progress * axis.span + paint->progress * width});
         }
-        start = Endpoint(paint, bounds);
+        start = Endpoint(paint, bounds, offsetY);
         corners |= paint->kind == Paint::Kind::Corners;
     }
 

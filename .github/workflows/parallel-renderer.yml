@@ -28,7 +28,9 @@ jobs:
           repository: amanosatosi/libassmod
           ref: 60e06ef0d4535c5403f446fd46b996df4d0d2560
           path: benchmark-source
-          sparse-checkout: libass
+          sparse-checkout: |
+            libass
+            test/fonts
       - name: Compile renderer and existing hosts
         shell: cmd
         run: |
@@ -38,6 +40,7 @@ jobs:
           set "MANGETSU_REVISION=60e06ef0d4535c5403f446fd46b996df4d0d2560"
           pwsh -File .github\kfx\build-harness.ps1 -Revision "%GITHUB_SHA%" || exit /b 1
           move bundle hosts || exit /b 1
+          copy benchmark-source\test\fonts\furi-tight-ascent.ttf hosts\furi-tight-ascent.ttf || exit /b 1
           cl /nologo /std:c++17 /O2 /EHsc /MT /Ibenchmark-source\libass .github\ci\render-bench.cpp /Fe:hosts\render-bench.exe || exit /b 1
           cl /nologo /std:c++17 /O2 /EHsc /MT .github\parallel\concurrent.cpp /Fe:hosts\concurrent.exe user32.lib || exit /b 1
           if not "%GITHUB_REF_NAME%"=="feature/parallel-event-rendering" (

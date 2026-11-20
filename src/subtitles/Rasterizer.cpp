@@ -1424,12 +1424,12 @@ public:
                 CRect rect = draw.paintBounds;
                 if (draw.paintSegments)
                 {
-                    const auto found = draw.paintSegments->find(source->segment);
+                    const auto found = draw.paintSegments->find((uint64_t(draw.gradient.paintGroup) << 32) | source->segment);
                     if (found != draw.paintSegments->end()) rect = found->second;
                 }
                 samplers[slice][component].Prepare(source.get(),
                     {double(rect.left), double(rect.top), double(rect.right), double(rect.bottom)},
-                    draw.paintScaleX, draw.paintScaleY, component != 0);
+                    draw.paintScaleX, draw.paintScaleY, component != 0, draw.gradient.paintOffsetY / 8.);
             }
     }
 
@@ -1525,7 +1525,8 @@ struct PositionedDraw
             int((std::max)(int64_t(0), (std::min)(int64_t(source.bounds.Width()),
                 int64_t(int32_t(source.info.sw[3])) + 1 - source.info.xo))))
     {
-        opacity.Prepare(draw.gradient.positionedOpacity.get(), {}, draw.paintScaleX, draw.paintScaleY, true);
+        opacity.Prepare(draw.gradient.positionedOpacity.get(), {}, draw.paintScaleX, draw.paintScaleY, true,
+            draw.gradient.paintOffsetY / 8.);
     }
 
     void Sample(int y, int left, float* above)
@@ -1578,7 +1579,7 @@ void BlendPositionedOverlays(const OverlayDraw* const* draws, size_t count, int 
     PROFILE_RENDER_STAGE(Composite);
     int left = INT_MAX, right = INT_MIN;
     int firstRow = bottom, lastRow = top;
-    std::vector<const KfxPaint::Paint*> scopes;
+    std::vector<std::pair<const KfxPaint::Paint*, unsigned>> scopes;
     std::vector<std::unique_ptr<PositionedDraw>> positioned(count);
     for (size_t i = 0; i < count; ++i)
     {
@@ -1587,9 +1588,10 @@ void BlendPositionedOverlays(const OverlayDraw* const* draws, size_t count, int 
         lastRow = (std::max)(lastRow, int(draw.bounds.bottom));
         const auto* mask = draw.gradient.positionedOpacity.get();
         if (!mask) continue;
-        const auto old = std::find(scopes.begin(), scopes.end(), mask);
+        const auto key = std::make_pair(mask, draw.gradient.paintGroup);
+        const auto old = std::find(scopes.begin(), scopes.end(), key);
         const size_t scope = old - scopes.begin();
-        if (old == scopes.end()) scopes.push_back(mask);
+        if (old == scopes.end()) scopes.push_back(key);
         positioned[i] = std::make_unique<PositionedDraw>(draw, scope);
         left = (std::min)(left, int(draw.bounds.left));
         right = (std::max)(right, int(draw.bounds.right));
@@ -1736,7 +1738,8 @@ CRect Rasterizer::Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int x
                     if (parts[part] && !parts[part]->positioned)
                     {
                         auto& segments = activeOverlayDraws->paintSegments;
-                        const auto inserted = segments.emplace(parts[part]->segment, paintBounds);
+                        const auto key = (uint64_t(mod_grad.paintGroup) << 32) | parts[part]->segment;
+                        const auto inserted = segments.emplace(key, paintBounds);
                         if (!inserted.second) inserted.first->second |= paintBounds;
                     }
         }

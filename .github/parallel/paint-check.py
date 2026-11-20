@@ -96,6 +96,18 @@ if ROUND3:
                             rf"\polc{WHITE}\pols7\t(0,2200,\pols13\polsp28)", plain) for x, y in positions]),
     ]
     paint_scenes += [write(name, entries) for name, entries in paired]
+if ROUND4:
+    layout_positions = [(45 + i % 3 * 620, 45 + i // 3 * 255) for i in range(9)]
+    paint_scenes += [
+        write("scroll-stress", [(x, y,
+            r"\fs33\bs4\boxp3\4a&H00&\scrollsl3\scrollt250\scroll(ue,0,+1,250|300,+1,500,-1,750,+1)",
+            r"<漢字|かんじ>\NMixed မြန်မာ\N{s39}Bigger\NSame row {scroll0}Fixed")
+            for x, y in layout_positions]),
+        write("chat-stress", [(x, y, r"\chatmode2\msgm(Miku)\msgtitle(Contact)\fs21"
+            r"\msgstartcount(1)\msgtime(250,500,750)\readtime250\bubbs2",
+            r"|Miku:\NHello||Reply||Another message||友達:\N<今日|きょう> မြန်မာ|")
+            for x, y in layout_positions]),
+    ]
 
 
 def benchmark(dll, scenario, workers, mode):
@@ -824,6 +836,15 @@ if ROUND4:
     expected = benchmark(CANDIDATE, inline, 1, "regression")["hashes"]
     for workers in (1, 2, 4, 6, 8):
         assert benchmark(CANDIDATE, inherited, workers, "regression")["hashes"] == expected
+    late = []
+    for scene in (inherited, inline):
+        path = scene[0].with_stem(scene[0].stem + "-filtered-at-nine-hours")
+        path.write_text(scene[0].read_text(encoding="utf-8-sig")
+            .replace("0:00:01.00,0:00:05.00", "9:00:00.00,9:00:03.00"), encoding="utf-8-sig")
+        late.append(json.loads(subprocess.check_output(
+            [str(BENCH), "csri", str(CANDIDATE), str(path), "real", "32400000", "32403000"],
+            env=dict(os.environ, OBORODZUKI_BENCH_ITERATION="1"), text=True, timeout=180))["hashes"])
+    assert late[0] == late[1], "Late time-filtered CSRI snapshot lost metadata"
 
     for mode, body in (
         (1, r"{\msg(Miku,right)}Hello{\msg(Yurf,left)}မြန်မာ"),
@@ -846,6 +867,23 @@ if ROUND4:
         expected = benchmark(CANDIDATE, chat, 1, "regression")["hashes"]
         for workers in (2, 4, 6, 8):
             assert benchmark(CANDIDATE, chat, workers, "regression")["hashes"] == expected
+
+    font = Path("hosts/furi-tight-ascent.ttf").read_bytes()
+    encoded = []
+    for i in range(0, len(font), 3):
+        block = font[i:i + 3]
+        number = int.from_bytes(block.ljust(3, b"\0"), "big")
+        encoded.extend(chr(((number >> shift) & 63) + 33) for shift in (18, 12, 6, 0)[:len(block) + 1])
+    lines = ["".join(encoded[i:i + 80]) for i in range(0, len(encoded), 80)]
+    entries = [(400, 360, rf"\fs76\fnFuri Tight Ascent\1c{WHITE}", "<ABC|ABC>")]
+    missing = write("private-font-missing", entries)
+    attached = write("private-font-attached", entries)
+    with attached[0].open("a", encoding="utf-8") as script:
+        script.write("\n[Fonts]\nfontname: furi-tight-ascent.ttf\n" + "\n".join(lines) + "\n\n")
+    a = benchmark(CANDIDATE, attached, 1, "regression")["hashes"]
+    b = benchmark(CANDIDATE, missing, 1, "regression")["hashes"]
+    assert a != b, "The embedded private font did not affect DirectWrite annotations"
+    assert benchmark(CANDIDATE, attached, 4, "regression")["hashes"] == a
 
 # Check old corner math against the validated VSFilterMod path rather than
 # requiring its different legacy bitmap geometry to agree with libass.

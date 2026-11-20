@@ -1290,7 +1290,7 @@ double GetFloat(CStringW& buff, char sep = ',') //throw(...)
     return((double)ret);
 }
 
-static bool LoadFont(CString& font)
+static bool LoadFont(CString& font, std::vector<BYTE>* attachment = nullptr)
 {
     int len = font.GetLength();
 
@@ -1321,6 +1321,8 @@ static bool LoadFont(CString& font)
         pData[datalen++] = ((pData[(len&~3)+1] & 15) << 4) | ((pData[(len&~3)+2] >> 2) & 15);
     }
 
+    if (attachment && datalen > 0 && datalen <= 8 * 1024 * 1024)
+        attachment->assign(static_cast<const BYTE*>(pData), static_cast<const BYTE*>(pData) + datalen);
     HANDLE hFont = INVALID_HANDLE_VALUE;
 
     if(HMODULE hModule = LoadLibrary(_T("GDI32.DLL")))
@@ -1367,9 +1369,19 @@ static bool LoadFont(CString& font)
     return(true);
 }
 
-static bool LoadUUEFont(CTextFile* file)
+static bool LoadUUEFont(CTextFile* file, std::vector<std::vector<BYTE>>* attachments = nullptr)
 {
     CString s, font;
+    const auto install = [&] {
+        std::vector<BYTE> bytes;
+        LoadFont(font, attachments && attachments->size() < 16 ? &bytes : nullptr);
+        if (!bytes.empty())
+        {
+            size_t total = bytes.size();
+            for (const auto& prior : *attachments) total += prior.size();
+            if (total <= 32 * 1024 * 1024) attachments->push_back(std::move(bytes));
+        }
+    };
     while(file->ReadString(s))
     {
         s.Trim();
@@ -1385,7 +1397,7 @@ static bool LoadUUEFont(CTextFile* file)
         }
         if(s.Find(_T("fontname:")) == 0)
         {
-            LoadFont(font);
+            install();
             font.Empty();
             continue;
         }
@@ -1394,7 +1406,7 @@ static bool LoadUUEFont(CTextFile* file)
     }
 
     if(!font.IsEmpty())
-        LoadFont(font);
+        install();
 
     return(true);
 }
@@ -2015,7 +2027,11 @@ static bool OpenSubStationAlpha(CTextFile* file, CSimpleTextSubtitle& ret, int C
         }
         else if(entry == L"fontname")
         {
-            LoadUUEFont(file);
+            LoadUUEFont(file
+#ifdef _VSMOD
+                , &ret.AttachedFontsForImport()
+#endif
+            );
         }
 #ifdef _VSMOD // load png graphic from text resources
         else if(entry == L"filename")
@@ -2396,6 +2412,7 @@ void CSimpleTextSubtitle::Copy(CSimpleTextSubtitle& sts)
     Empty();
 #ifdef _VSMOD
     m_metadataCarriers = sts.m_metadataCarriers;
+    m_attachedFonts = sts.m_attachedFonts;
 #endif
 
 #ifdef _VSMOD
@@ -2496,6 +2513,7 @@ void CSimpleTextSubtitle::Empty()
 {
 #ifdef _VSMOD
     m_metadataCarriers.clear();
+    m_attachedFonts.clear();
 #endif
     m_dstScreenSize = CSize(0, 0);
     m_styles.Free();
@@ -4200,6 +4218,8 @@ void MOD_GRADIENT::clear()
     paint.reset();
     positionedOpacity.reset();
     legacyParts = 0;
+    paintOffsetY = 0;
+    paintGroup = 0;
 }
 
 #include <math.h>

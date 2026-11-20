@@ -28,7 +28,7 @@ struct Scene
     int mode = 0, initial = 0, slide = 250, receipt = 0, readDelay = 0;
     int width = 0, textWidth = 0, viewport = 0, headerHeight = 0, pad = 0;
     int headerColor = -1, headerBackground = -1;
-    bool hasTimes = false, gotTitle = false, showNames = true;
+    bool hasTimes = false, gotTitle = false, showNames = true, receiptConfigured = false;
     CStringW title, main;
     Appearance skin;
     std::vector<int> times, reads;
@@ -61,9 +61,18 @@ struct Scene
         }
         const int shift = (std::max)(0, bottom - headerHeight - viewport);
         std::vector<NativeScroll::Frame> result;
-        for (const auto& message : messages)
-            result.push_back({-shift, (y + headerHeight + 4) >> 3,
-                (y + headerHeight + viewport + 4) >> 3, true, message.start > time});
+        for (size_t i = 0; i < messages.size(); ++i)
+        {
+            const auto& message = messages[i];
+            const bool hidden = message.start > time;
+            const bool enters = !hidden && hasTimes && int(i) >= initial && slide > 0;
+            const int rise = enters ? int((1 - (std::min)(1., double(time - message.start) / slide)) *
+                (message.bottom - message.top)) : 0;
+            const int viewBottom = enters && rise ? (std::min)(headerHeight + viewport, message.bottom - shift) :
+                headerHeight + viewport;
+            result.push_back({rise-shift, (y + headerHeight + 4) >> 3,
+                (y + viewBottom + 4) >> 3, true, hidden});
+        }
         return result;
     }
 };

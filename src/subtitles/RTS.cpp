@@ -975,6 +975,8 @@ CRect CWord::DrawNativeOutline(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, 
         MOD_GRADIENT extra;
         extra.paint = r->paint;
         extra.positionedOpacity = m_style.mod_grad.positionedOpacity;
+        extra.paintOffsetY = m_style.mod_grad.paintOffsetY;
+        extra.paintGroup = m_style.mod_grad.paintGroup;
         extra.fadalpha = fade;
         MOD_GRADIENT& paint = layer && layer->number ? extra : m_style.mod_grad;
         const auto draw = [&](CRect region, DWORD color, MOD_GRADIENT& shading) {
@@ -2739,6 +2741,8 @@ CRect CLine::PaintShadow(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPo
             w->m_style.mod_grad.subpixx = x & 7;
             w->m_style.mod_grad.subpixy = y & 7;
             w->m_style.mod_grad.fadalpha = alpha;
+            w->m_style.mod_grad.paintOffsetY = scrollY;
+            w->m_style.mod_grad.paintGroup = w->m_scrollGroup;
 #endif
 #if defined (_VSMOD) && defined(_LUA)
             w->Paint(CPoint(x, y), CPoint(org.x, org.y + scrollY), 4);
@@ -2832,6 +2836,8 @@ CRect CLine::PaintOutline(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CP
             w->m_style.mod_grad.subpixx = x & 7;
             w->m_style.mod_grad.subpixy = y & 7;
             w->m_style.mod_grad.fadalpha = alpha;
+            w->m_style.mod_grad.paintOffsetY = scrollY;
+            w->m_style.mod_grad.paintGroup = w->m_scrollGroup;
 #endif
 
 #if defined (_VSMOD) && defined(_LUA)
@@ -2982,6 +2988,8 @@ CRect CLine::PaintBody(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoin
         w->m_style.mod_grad.subpixx = x & 7;
         w->m_style.mod_grad.subpixy = y & 7;
         w->m_style.mod_grad.fadalpha = alpha;
+        w->m_style.mod_grad.paintOffsetY = scrollY;
+        w->m_style.mod_grad.paintGroup = w->m_scrollGroup;
 #endif
 
 #if defined (_VSMOD) && defined(_LUA)
@@ -3593,6 +3601,42 @@ void CSubtitle::CreateEventBox(int borderStyle, int time, bool scaledBorder)
     if ((m_boxMode < 0 ? borderStyle != 2 : m_boxMode == 0) || IsEmpty())
         return;
 
+    if (!m_scrollContexts.empty())
+    {
+        struct Section { CWord* word; double left, top, right, bottom; };
+        std::vector<Section> sections;
+        int y = 0;
+        for (auto lines = GetHeadPosition(); lines;)
+        {
+            auto* line = GetNext(lines);
+            int x = LineLeft(*line, 0);
+            const int height = line->m_ascent + line->m_descent;
+            for (auto words = line->GetHeadPosition(); words;)
+            {
+                auto* word = line->GetNext(words);
+                const int next = x + word->m_width;
+                if (!word->m_fWhiteSpaceChar && !word->m_fLineBreak && !word->m_isRubyReading &&
+                    (word->m_ktype != 3 || time >= word->m_kstart) && next > x)
+                {
+                    if (sections.empty() || sections.back().word->m_scrollGroup != word->m_scrollGroup)
+                        sections.push_back({word, double(x), double(y), double(next), double(y+height)});
+                    else
+                    {
+                        auto& section = sections.back();
+                        section.left = (std::min)(section.left, double(x));
+                        section.right = (std::max)(section.right, double(next));
+                        section.bottom = y + height;
+                    }
+                }
+                x = next;
+            }
+            y += height;
+        }
+        for (auto i = sections.rbegin(); i != sections.rend(); ++i)
+            AddBoxRegion(*i->word, i->left, i->top, i->right, i->bottom, scaledBorder);
+        return;
+    }
+
     CWord* canonical = nullptr;
     double left = 0, right = 0;
     POSITION lines = GetHeadPosition();
@@ -3614,7 +3658,12 @@ void CSubtitle::CreateEventBox(int borderStyle, int time, bool scaledBorder)
     if (!canonical || right <= left || m_rect.Height() <= 0)
         return;
 
-    auto& style = canonical->m_style;
+    AddBoxRegion(*canonical, left, 0, right, m_rect.Height(), scaledBorder);
+}
+
+void CSubtitle::AddBoxRegion(CWord& word, double left, double top, double right, double bottom, bool scaledBorder)
+{
+    auto& style = word.m_style;
     const double soft = style.softScale > 0 ? style.softScale : 100;
     const double sx = std::abs(style.fontScaleX) / soft * (scaledBorder ? m_scalex : 1) * 8;
     const double sy = std::abs(style.fontScaleY) / soft * (scaledBorder ? m_scaley : 1) * 8;
@@ -3624,14 +3673,15 @@ void CSubtitle::CreateEventBox(int borderStyle, int time, bool scaledBorder)
     const double edgeX = (std::max)(0., style.shadowDepthX) + style.outlineWidthX;
     const double edgeTop = (std::max)(0., style.shadowDepthY) + m_topborder;
     const double edgeBottom = (std::max)(0., style.shadowDepthY) + m_bottomborder;
-    const KfxPaint::Rect rect{left - m_annotationLeft - edgeX - bounded(box.padding[0] * sx), -edgeTop - bounded(box.padding[2] * sy),
-        right + m_annotationRight + edgeX + bounded(box.padding[1] * sx), m_rect.Height() + edgeBottom + bounded(box.padding[3] * sy)};
+    const KfxPaint::Rect rect{left - m_annotationLeft - edgeX - bounded(box.padding[0] * sx), top - edgeTop - bounded(box.padding[2] * sy),
+        right + m_annotationRight + edgeX + bounded(box.padding[1] * sx), bottom + edgeBottom + bounded(box.padding[3] * sy)};
     const double radiusX = (std::min)(bounded(box.radius * sx), (rect.right - rect.left) / 2);
     const double radiusY = (std::min)(bounded(box.radius * sy), (rect.bottom - rect.top) / 2);
     const auto expand = [&](double x, double y) {
         return KfxPaint::Rect{rect.left-x, rect.top-y, rect.right+x, rect.bottom+y};
     };
     auto fill = std::make_unique<EventBoxPath>(style, m_scalex, m_scaley, rect);
+    fill->m_scrollGroup = word.m_scrollGroup;
     fill->AddContour(rect, radiusX, radiusY, false);
     m_eventBox.push_back(std::move(fill));
     double x = 0, y = 0;
@@ -3643,6 +3693,7 @@ void CSubtitle::CreateEventBox(int borderStyle, int time, bool scaledBorder)
             const double outerY = bounded(y + layer.x * sy);
             if (outerX == x && outerY == y) continue;
             auto ring = std::make_unique<EventBoxPath>(style, m_scalex, m_scaley, rect);
+            ring->m_scrollGroup = word.m_scrollGroup;
             ring->AddContour(expand(outerX, outerY), radiusX + outerX, radiusY + outerY, false);
             ring->AddContour(expand(x, y), radiusX + x, radiusY + y, true);
             auto& paint = ring->m_style;
@@ -5110,6 +5161,7 @@ void CRenderedTextSubtitle::OnChanged()
     if (m_textGeometry)
         m_textGeometry->Clear();
 #ifdef _VSMOD
+    m_shaper.reset();
     if (m_overrideTags)
     {
         m_overrideTags->layout.clear();
@@ -5303,7 +5355,7 @@ void CRenderedTextSubtitle::ParseString(CSubtitle* sub, CStringW str, STSStyle& 
 #ifdef _VSMOD
 bool CRenderedTextSubtitle::ParseShapedString(CSubtitle* sub, const CStringW& text, STSStyle& style, bool vertical)
 {
-    if (!m_shaper) m_shaper = std::make_unique<ShapedText::Context>();
+    if (!m_shaper) m_shaper = std::make_unique<ShapedText::Context>(m_attachedFonts);
     CStringW str = text;
     str.Replace(L"\\N", L"\n");
     str.Replace(L"\\n", (sub->m_wrapStyle < 2 || sub->m_wrapStyle == 3) ? L" " : L"\n");
@@ -5378,7 +5430,7 @@ bool CRenderedTextSubtitle::ParseShapedString(CSubtitle* sub, const CStringW& te
 
 bool CRenderedTextSubtitle::ParseFurigana(CSubtitle* sub, Furigana::Fields& fields, STSStyle& style)
 {
-    if (!m_shaper) m_shaper = std::make_unique<ShapedText::Context>();
+    if (!m_shaper) m_shaper = std::make_unique<ShapedText::Context>(m_attachedFonts);
     if (!m_overrideTags) m_overrideTags = std::make_unique<OverrideTagCache>();
     CSubtitle::RubyGroup group;
     group.options = sub->m_rubyOptions;
@@ -6736,8 +6788,13 @@ bool ApplyChatTag(NativeChat::Scene& chat, const OverrideTag& tag, STSStyle& sty
             if (cmd == L"msgshowname" && value <= 1) chat.showNames = value != 0;
             if (cmd == L"msgstartcount") chat.initial = value;
             if (cmd == L"msganim") chat.slide = value;
-            if (cmd == L"readmark" && value <= 2) chat.receipt = value;
-            if (cmd == L"readtime") { chat.readDelay = value; if (!chat.receipt) chat.receipt = 2; }
+            if (cmd == L"readmark" && value <= 2) { chat.receipt = value; chat.receiptConfigured = true; }
+            if (cmd == L"readtime")
+            {
+                chat.readDelay = value;
+                if (!chat.receiptConfigured) chat.receipt = 2;
+                chat.receiptConfigured = true;
+            }
         }
         return true;
     }
@@ -6823,6 +6880,7 @@ bool ApplyChatTag(NativeChat::Scene& chat, const OverrideTag& tag, STSStyle& sty
     {
         chat.skin = {};
         chat.receipt = chat.readDelay = 0;
+        chat.receiptConfigured = false;
     }
     return false;
 }
@@ -10867,6 +10925,8 @@ try
                 const DWORD opacity = MulDiv(255 - style.alpha[3], 255 - alpha, 255);
                 const DWORD colors[4] = {DWORD(revcolor(style.colors[3])) | (opacity << 24), DWORD(-1), 0, 0};
                 style.mod_grad.fadalpha = alpha;
+                style.mod_grad.paintOffsetY = dy;
+                style.mod_grad.paintGroup = box.m_scrollGroup;
                 style.mod_grad.subpixx = origin.x & 7;
                 style.mod_grad.subpixy = origin.y & 7;
                 const auto drawBox = [&](CRect& clip) {

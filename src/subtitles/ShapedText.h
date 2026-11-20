@@ -33,7 +33,7 @@ class Context
     struct Impl;
     std::unique_ptr<Impl> native;
 public:
-    Context();
+    explicit Context(const std::vector<std::vector<BYTE>>& attachments);
     ~Context();
     std::shared_ptr<const Run> Shape(const wchar_t* text, unsigned length, const wchar_t* family,
         float em, int weight, bool italic, bool verticalVariants);

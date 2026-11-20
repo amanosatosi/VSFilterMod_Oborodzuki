@@ -1,7 +1,7 @@
 #include "stdafx.h"
 #include "ShapedText.h"
 #include "RenderProfile.h"
-#include <dwrite_1.h>
+#include <dwrite_3.h>
 #include <d2d1.h>
 #include <algorithm>
 #include <cmath>
@@ -15,6 +15,8 @@ struct Context::Impl
 {
     HMODULE library = nullptr;
     CComPtr<IDWriteFactory> factory;
+    CComPtr<IDWriteInMemoryFontFileLoader> attachmentLoader;
+    CComPtr<IDWriteFontCollection1> attachmentCollection;
     struct Entry
     {
         std::wstring text, family;
@@ -27,7 +29,7 @@ struct Context::Impl
     std::list<Entry> cache;
     size_t cachedPoints = 0;
 
-    Impl()
+    explicit Impl(const std::vector<std::vector<BYTE>>& attachments)
     {
         WCHAR system[MAX_PATH];
         const UINT length = GetSystemDirectoryW(system, MAX_PATH);
@@ -42,10 +44,31 @@ struct Context::Impl
             if (SUCCEEDED(create(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), &object)))
                 factory.Attach(static_cast<IDWriteFactory*>(object));
         }
+        if (factory && !attachments.empty())
+        {
+            CComPtr<IDWriteFactory5> modern;
+            CComPtr<IDWriteFontSetBuilder1> builder;
+            if (FAILED(factory.QueryInterface(&modern)) || FAILED(modern->CreateFontSetBuilder(&builder)) ||
+                FAILED(modern->CreateInMemoryFontFileLoader(&attachmentLoader))) return;
+            if (FAILED(factory->RegisterFontFileLoader(attachmentLoader))) { attachmentLoader.Release(); return; }
+            for (const auto& bytes : attachments)
+            {
+                CComPtr<IDWriteFontFile> file;
+                if (SUCCEEDED(attachmentLoader->CreateInMemoryFontFileReference(factory, bytes.data(),
+                        UINT32(bytes.size()), nullptr, &file)))
+                    builder->AddFontFile(file);
+            }
+            CComPtr<IDWriteFontSet> set;
+            if (SUCCEEDED(builder->CreateFontSet(&set)))
+                modern->CreateFontCollectionFromFontSet(set, &attachmentCollection);
+        }
     }
 
     ~Impl()
     {
+        attachmentCollection.Release();
+        if (attachmentLoader) factory->UnregisterFontFileLoader(attachmentLoader);
+        attachmentLoader.Release();
         factory.Release();
         if (library) FreeLibrary(library);
     }
@@ -231,7 +254,7 @@ public:
 };
 }
 
-Context::Context() : native(std::make_unique<Impl>()) {}
+Context::Context(const std::vector<std::vector<BYTE>>& attachments) : native(std::make_unique<Impl>(attachments)) {}
 Context::~Context() = default;
 
 std::shared_ptr<const Run> Context::Shape(const wchar_t* text, unsigned length, const wchar_t* family,
@@ -252,7 +275,15 @@ std::shared_ptr<const Run> Context::Shape(const wchar_t* text, unsigned length, 
                 return hit->run;
             }
     CComPtr<IDWriteTextFormat> format;
-    if (FAILED(native->factory->CreateTextFormat(face, nullptr, DWRITE_FONT_WEIGHT((std::max)(1, (std::min)(999, weight))),
+    IDWriteFontCollection* fonts = nullptr;
+    if (native->attachmentCollection)
+    {
+        UINT32 index = 0;
+        BOOL exists = FALSE;
+        if (SUCCEEDED(native->attachmentCollection->FindFamilyName(face, &index, &exists)) && exists)
+            fonts = native->attachmentCollection;
+    }
+    if (FAILED(native->factory->CreateTextFormat(face, fonts, DWRITE_FONT_WEIGHT((std::max)(1, (std::min)(999, weight))),
             italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, em, L"", &format)))
         return {};
     if (FAILED(format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP))) return {};

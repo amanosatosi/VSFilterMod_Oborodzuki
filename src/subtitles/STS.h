@@ -172,6 +172,8 @@ public:
     std::shared_ptr<const KfxPaint::Sources> paint;
     KfxPaint::Source positionedOpacity;
     unsigned legacyParts = 0;
+    int paintOffsetY = 0;
+    unsigned paintGroup = 0;
 
     MOD_GRADIENT();
     bool operator == (MOD_GRADIENT& mg);
@@ -355,10 +357,14 @@ protected:
     CAtlArray<STSSegment> m_segments;
 #ifdef _VSMOD
     std::vector<STSEntry> m_metadataCarriers;
+    std::vector<std::vector<BYTE>> m_attachedFonts;
 #endif
     virtual void OnChanged() {}
 
 public:
+#ifdef _VSMOD
+    std::vector<std::vector<BYTE>>& AttachedFontsForImport() { return m_attachedFonts; }
+#endif
     CString m_name;
     LCID m_lcid;
     exttype m_exttype;

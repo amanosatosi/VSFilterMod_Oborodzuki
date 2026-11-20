@@ -87,7 +87,7 @@ struct OverlayDraw
     int colorType;
     MOD_GRADIENT gradient;
     MOD_MOVEVC maskPosition;
-    const std::map<unsigned, CRect>* paintSegments = nullptr;
+    const std::map<uint64_t, CRect>* paintSegments = nullptr;
     CRect paintBounds{0, 0, 0, 0};
     KfxPaint::Fade paintFade;
     KfxPaint::PaintBoundary boundary;
@@ -107,7 +107,7 @@ struct OverlayDrawList
     // A word can replace its coverage mask between the shadow and outline.
     // Keep earlier phases alive until all bands have read them.
     std::vector<std::unique_ptr<BYTE[]>> retiredMasks;
-    std::map<unsigned, CRect> paintSegments;
+    std::map<uint64_t, CRect> paintSegments;
 #ifdef _VSMOD
     bool hasPositionedAlpha = false;
 #endif
