@@ -112,8 +112,11 @@ preserves renderer startup on hosts where it is unavailable.
 - Outline bounds are measured before final authored transforms. Region
   boundaries for timed base annotations use axis-aligned clips. Strong
   3D or projective transforms can move those boundaries relative to the ink.
-  Curved `\kf` follows the local path tangent and authored Z rotation; its
+  Curved `\kf` follows the local path tangent and authored Z rotation. Its
   split still uses a screen-space line under 3D or perspective.
+- Glyph-mode cycling advances for every output glyph in an annotation base.
+  A multi-glyph base cluster currently paints with its first glyph's color.
+  Ordinary glyph-mode text paints each output glyph separately.
 - Perspective falls back with scrolling, banners, outline randomization or
   Lua outline hooks. Legacy `\fn@FontName` layout remains available with
   native vertical mode disabled.
@@ -136,3 +139,30 @@ are additional correctness checks on the four-logical-processor runner.
 [Focused Round 3 checks](https://github.com/amanosatosi/VSFilterMod_Oborodzuki/actions/runs/44354773008) ·
 [Round 3 acceptance and profiles](https://github.com/amanosatosi/VSFilterMod_Oborodzuki/actions/runs/44356341316) ·
 [Validated Round 2 checkpoint](https://github.com/amanosatosi/VSFilterMod_Oborodzuki/actions/runs/44317693536)
+
+### Instrumented feature workloads
+
+The following 120-frame workloads contain 12 simultaneous animated text
+events. The control uses ordinary text with the same motion, stroke, shadows
+and script. The native layout mix adds annotations, vertical text, curved
+text and perspective on separate events. Pattern paint adds per-glyph
+cycling and animated dots. These are instrumented measurements.
+
+| Workload | Median ms at 1 / 2 / 4 workers | p95 ms at 1 / 2 / 4 workers | 4-worker CPU s | 4-worker peak MiB |
+| --- | ---: | ---: | ---: | ---: |
+| Layout control | 10.124 / 5.527 / 4.426 | 10.432 / 5.723 / 4.714 | 1.875 | 30.0 |
+| Native layout mix | 16.966 / 9.293 / 7.769 | 17.629 / 10.664 / 8.306 | 3.328 | 32.9 |
+| Pattern paint | 20.697 / 11.232 / 9.912 | 21.816 / 12.662 / 10.352 | 4.500 | 34.3 |
+
+The warmed native layout mix reused all 2,160 shaping requests per pass.
+At one worker, the profiler attributed 1.398 s to outline widening,
+0.206 s to scan conversion, 0.111 s to compositing, 0.064 s to projection
+and 0.013 s to native layout. Pattern paint widened 21,600 glyph masks
+and spent 1.433 s widening outlines and 0.576 s compositing them. The
+control widened 1,440 masks and spent 0.859 s widening and 0.052 s
+compositing. These are exclusive stage totals.
+
+The separate 600-frame ordinary KFX profile made zero native shape,
+layout or projection calls at 1, 2 and 4 workers. Each setting recorded
+23,280 hits in the established text-measure cache.
+[Profile artifact](https://github.com/amanosatosi/VSFilterMod_Oborodzuki/actions/runs/44356341316/artifacts/14452717436)
