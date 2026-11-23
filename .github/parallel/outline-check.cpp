@@ -44,7 +44,15 @@ int main()
         std::vector<std::pair<unsigned, unsigned>> spans;
         for (int s = 0; s < h; ++s) {
             rows.push_back({spans.size()});
-            for (int x = rng() % 8; x < 110;) {
+            if (trial % 2) {
+                // Slowly changing glyph stems, splits and holes. These make
+                // long strips and exercise the vector extrema and their tails.
+                for (int stem = 0; stem < 5; ++stem) {
+                    if ((s + stem * 3) % 19 == 0) continue;
+                    unsigned x = 0x40000000u + stem * 23 + (s / 4 + stem) % 6;
+                    spans.emplace_back(x, x + 5 + (s / 3 + stem) % 9);
+                }
+            } else for (int x = rng() % 8; x < 110;) {
                 int end = x + 1 + rng() % 19;
                 if (rng() % 6)
                     spans.emplace_back(0x40000000u + x, 0x40000000u + end);

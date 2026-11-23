@@ -3,6 +3,60 @@
 #include "OverlayMix.h"
 #include <math.h>
 
+#ifdef _VSMOD
+static thread_local GradientCache* activeGradientCache = nullptr;
+
+GradientCacheScope::GradientCacheScope(GradientCache& cache) : previous(activeGradientCache)
+{
+    activeGradientCache = &cache;
+}
+GradientCacheScope::~GradientCacheScope()
+{
+    activeGradientCache = previous;
+}
+
+std::shared_ptr<std::vector<DWORD>> GradientCache::Lookup(const MOD_GRADIENT& gradient, int channel)
+{
+    const int w = gradient.width, h = gradient.height;
+    if (gradient.mode[channel] != 1 || w <= 0 || h <= 0 || w > 8192 / h)
+        return {};
+    Key key{w, h};
+    std::copy_n(gradient.color[channel], 4, key.colors);
+    memcpy(&key.alphas, gradient.alpha[channel], sizeof(key.alphas));
+    key.fade = gradient.fadalpha;
+    uint64_t hash = unsigned(w) * 16777619u + unsigned(h);
+    for (DWORD c : key.colors) hash = (hash ^ c) * 1099511628211ull;
+    hash = (hash ^ key.alphas) * 1099511628211ull ^ key.fade;
+    auto& slot = slots[(hash ^ (hash >> 31) ^ (hash >> 13)) % slots.size()];
+    if (slot.samples && !memcmp(&key, &slot.key, sizeof(key))) return slot.samples;
+    if (slot.lastProbe != hash) {
+        slot.lastProbe = hash;
+        return {};
+    }
+    auto samples = std::make_shared<std::vector<DWORD>>(w * h, 0xffffffff);
+    slot.key = key;
+    slot.samples = samples;
+    return samples;
+}
+
+DWORD COverlayGradient::Sample(int x, int y, int channel, Channel& state)
+{
+    if (!state.tried) {
+        state.tried = true;
+        if (activeGradientCache) state.samples = activeGradientCache->Lookup(mod_grad, channel);
+    }
+    const int tx = mod_grad.xoffset + x;
+    if (state.samples && unsigned(tx) < unsigned(mod_grad.width) && unsigned(y) < unsigned(mod_grad.height)) {
+        auto& color = (*state.samples)[y * mod_grad.width + tx];
+        // Legacy corner opacity is the high byte of a product of two bytes
+        // and can reach only 254. White at alpha 255 is a free sentinel.
+        if (color == 0xffffffff) color = mod_grad.getmixcolor(x, y, channel);
+        return color;
+    }
+    return mod_grad.getmixcolor(x, y, channel);
+}
+#endif
+
 static __forceinline DWORD blendMixColor(DWORD* dst, DWORD* color, MOD_BLEND mod_blendMode) {
     if (mod_blendMode == BLEND_NORMAL) {
         return *color;

@@ -42,6 +42,7 @@
 #include <omp.h>
 #endif
 #include "RTS.h"
+#include "OverlayMix.h"
 
 #if defined (_VSMOD) && defined(_LUA)
 // path m012. Lua animation
@@ -374,6 +375,10 @@ class EventWorkerPool
 
     void Worker(size_t observed, unsigned index)
     {
+#ifdef _VSMOD
+        GradientCache gradient;
+        const GradientCacheScope gradientScope(gradient);
+#endif
         std::unique_ptr<TextDeviceContext> dc;
         std::unique_ptr<TextGeometryCache> geometry;
         for (;;)
@@ -440,6 +445,9 @@ class EventWorkerPool
 
 public:
     enum class Batch { Preparation, Capture, Blend };
+#ifdef _VSMOD
+    GradientCache callerGradient;
+#endif
 
     EventWorkerPool()
     {
@@ -6375,7 +6383,8 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
         tag.fixedTransformInput = !tag.extendedArguments && !tag.extendedScalar &&
             (numberedCorner || cmd == L"an" || cmd == L"frx" || cmd == L"fry" ||
              cmd == L"frz" || cmd == L"fr" || cmd == L"fscx" || cmd == L"fscy" ||
-             cmd == L"pos" || cmd == L"t");
+             (cmd == L"pos" && tag.parameters.size() == 2) ||
+             (cmd == L"t" && !tag.parameters.empty() && tag.parameters.size() <= 4));
 #endif
         result->push_back(std::move(tag));
     };
@@ -10475,6 +10484,9 @@ try
 
     if (!m_eventWorkers)
         m_eventWorkers = std::make_unique<EventWorkerPool>();
+#ifdef _VSMOD
+    const GradientCacheScope gradientScope(m_eventWorkers->callerGradient);
+#endif
     bool parallel = m_eventWorkers->CanParallelize(subs.GetCount());
 #if defined(_VSMOD) && defined(_LUA)
     // User scripts may observe callback order and shared Lua globals.

@@ -26,18 +26,48 @@ public:
 };
 
 #ifdef _VSMOD
+class GradientCache
+{
+    struct Key {
+        int width, height;
+        DWORD colors[4], alphas, fade;
+    };
+    struct Slot {
+        uint64_t lastProbe = 0;
+        Key key{};
+        std::shared_ptr<std::vector<DWORD>> samples;
+    };
+    std::array<Slot, 64> slots{};
+public:
+    std::shared_ptr<std::vector<DWORD>> Lookup(const MOD_GRADIENT& gradient, int channel);
+};
+
+class GradientCacheScope
+{
+    GradientCache* previous;
+public:
+    explicit GradientCacheScope(GradientCache& cache);
+    ~GradientCacheScope();
+};
+
 // Gradient Color
 class COverlayGradient : public COverlayGetter
 {
 private:
     const MOD_GRADIENT& mod_grad;
     int type;
+    struct Channel {
+        bool tried = false;
+        std::shared_ptr<std::vector<DWORD>> samples;
+    };
+    Channel first, second;
+    DWORD Sample(int x, int y, int channel, Channel& state);
 
 public:
     COverlayGradient(const MOD_GRADIENT& gradient, int typ) : mod_grad(gradient), type(typ) {}
 
-    DWORD getcolor1(int x, int y) { return mod_grad.getmixcolor(x, y, type); }
-    DWORD getcolor2(int x, int y) { return mod_grad.getmixcolor(x, y, 1); }
+    DWORD getcolor1(int x, int y) { return Sample(x, y, type, first); }
+    DWORD getcolor2(int x, int y) { return Sample(x, y, 1, second); }
 };
 
 // Clip mask

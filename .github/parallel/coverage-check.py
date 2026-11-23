@@ -69,6 +69,9 @@ if __name__ == "__main__":
         if i % 3:
             tags += rf"\xbord{2 + i % 4}\ybord{6 - i % 4}\blur{1 + i % 3}\p1"
             text = f"m 0 0 l 100 0 100 30 50 {20 + i} 0 30 m 16 8 l 16 20 32 20 32 8"
+        if i % 4 == 1:
+            tags += (r"\t(200,500,\1vc(&HFF00FF&,&H112233&,&H441122&,&H00FF00&)"
+                     r"\3va(&H90&,&H12&,&H61&,&H04&))\fad(120,200)\clip(500,200,800,500)")
         lines.append(f"Dialogue: {i % 2},0:00:01.00,0:00:03.00,Default,actor{i},0,0,0,,{{{tags}}}{text}\n")
     source = (header + "".join(lines)).encode("utf-8-sig")
     expected = render(base, source, 1)

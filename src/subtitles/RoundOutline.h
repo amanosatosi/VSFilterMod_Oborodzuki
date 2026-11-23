@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <emmintrin.h>
 #include <limits>
 #include <utility>
