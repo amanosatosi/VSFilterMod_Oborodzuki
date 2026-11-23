@@ -289,11 +289,11 @@ public:
     bool hasFadeColor[2]{};
 };
 
+struct OverrideTag;
+
 #if defined (_VSMOD) && defined(_LUA)
 class CSubtitle : public CAtlList<CLine*>, public CMyLua
 #else
-struct OverrideTag;
-
 class CSubtitle : public CAtlList<CLine*>
 #endif
 {
