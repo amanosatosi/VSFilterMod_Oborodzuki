@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      gradient_direction:
+        description: Run the focused gradient slide direction pixel fixture
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -44,6 +49,10 @@ jobs:
           copy "%dll%" dist\ || exit /b 1
           copy LICENSE dist\ || exit /b 1
           copy README.md dist\ || exit /b 1
+
+      - name: Run focused CSRI gradient direction pixels
+        if: inputs.gradient_direction && matrix.arch == 'x64'
+        run: python .github/parallel/gradient-slide-direction.py dist/VSFilterModOborodzuki.dll
 
       - uses: actions/upload-artifact@v4
         with:

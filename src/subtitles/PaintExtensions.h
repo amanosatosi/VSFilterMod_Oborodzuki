@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 #include "RenderProfile.h"
@@ -77,6 +78,7 @@ struct Paint
     Source from, to;
     unsigned depth = 0;
     double width = 0, progress = 0;
+    std::optional<double> slideDirection;
 };
 
 struct DotState;
@@ -220,6 +222,7 @@ struct SlideSettings
     double positionedAlpha = 0;
     std::array<double, 2> decoration{};
     double global = 0;
+    std::optional<double> direction;
 
     double Width(int part) const
     {
@@ -392,7 +395,8 @@ public:
         alpha = inverseAlpha;
         for (; paint->kind == Paint::Kind::Slide; paint = paint->from.get())
         {
-            const Projection axis(Position(*paint, bounds, offsetY), paint->angle);
+            const Projection axis(Position(*paint, bounds, offsetY),
+                                  paint->slideDirection.value_or(paint->angle));
             const double scale = sx == sy ? sx : (sx > 0 && sy > 0 ?
                 1 / std::hypot(axis.dx / sx, axis.dy / sy) : 0);
             const double limit = (std::numeric_limits<double>::max)() / 2;

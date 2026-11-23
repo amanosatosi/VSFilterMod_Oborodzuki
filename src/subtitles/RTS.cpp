@@ -5056,7 +5056,7 @@ CRect CScreenLayoutAllocator::AllocRect(CSubtitle* s, int segment, int entry, in
 
 // CRenderedTextSubtitle
 
-enum class ExtensionTag : unsigned char { None, Box, Outline, Gradient, Decoration, Pattern, Layout };
+enum class ExtensionTag : unsigned char { None, Box, Outline, Gradient, SlideDirection, Decoration, Pattern, Layout };
 
 struct PatternTag
 {
@@ -6296,8 +6296,8 @@ void SetPaintPart(STSStyle& style, int part, KfxPaint::Source source)
 }
 
 KfxPaint::Source ResolvePaintSource(CSubtitle& subtitle, KfxPaint::Source old, KfxPaint::Paint target,
-    KfxPaint::Value solid, bool alpha, double progress, double width, bool keepCorners = false,
-    bool animate = false)
+    KfxPaint::Value solid, bool alpha, double progress, double width,
+    std::optional<double> direction, bool keepCorners = false, bool animate = false)
 {
     using namespace KfxPaint;
     if (progress <= 0)
@@ -6320,6 +6320,7 @@ KfxPaint::Source ResolvePaintSource(CSubtitle& subtitle, KfxPaint::Source old, K
         Paint slide;
         slide.kind = Paint::Kind::Slide;
         slide.angle = target.kind == Paint::Kind::Field ? target.angle : old->angle;
+        slide.slideDirection = direction;
         slide.width = width;
         slide.progress = progress;
         slide.positioned = target.positioned || old->positioned;
@@ -6356,7 +6357,8 @@ KfxPaint::Source ResolvePaintSource(CSubtitle& subtitle, KfxPaint::Source old, K
 }
 
 void ApplyPaintPart(CSubtitle& subtitle, STSStyle& style, int part, KfxPaint::Paint target,
-                    double progress, double width, bool animate = false)
+                    double progress, double width, std::optional<double> direction,
+                    bool animate = false)
 {
     using namespace KfxPaint;
     if (progress <= 0)
@@ -6368,7 +6370,7 @@ void ApplyPaintPart(CSubtitle& subtitle, STSStyle& style, int part, KfxPaint::Pa
     if (!old && progress < 1 && width >= 0 && (style.mod_grad.legacyParts & (1u << part)))
         old = std::make_shared<const Paint>(PaintCorners(style, channel, alpha));
     SetPaintPart(style, part, ResolvePaintSource(subtitle, std::move(old), std::move(target),
-        solid, alpha, progress, width, false, animate));
+        solid, alpha, progress, width, direction, false, animate));
 }
 
 KfxPaint::OutlineLayer& EditOutlineLayer(KfxPaint::OutlineStyle& state, unsigned number)
@@ -6428,6 +6430,8 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
             tag.extension = ExtensionTag::Box;
         else if (ReadOutlineTag(cmd, outline))
             tag.extension = ExtensionTag::Outline;
+        else if (cmd.Left(5) == L"grdsd")
+            tag.extension = ExtensionTag::SlideDirection;
         else if (ReadPaintTag(cmd, paint))
             tag.extension = ExtensionTag::Gradient;
         else if (ReadDecorationScalar(cmd, inverse, argument))
@@ -6990,6 +6994,8 @@ bool ApplyChatTag(NativeChat::Scene& chat, const OverrideTag& tag, STSStyle& sty
 
 bool MetadataTag(const OverrideTag& tag, bool actor)
 {
+    if (tag.extension == ExtensionTag::SlideDirection)
+        return true;
     const auto& cmd = tag.command;
     if (tag.extension == ExtensionTag::Gradient)
     {
@@ -7109,6 +7115,8 @@ void CRenderedTextSubtitle::CompileMetadata()
 void CRenderedTextSubtitle::ApplyMetadata(CSubtitle& sub, const CString& styleName, STSStyle& style, bool initial, bool named)
 {
     const auto& cache = *m_overrideTags;
+    auto& inheritedDirection = sub.m_inherited->slideDirection;
+    inheritedDirection.reset();
     STSStyle base(style);
     const auto select = cache.styleMetadata.find(styleName);
     if (select != cache.styleMetadata.end())
@@ -7137,12 +7145,14 @@ void CRenderedTextSubtitle::ApplyMetadata(CSubtitle& sub, const CString& styleNa
                     bits != style.mod_grad.legacyParts;
         }
     }
+    if (sub.m_slideSettings) inheritedDirection = sub.m_slideSettings->direction;
     const auto* patch = sub.m_inherited->actorPatch;
     if (patch && !patch->empty() && (cache.actorStyles.empty() ? !named :
         std::find(cache.actorStyles.begin(), cache.actorStyles.end(), styleName) != cache.actorStyles.end()))
     {
         STSStyle inherited(style);
         ParseSSATag(&sub, {}, style, inherited, false, nullptr, patch);
+        if (sub.m_slideSettings) inheritedDirection = sub.m_slideSettings->direction;
     }
 }
 #endif
@@ -7172,6 +7182,13 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 std::make_unique<KfxPaint::SlideSettings>();
         }
         return *owner;
+    };
+    const auto slideDirection = [&]() {
+        const auto* settings = slides();
+        return settings ? settings->direction : std::optional<double>{};
+    };
+    const auto defaultSlideDirection = [&]() {
+        return sub->m_inherited ? sub->m_inherited->slideDirection : std::optional<double>{};
     };
     const auto paintProgress = [&]() { return fAnimate ? KfxPaint::Unit(CalcAnimation(1, 0, true)) : 1.0; };
     const auto stopCycle = [&](unsigned target) {
@@ -7259,7 +7276,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             solid.solid = alpha;
             const int part = KfxPaint::NativeSlideStart + int(layer.number - 1) * 2 + 1;
             layer.paint[1] = ResolvePaintSource(*sub, layer.paint[1], std::move(solid), from,
-                true, progress, fAnimate && slides() && layer.paint[1] ? slides()->Width(part) : -1, true);
+                true, progress, fAnimate && slides() && layer.paint[1] ? slides()->Width(part) : -1, slideDirection(), true);
             layer.inverseAlpha = KfxPaint::Mix(from, alpha, progress, true, false);
         }
         style.nativeOutline = std::move(state);
@@ -7729,7 +7746,8 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             Paint target;
             target.solid = value;
             source = reset ? Source{} : ResolvePaintSource(*sub, source, std::move(target), from, decorationAlpha,
-                progress, fAnimate && slides() && source ? slides()->Width(DecorationSlideStart + int(decorationAlpha)) : -1);
+                progress, fAnimate && slides() && source ? slides()->Width(DecorationSlideStart + int(decorationAlpha)) : -1,
+                slideDirection());
             solid = reset ? -1 : int(Mix(from, value, progress, decorationAlpha, false));
             style.decoration = std::move(deco);
             continue;
@@ -7868,7 +7886,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     auto& layer = EditOutlineLayer(*state, 0);
                     const Value solid = layer.waitingColor >= 0 ? Value(layer.waitingColor) : revcolor(style.colors[2]);
                     layer.waitingPaint = reset ? Source{} : ResolvePaintSource(*sub,
-                        layer.waitingPaint, std::move(target), solid, false, progress, width, true, fAnimate);
+                        layer.waitingPaint, std::move(target), solid, false, progress, width, slideDirection(), true, fAnimate);
                     ringState = std::move(state);
                 }
                 else if (base)
@@ -7879,7 +7897,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     if (!old && width >= 0 && (style.mod_grad.legacyParts & (1u << part)))
                         old = std::make_shared<const Paint>(PaintCorners(style, 2, inverse));
                     SetPaintPart(style, part, reset ? Source{} : ResolvePaintSource(*sub,
-                        std::move(old), std::move(target), solid, inverse, progress, width, true, fAnimate));
+                        std::move(old), std::move(target), solid, inverse, progress, width, slideDirection(), true, fAnimate));
                     style.mod_grad.legacyParts &= ~(1u << part);
                 }
                 else
@@ -7893,7 +7911,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     const Value solid = fallback >= 0 ? Value(fallback) :
                         inverse ? style.alpha[channel] : revcolor(style.colors[channel]);
                     layer.paint[component] = reset ? Source{} : ResolvePaintSource(*sub,
-                        layer.paint[component], std::move(target), solid, inverse, progress, width, true, fAnimate);
+                        layer.paint[component], std::move(target), solid, inverse, progress, width, slideDirection(), true, fAnimate);
                     ringState = std::move(state);
                 }
                 continue;
@@ -7910,7 +7928,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     const Value from = inverse ? style.alpha[2] : revcolor(style.colors[2]);
                     Paint target;
                     target.solid = value;
-                    ApplyPaintPart(*sub, style, part, std::move(target), progress, width);
+                    ApplyPaintPart(*sub, style, part, std::move(target), progress, width, slideDirection());
                     style.mod_grad.legacyParts &= ~(1u << part);
                     const Value mixed = Mix(from, value, progress, inverse, false);
                     if (inverse) style.alpha[2] = BYTE(mixed);
@@ -7928,7 +7946,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                         target.solid = value;
                         const double waitingWidth = fAnimate && slides() ? slides()->Width(WaitingSlidePart) : -1;
                         layer.waitingPaint = reset ? Source{} : ResolvePaintSource(*sub, layer.waitingPaint,
-                            std::move(target), from, false, progress, layer.waitingPaint ? waitingWidth : -1, true);
+                            std::move(target), from, false, progress, layer.waitingPaint ? waitingWidth : -1, slideDirection(), true);
                     }
                     else
                     {
@@ -7936,7 +7954,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                         target.solid = value;
                         auto& source = layer.paint[int(inverse)];
                         source = reset ? Source{} : ResolvePaintSource(*sub, source, std::move(target),
-                            from, inverse, progress, source ? width : -1, true);
+                            from, inverse, progress, source ? width : -1, slideDirection(), true);
                     }
                     dest = reset ? -1 : int(Mix(from, value, progress, inverse, false));
                     ringState = std::move(state);
@@ -7992,6 +8010,27 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             continue;
         }
 
+        if (tag.extension == ExtensionTag::SlideDirection)
+        {
+            if (tag.parenthesized) continue;
+            CStringW argument = cmd.Mid(5);
+            argument.Trim();
+            if (argument.IsEmpty())
+            {
+                if (slides() || defaultSlideDirection())
+                    editSlides().direction = defaultSlideDirection();
+            }
+            else
+            {
+                double angle;
+                if (!ReadPaintNumber(argument, angle)) continue;
+                angle = std::fmod(angle, 360.0);
+                if (angle < 0) angle += 360;
+                editSlides().direction = angle > 0 && angle < 360 ? angle : 0;
+            }
+            continue;
+        }
+
         if (tag.extension == ExtensionTag::Gradient)
         {
             PaintTag paint{};
@@ -8034,7 +8073,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 const double progress = paintProgress();
                 if (progress <= 0) continue;
                 source = ResolvePaintSource(*sub, source, std::move(field), 0, true, progress,
-                    fAnimate && slides() ? slides()->Width(paint.part) : -1, false, fAnimate);
+                    fAnimate && slides() ? slides()->Width(paint.part) : -1, slideDirection(), false, fAnimate);
                 ++sub->m_positionedAlphaScopes;
             }
             else if (paint.decoration)
@@ -8055,7 +8094,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 const int own = inverse ? deco->inverseAlpha : deco->color;
                 const Value solid = own >= 0 ? Value(own) : inverse ? style.alpha[0] : revcolor(style.colors[0]);
                 source = reset ? Source{} : ResolvePaintSource(*sub, source, std::move(field), solid, inverse, progress,
-                    fAnimate && slides() ? slides()->Width(paint.part) : -1, false, fAnimate);
+                    fAnimate && slides() ? slides()->Width(paint.part) : -1, slideDirection(), false, fAnimate);
                 style.decoration = std::move(deco);
             }
             else if (params.empty() && (paint.argument.IsEmpty() || paint.argument == L"0"))
@@ -8076,7 +8115,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     if (!(paint.part & 1)) stopCycle(unsigned(paint.part / 2));
                     const auto progress = paintProgress();
                     ApplyPaintPart(*sub, style, paint.part, std::move(field), progress,
-                                   fAnimate && slides() ? slides()->Width(paint.part) : -1, fAnimate);
+                                   fAnimate && slides() ? slides()->Width(paint.part) : -1, slideDirection(), fAnimate);
                     if (progress > 0)
                     {
                         style.mod_grad.legacyParts &= ~(1u << paint.part);
@@ -8111,7 +8150,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     KfxPaint::Paint solid;
                     solid.solid = scalarAlpha ? KfxPaint::Value(p.IsEmpty() ? org.alpha[channel] : wcstol(p, nullptr, 16) & 255) :
                         KfxPaint::Value(revcolor(p.IsEmpty() ? org.colors[channel] : wcstol(p, nullptr, 16) & 0xFFFFFF));
-                    ApplyPaintPart(*sub, style, part, std::move(solid), progress, width);
+                    ApplyPaintPart(*sub, style, part, std::move(solid), progress, width, slideDirection());
                 }
                 if (progress <= 0)
                     continue;
@@ -8137,7 +8176,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     }
                     if (corners.stops.size() == 4)
                     {
-                        ApplyPaintPart(*sub, style, part, std::move(corners), progress, width);
+                        ApplyPaintPart(*sub, style, part, std::move(corners), progress, width, slideDirection());
                         continue;
                     }
                 }
@@ -9309,6 +9348,8 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #endif
 #ifdef _VSMOD
             if (slides()) editSlides() = {};
+            if (fAnimate && defaultSlideDirection())
+                editSlides().direction = defaultSlideDirection();
 #endif
             STSStyle* val;
 #ifdef _VSMOD
