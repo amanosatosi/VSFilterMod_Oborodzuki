@@ -70,13 +70,15 @@ for name, (count, effects) in scenarios.items():
 if sys.argv[1:] == ["--fixtures-only"]:
     raise SystemExit()
 print("Checking concurrent instances and repeated teardown", flush=True)
-subprocess.run(["hosts/concurrent.exe", DLL, str((ROOT / "overlap-32.ass").resolve())], check=True, timeout=180)
+for count in (4, 32):
+    subprocess.run(["hosts/concurrent.exe", DLL, str((ROOT / f"overlap-{count}.ass").resolve())],
+                   check=True, timeout=180)
 
 baseline = str(Path("threading-baseline/renderer/renderer.dll").resolve(strict=True))
 dlls = {"baseline": baseline, "candidate": DLL}
 comparable = [workers for workers in WORKERS if workers <= cpu]
 quick = os.environ.get("PARALLEL_QUICK") == "true"
-fixture_names = ("idle", "static", "animated", "overlap-16", "blend", "mixed", "lua") if quick else tuple(scenarios)
+fixture_names = ("idle", "static", "animated", "overlap-4", "overlap-16", "blend", "mixed", "lua") if quick else tuple(scenarios)
 settings = [(revision, workers) for workers in (comparable if quick else WORKERS)
             for revision in dlls if revision == "candidate" or workers in comparable]
 

@@ -482,8 +482,13 @@ public:
     void Run(const std::vector<std::function<void()>>& work, Batch batch = Batch::Preparation,
         unsigned blendLimit = 1)
     {
-        const auto available = batch == Batch::Blend
-            ? (std::min)(work.size(), size_t(blendLimit)) : work.size() / 2;
+        // Preparation already omits events whose geometry is ready. Four
+        // independently dirty events can use four workers for rasterization.
+        size_t available = work.size() / 2;
+        if (batch == Batch::Preparation && work.size() >= 4)
+            available = work.size();
+        else if (batch == Batch::Blend)
+            available = (std::min)(work.size(), size_t(blendLimit));
         const unsigned desiredWorkers = unsigned((std::min)(size_t(workers), available));
         if (desiredWorkers < 2)
         {
