@@ -5079,6 +5079,11 @@ struct OverrideTag {
     PatternTag pattern;
     bool fixedTransformInput = false;
     std::array<DWORD, 4> corners{};
+#ifdef _VSMOD
+    double STSStyle::* geometryField = nullptr;
+    double geometryTarget = 0;
+    bool clampScale = false;
+#endif
 };
 
 using OverrideTags = std::vector<OverrideTag>;
@@ -6460,6 +6465,26 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
              cmd == L"frz" || cmd == L"fr" || cmd == L"fscx" || cmd == L"fscy" ||
              (cmd == L"pos" && tag.parameters.size() == 2) ||
              (cmd == L"t" && !tag.parameters.empty() && tag.parameters.size() <= 4));
+        // Compile integer geometry operands once. Resets, expressions and fractional
+        // angles retain the general parser and its numeric conversion rules.
+        if (tag.fixedTransformInput && !tag.parenthesized && tag.parameters.size() == 1 &&
+            !cmd.IsEmpty() && cmd[0] == L'f')
+        {
+            const CStringW& value = tag.parameters.front();
+            const int length = value.GetLength();
+            const wchar_t* digits = value.GetString();
+            if (*digits == L'-' || *digits == L'+') ++digits;
+            if (*digits && length <= 8 && digits[wcsspn(digits, L"0123456789")] == 0)
+            {
+                if (cmd == L"frx") tag.geometryField = &STSStyle::fontAngleX;
+                else if (cmd == L"fry") tag.geometryField = &STSStyle::fontAngleY;
+                else if (cmd == L"fr" || cmd == L"frz") tag.geometryField = &STSStyle::fontAngleZ;
+                else if (cmd == L"fscx") tag.geometryField = &STSStyle::fontScaleX;
+                else if (cmd == L"fscy") tag.geometryField = &STSStyle::fontScaleY;
+                tag.clampScale = cmd == L"fscx" || cmd == L"fscy";
+                tag.geometryTarget = tag.clampScale ? wcstol(value, nullptr, 10) : wcstod(value, nullptr);
+            }
+        }
 #endif
         result->push_back(std::move(tag));
     };
@@ -6808,7 +6833,9 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
 std::shared_ptr<const OverrideTags> OverrideTagCache::Get(const CStringW& text)
 {
     const size_t length = text.GetLength();
-    if (length > 1024)
+    // Long karaoke blocks recur on every frame. Keep them under the same
+    // aggregate character and entry budgets as shorter blocks.
+    if (length > 8192)
         return TokenizeOverrideTags(text);
 
     const auto found = blocks.find(text);
@@ -7349,10 +7376,19 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             continue;
         }
 #endif
+#ifdef _VSMOD
+        if (sub->m_chat && ApplyChatTag(*sub->m_chat, tag, style, fAnimate)) continue;
+        if (tag.geometryField)
+        {
+            double& field = style.*tag.geometryField;
+            const double n = CalcAnimation(tag.geometryTarget, field, fAnimate);
+            field = tag.clampScale && n < 0 ? 0 : n;
+            continue;
+        }
+#endif
         CStringW p = params.size() > 0 ? params[0] : L"";
 
 #ifdef _VSMOD
-        if (sub->m_chat && ApplyChatTag(*sub->m_chat, tag, style, fAnimate)) continue;
         if (tag.extension == ExtensionTag::Pattern)
         {
             using P = PatternTag;

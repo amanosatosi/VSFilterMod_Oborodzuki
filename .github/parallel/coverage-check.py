@@ -67,6 +67,10 @@ if __name__ == "__main__":
                 rf"\1vc(&H01020{i % 9}&,&H011122&,&H77EE23&,&HCC9922&)"
                 r"\3va(&H10&,&H30&,&H50&,&H70&)")
         text = "日本語 မြန်မာ"
+        if i == 0:
+            # Exercise a long cached block, repeated assignments and numeric fallbacks.
+            tags += (r"\t(100,500,\fr-0\fscy+99\frz3)" * 45 +
+                     r"\t(120,600,\frx-12\fry17\frz2.5\fscx-3)\t(600,900,\fscx\frz)")
         if i % 3:
             tags += rf"\xbord{2 + i % 4}\ybord{6 - i % 4}\blur{1 + i % 3}\p1"
             text = f"m 0 0 l 100 0 100 30 50 {20 + i} 0 30 m 16 8 l 16 20 32 20 32 8"
