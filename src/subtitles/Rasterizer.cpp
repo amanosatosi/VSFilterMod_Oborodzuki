@@ -829,12 +829,13 @@ bool Rasterizer::WidenOutlineByRow(int rx, int ry)
         const auto packedY = (static_cast<unsigned __int64>(y) + 0x40000000) << 32;
         if (useStrips && strips.safe[y + ry])
         {
-            auto& spans = strips.intervals[y + ry];
-            std::sort(spans.begin(), spans.end());
-            for (size_t i = 0; i < spans.size();)
+            auto& spans = strips.intervals;
+            const auto first = strips.offsets[y + ry], end = strips.offsets[y + ry + 1];
+            std::sort(spans.begin() + first, spans.begin() + end);
+            for (auto i = first; i < end;)
             {
                 auto merged = spans[i++];
-                while (i < spans.size() && spans[i].first <= merged.second)
+                while (i < end && spans[i].first <= merged.second)
                 {
                     merged.second = (std::max)(merged.second, spans[i].second);
                     ++i;

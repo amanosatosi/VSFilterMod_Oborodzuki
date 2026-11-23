@@ -62,8 +62,15 @@ int main()
         rows.push_back({spans.size()});
         RoundOutline::Rows result;
         if (!RoundOutline::Build(rows, spans, radius, result)) continue;
+        if (result.offsets.size() != result.safe.size() + 1 || result.offsets.front() != 0 ||
+            result.offsets.back() != result.intervals.size() ||
+            !std::is_sorted(result.offsets.begin(), result.offsets.end())) return 1;
         for (int y = -ry; y < h + ry; ++y) {
-            if (!result.safe[y + ry]) { ++legacy; continue; }
+            if (!result.safe[y + ry]) {
+                if (result.offsets[y + ry] != result.offsets[y + ry + 1]) return 1;
+                ++legacy;
+                continue;
+            }
             Row expected;
             for (int s = (std::min)(h - 1, y + ry); s >= (std::max)(0, y - ry); --s) {
                 Row incoming;
@@ -74,10 +81,12 @@ int main()
                 }
                 expected = merge(expected, incoming);
             }
-            auto& intervals = result.intervals[y + ry];
-            std::sort(intervals.begin(), intervals.end());
+            auto first = result.intervals.begin() + result.offsets[y + ry];
+            auto end = result.intervals.begin() + result.offsets[y + ry + 1];
+            std::sort(first, end);
             Row actual;
-            for (auto span : intervals) {
+            for (auto it = first; it != end; ++it) {
+                const auto& span = *it;
                 if (actual.empty() || actual.back().second < span.first) actual.push_back(span);
                 else actual.back().second = (std::max)(actual.back().second, span.second);
             }

@@ -48,7 +48,8 @@ inline Interval Bounds(const Strip& strip, int first, int last, const short* rad
 
 struct Rows {
     std::vector<unsigned char> safe;
-    std::vector<std::vector<Interval>> intervals;
+    std::vector<unsigned> offsets;
+    std::vector<Interval> intervals;
 };
 
 template<class RowTable, class Spans>
@@ -113,14 +114,28 @@ bool Build(const RowTable& rows, const Spans& spans, const std::vector<int>& rad
     }
     if (std::count(output.safe.begin(), output.safe.end(), 1) < int(output.safe.size() / 2))
         return false;
-    output.intervals.resize(output.safe.size());
+    // Every strip contributes one interval to every certified row it
+    // intersects. Count with its two endpoints before allocating the spans.
+    std::vector<int> changes(output.safe.size() + 1);
+    for (const auto& strip : strips) {
+        ++changes[strip.start];
+        --changes[strip.start + strip.left.size() + 2 * ry];
+    }
+    output.offsets.resize(changes.size());
+    int active = 0;
+    for (size_t i = 0; i < output.safe.size(); ++i) {
+        active += changes[i];
+        output.offsets[i + 1] = output.offsets[i] + (output.safe[i] ? active : 0);
+    }
+    output.intervals.resize(output.offsets.back());
+    auto next = output.offsets;
     for (const auto& strip : strips) {
         const int n = int(strip.left.size());
         for (int y = -ry; y < n + ry; ++y) {
             const int row = strip.start + y + ry;
             if (!output.safe[row]) continue;
             const int first = (std::max)(0, y - ry), last = (std::min)(n, y + ry + 1);
-            output.intervals[row].push_back(Bounds(strip, first, last, kernel.data() + (ry + first - y)));
+            output.intervals[next[row]++] = Bounds(strip, first, last, kernel.data() + (ry + first - y));
         }
     }
     return true;
