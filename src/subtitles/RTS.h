@@ -36,13 +36,6 @@
 #endif
 #include "..\SubPic\ISubPic.h"
 
-class CMyFont : public CFont
-{
-public:
-    CMyFont(STSStyle& style);
-    CMyFont(const LOGFONT& font);
-};
-
 class CPolygon;
 
 class CWord : public Rasterizer

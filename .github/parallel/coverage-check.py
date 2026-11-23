@@ -67,6 +67,11 @@ if __name__ == "__main__":
                 rf"\1vc(&H01020{i % 9}&,&H011122&,&H77EE23&,&HCC9922&)"
                 r"\3va(&H10&,&H30&,&H50&,&H70&)")
         text = "日本語 မြန်မာ"
+        # More font requests than cache slots, including missing faces, spaced
+        # text, mixed scripts and the metrics used by ASS drawings.
+        tags += rf"\fs{31 + i}\fn" + ("Arial" if i % 2 else "Missing coverage fixture font")
+        if i == 3:
+            tags += r"\fsp2"
         if i == 0:
             # Exercise a long cached block, repeated assignments and numeric fallbacks.
             tags += (r"\t(100,500,\fr-0\fscy+99\frz3)" * 45 +

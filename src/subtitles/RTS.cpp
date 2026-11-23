@@ -119,8 +119,6 @@ static long revcolor(long c)
 
 //////////////////////////////////////////////////////////////////////////////////////////////
 
-// CMyFont
-
 static LOGFONT TextLogFont(STSStyle& style)
 {
     LOGFONT lf;
@@ -145,19 +143,28 @@ static LOGFONT TextLogFont(STSStyle& style)
     return lf;
 }
 
-CMyFont::CMyFont(STSStyle& style) : CMyFont(TextLogFont(style))
+// A retained native handle keeps GDI's realized font available across different
+// text runs without retaining a thread-local MFC handle-map entry.
+struct RealizedFont
 {
-}
+    const LOGFONT request;
+    HFONT handle;
+    const bool requestedFaceCreated;
 
-CMyFont::CMyFont(const LOGFONT& font)
-{
-    LOGFONT lf = font;
-    if(!CreateFontIndirect(&lf))
+    explicit RealizedFont(const LOGFONT& font) : request(font), handle(::CreateFontIndirect(&font)),
+        requestedFaceCreated(handle != nullptr)
     {
-        _tcscpy(lf.lfFaceName, _T("Arial"));
-        CreateFontIndirect(&lf);
+        if (!handle)
+        {
+            LOGFONT fallback = font;
+            _tcscpy_s(fallback.lfFaceName, _T("Arial"));
+            handle = ::CreateFontIndirect(&fallback);
+        }
     }
-}
+    ~RealizedFont() { if (handle) ::DeleteObject(handle); }
+    RealizedFont(const RealizedFont&) = delete;
+    RealizedFont& operator=(const RealizedFont&) = delete;
+};
 
 struct TextGeometryKey
 {
@@ -202,6 +209,8 @@ struct TextGeometryCache
     Rasterizer::OutlineCache outlines;
     unsigned long long generation = 0;
     std::unordered_map<TextGeometryKey, TextGeometry, TextGeometryHash> runs;
+    std::array<std::shared_ptr<const RealizedFont>, 8> fonts{};
+    size_t nextFont = 0;
     CRegKey machineFonts, userFonts;
     FILETIME machineStamp{}, userStamp{};
     unsigned embeddedRevision = 0;
@@ -215,10 +224,26 @@ struct TextGeometryCache
     {
         ++generation;
         runs.clear();
+        fonts.fill(nullptr);
+        nextFont = 0;
         pathBytes = 0;
         saturated = false;
         clipMasks.clear();
         clipBytes = 0;
+    }
+
+    std::shared_ptr<const RealizedFont> GetFont(const LOGFONT& request)
+    {
+        for (const auto& font : fonts)
+            if (font && !memcmp(&font->request, &request, sizeof(request)))
+                return font;
+        auto font = std::make_shared<RealizedFont>(request);
+        if (font->requestedFaceCreated)
+        {
+            fonts[nextFont] = font;
+            nextFont = (nextFont + 1) % fonts.size();
+        }
+        return font;
     }
 
     void SaveClip(const ClipKey& key, const std::shared_ptr<BYTE>& pixels, size_t bytes)
@@ -303,6 +328,11 @@ struct TextGeometryCache
 // Words are short-lived. Bind the renderer's cache only while that renderer
 // is laying out and painting a frame, including nested calls on this thread.
 static thread_local TextGeometryCache* activeTextGeometry = nullptr;
+
+static std::shared_ptr<const RealizedFont> GetTextFont(const LOGFONT& request)
+{
+    return activeTextGeometry ? activeTextGeometry->GetFont(request) : std::make_shared<RealizedFont>(request);
+}
 
 class TextGeometryScope
 {
@@ -1897,8 +1927,8 @@ CText::CText(STSStyle& style, CStringW str, int ktype, int kstart, int kend, dou
     }
 
     PROFILE_RENDER_STAGE(GdiMetrics);
-    CMyFont font(logFont);
-    const SelectedTextFont selected(font);
+    const auto font = GetTextFont(logFont);
+    const SelectedTextFont selected(font->handle);
     TEXTMETRIC metrics{};
     const bool hasMetrics = !!GetTextMetrics(g_hDC, &metrics);
     const int ascent = (metrics.tmAscent + 4) >> 3;
@@ -1930,7 +1960,7 @@ CText::CText(STSStyle& style, CStringW str, int ktype, int kstart, int kend, dou
             return;
         }
         m_width = int(measureWidth(extent));
-        if (geometry && hasMetrics && selected && font.GetSafeHandle())
+        if (geometry && hasMetrics && selected && font->handle)
         {
             geometry->extent = extent;
             geometry->ascent = ascent;
@@ -2101,8 +2131,8 @@ bool CText::CreatePath()
     }
 
     PROFILE_RENDER_STAGE(GdiPath);
-    CMyFont font(logFont);
-    const SelectedTextFont selected(font);
+    const auto font = GetTextFont(logFont);
+    const SelectedTextFont selected(font->handle);
 
     int width = 0;
 
@@ -2140,7 +2170,7 @@ bool CText::CreatePath()
         const bool drawn = !!TextOutW(g_hDC, 0, 0, m_str, m_str.GetLength());
         const bool ended = EndPath(g_hDC);
         if (geometry && !geometry->hasPath && begun && drawn && ended && selected &&
-            font.GetSafeHandle() && (!mPathPoints || (mpPathPoints && mpPathTypes)))
+            font->handle && (!mPathPoints || (mpPathPoints && mpPathTypes)))
             activeTextGeometry->SavePath(*geometry, mpPathPoints, mpPathTypes, mPathPoints);
     }
 
@@ -2161,10 +2191,11 @@ CPolygon::CPolygon(STSStyle& style, CStringW str, int ktype, int kstart, int ken
         m_style.mod_grad.paint = std::move(sources);
     }
 #endif
-    CMyFont font(m_style);
-    HFONT oldFont = SelectFont(g_hDC, font);
-    MeasureSelectedFont();
-    SelectFont(g_hDC, oldFont);
+    {
+        const auto font = GetTextFont(TextLogFont(m_style));
+        const SelectedTextFont selected(font->handle);
+        MeasureSelectedFont();
+    }
     ParseStr();
 }
 
