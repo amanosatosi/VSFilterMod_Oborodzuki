@@ -1415,6 +1415,65 @@ static void BlendOverlay(RasterizerNfo& info, bool body, COverlayGetter* color, 
 }
 
 #ifdef _VSMOD
+// Vector clips are often solid across whole glyph rows. Preserve the old
+// six-bit sampler's bottom-edge convention and group adjacent rows so the
+// ordinary SIMD mixer can process the opaque part of a clip directly.
+enum class ClipRow { Empty, Opaque, Partial };
+
+static ClipRow ClassifyClipRow(const BYTE* mask, int width)
+{
+    const BYTE first = mask[0];
+    if (first != 0 && first != 64) return ClipRow::Partial;
+    const auto expected = _mm_set1_epi8(char(first));
+    int x = 0;
+    for (; x <= width - 16; x += 16)
+    {
+        const auto values = _mm_loadu_si128(reinterpret_cast<const __m128i*>(mask + x));
+        if (_mm_movemask_epi8(_mm_cmpeq_epi8(values, expected)) != 0xffff)
+            return ClipRow::Partial;
+    }
+    for (; x < width; ++x)
+        if (mask[x] != first) return ClipRow::Partial;
+    return first ? ClipRow::Opaque : ClipRow::Empty;
+}
+
+static void BlendClippedSSE2(RasterizerNfo& info, bool body, COverlayGetter* color,
+    COverlayAlpha* alpha, const MOD_MOVEVC& clip)
+{
+    if (!alpha || clip.enable || info.mod_blendMode != BLEND_NORMAL || info.w > clip.spd.cx)
+    {
+        BlendOverlay<COverlayMixerSSE2>(info, body, color, alpha);
+        return;
+    }
+
+    const auto classify = [&](int row) {
+        const int wy = info.rowOffset + info.h - row - 1;
+        if (wy <= 0 || wy > clip.spd.cy) return ClipRow::Empty;
+        return ClassifyClipRow(clip.alphamask + ptrdiff_t(clip.hfull - wy) * clip.spd.cx, info.w);
+    };
+    ClipRow kind = classify(0);
+    for (int first = 0, next = 1; next <= info.h; ++next)
+    {
+        const auto following = next == info.h ? ClipRow::Empty : classify(next);
+        if (following == kind && next != info.h) continue;
+        if (kind != ClipRow::Empty)
+        {
+            auto span = info;
+            span.h = next - first;
+            span.rowOffset += info.h - next;
+            span.dst = reinterpret_cast<DWORD*>(reinterpret_cast<BYTE*>(info.dst) + ptrdiff_t(first) * info.pitch);
+            const auto offset = 2 * ptrdiff_t(first) * info.overlayp;
+            span.s += offset;
+            span.src += offset;
+            // The legacy clipped outline subtracts from the selected channel.
+            if (!body && kind == ClipRow::Opaque) span.src = span.s;
+            BlendOverlay<COverlayMixerSSE2>(span, body, color, kind == ClipRow::Opaque ? nullptr : alpha);
+        }
+        first = next;
+        kind = following;
+    }
+}
+
 // Each band makes its own sampler from immutable event paint and full bounds.
 class COverlayKfxPaint : public COverlayGetter
 {
@@ -1574,7 +1633,7 @@ void OverlayDraw::Blend(int top, int bottom) const
             band.s = band.src;
         COverlayKfxPaint extended(*this);
         if (g_cpuid.m_flags & CCpuID::sse2)
-            BlendOverlay<COverlayMixerSSE2>(band, body, &extended, alpha);
+            BlendClippedSSE2(band, body, &extended, alpha, maskPosition);
         else
             BlendOverlay<COverlayMixer>(band, body, &extended, alpha);
 #ifndef _M_X64
@@ -1584,7 +1643,11 @@ void OverlayDraw::Blend(int top, int bottom) const
     }
 #endif
     if (g_cpuid.m_flags & CCpuID::sse2)
+#ifdef _VSMOD
+        BlendClippedSSE2(band, body, color, alpha, maskPosition);
+#else
         BlendOverlay<COverlayMixerSSE2>(band, body, color, alpha);
+#endif
     else
         BlendOverlay<COverlayMixer>(band, body, color, alpha);
 #ifndef _M_X64
