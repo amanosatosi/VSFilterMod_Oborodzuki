@@ -6297,7 +6297,7 @@ void SetPaintPart(STSStyle& style, int part, KfxPaint::Source source)
 
 KfxPaint::Source ResolvePaintSource(CSubtitle& subtitle, KfxPaint::Source old, KfxPaint::Paint target,
     KfxPaint::Value solid, bool alpha, double progress, double width,
-    std::optional<double> direction, bool keepCorners = false, bool animate = false)
+    KfxPaint::SlideDirection direction, bool keepCorners = false, bool animate = false)
 {
     using namespace KfxPaint;
     if (progress <= 0)
@@ -6357,7 +6357,7 @@ KfxPaint::Source ResolvePaintSource(CSubtitle& subtitle, KfxPaint::Source old, K
 }
 
 void ApplyPaintPart(CSubtitle& subtitle, STSStyle& style, int part, KfxPaint::Paint target,
-                    double progress, double width, std::optional<double> direction,
+                    double progress, double width, KfxPaint::SlideDirection direction,
                     bool animate = false)
 {
     using namespace KfxPaint;
@@ -7116,7 +7116,7 @@ void CRenderedTextSubtitle::ApplyMetadata(CSubtitle& sub, const CString& styleNa
 {
     const auto& cache = *m_overrideTags;
     auto& inheritedDirection = sub.m_inherited->slideDirection;
-    inheritedDirection.reset();
+    inheritedDirection = {};
     STSStyle base(style);
     const auto select = cache.styleMetadata.find(styleName);
     if (select != cache.styleMetadata.end())
@@ -7185,10 +7185,10 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
     };
     const auto slideDirection = [&]() {
         const auto* settings = slides();
-        return settings ? settings->direction : std::optional<double>{};
+        return settings ? settings->direction : KfxPaint::SlideDirection{};
     };
     const auto defaultSlideDirection = [&]() {
-        return sub->m_inherited ? sub->m_inherited->slideDirection : std::optional<double>{};
+        return sub->m_inherited ? sub->m_inherited->slideDirection : KfxPaint::SlideDirection{};
     };
     const auto paintProgress = [&]() { return fAnimate ? KfxPaint::Unit(CalcAnimation(1, 0, true)) : 1.0; };
     const auto stopCycle = [&](unsigned target) {
@@ -8017,7 +8017,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             argument.Trim();
             if (argument.IsEmpty())
             {
-                if (slides() || defaultSlideDirection())
+                if (slides() || defaultSlideDirection().IsSet())
                     editSlides().direction = defaultSlideDirection();
             }
             else
@@ -8026,7 +8026,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 if (!ReadPaintNumber(argument, angle)) continue;
                 angle = std::fmod(angle, 360.0);
                 if (angle < 0) angle += 360;
-                editSlides().direction = angle > 0 && angle < 360 ? angle : 0;
+                editSlides().direction = { angle > 0 && angle < 360 ? angle : 0 };
             }
             continue;
         }
@@ -9348,7 +9348,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #endif
 #ifdef _VSMOD
             if (slides()) editSlides() = {};
-            if (fAnimate && defaultSlideDirection())
+            if (fAnimate && defaultSlideDirection().IsSet())
                 editSlides().direction = defaultSlideDirection();
 #endif
             STSStyle* val;

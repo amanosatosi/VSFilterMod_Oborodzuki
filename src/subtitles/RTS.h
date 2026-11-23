@@ -350,7 +350,7 @@ public:
         STSStyle original;
         Furigana::Options ruby;
         int wrap = 0, boxMode = -1;
-        std::optional<double> slideDirection;
+        KfxPaint::SlideDirection slideDirection;
     };
     std::unique_ptr<InheritedMetadata> m_inherited;
     int m_annotationLeft = 0, m_annotationRight = 0;
