@@ -88,6 +88,9 @@ jobs:
              image = $env:ImageVersion
              ram = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
              revision = $env:GITHUB_SHA } | ConvertTo-Json -Depth 4 | Set-Content parallel-results/environment.json
+      - name: Check effective alpha and outline reuse across seeks and resolution changes
+        if: github.ref_name == 'astra/extra-optimization-JustInCase'
+        run: python .github/parallel/coverage-check.py threading-baseline/renderer/renderer.dll renderer/renderer.dll
       - name: Download the pinned Mangetsu paint reference
         if: github.ref_name != 'feature/parallel-event-rendering'
         uses: actions/download-artifact@v4

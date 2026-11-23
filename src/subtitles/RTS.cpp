@@ -199,6 +199,7 @@ struct TextGeometry
 struct TextGeometryCache
 {
     Rasterizer::OutlineCache outlines;
+    unsigned long long generation = 0;
     std::unordered_map<TextGeometryKey, TextGeometry, TextGeometryHash> runs;
     CRegKey machineFonts, userFonts;
     FILETIME machineStamp{}, userStamp{};
@@ -211,6 +212,7 @@ struct TextGeometryCache
 
     void Clear()
     {
+        ++generation;
         runs.clear();
         pathBytes = 0;
         saturated = false;
@@ -5067,6 +5069,8 @@ struct OverrideTag {
     bool extendedScalar = false;
     bool extendedArguments = false;
     PatternTag pattern;
+    bool fixedTransformInput = false;
+    std::array<DWORD, 4> corners{};
 };
 
 using OverrideTags = std::vector<OverrideTag>;
@@ -6363,6 +6367,15 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
                 cmd == L"org" || cmd == L"distort")
                 tag.extendedArguments = std::any_of(tag.parameters.begin(), tag.parameters.end(), ExtendedNumber);
         }
+        const bool numberedCorner = cmd.GetLength() == 3 && cmd[0] >= L'1' && cmd[0] <= L'4' &&
+            cmd[1] == L'v' && (cmd[2] == L'a' || cmd[2] == L'c');
+        if ((numberedCorner || cmd == L"va" || cmd == L"vc") && tag.parameters.size() >= 4)
+            for (int i = 0; i < 4; ++i)
+                tag.corners[i] = wcstol(CStringW(tag.parameters[i]).Trim(L"&H"), nullptr, 16);
+        tag.fixedTransformInput = !tag.extendedArguments && !tag.extendedScalar &&
+            (numberedCorner || cmd == L"an" || cmd == L"frx" || cmd == L"fry" ||
+             cmd == L"frz" || cmd == L"fr" || cmd == L"fscx" || cmd == L"fscy" ||
+             cmd == L"pos" || cmd == L"t");
 #endif
         result->push_back(std::move(tag));
     };
@@ -7174,6 +7187,11 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
     {
         const auto& cmd = tag.command;
         const auto& params = tag.parameters;
+#ifdef _VSMOD
+        if (sub->m_reuseTransform && (!tag.fixedTransformInput ||
+            (fAnimate && (cmd == L"pos" || cmd == L"t"))))
+            sub->m_reuseTransform = false;
+#endif
 #ifdef _LUA
         // Direct function call!
         if(!compiled && !sub->m_measuringLayout && m_overrideTags->IsLuaFunction(*this, tag.rawCommand))
@@ -8202,7 +8220,12 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 DWORD c;
                 for(int j = 0; j < 4; j++)
                 {
-                    c = wcstol(CStringW(params[j]).Trim(L"&H"), NULL, 16);
+                    c = tag.corners[j];
+                    if (!fAnimate && !p.IsEmpty())
+                    {
+                        style.mod_grad.color[i][j] = revcolor(c & 0xffffff);
+                        continue;
+                    }
                     style.mod_grad.color[i][j] = !p.IsEmpty()
                                                  ? (((int)CalcAnimation((c & 0xff0000) >> 16, style.mod_grad.color[i][j] & 0xff, fAnimate)) & 0xff
                                                     | ((int)CalcAnimation(c & 0xff00, style.mod_grad.color[i][j] & 0xff00, fAnimate)) & 0xff00
@@ -8233,7 +8256,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 int a;
                 for(int j = 0; j < 4; j++)
                 {
-                    a = wcstol(CStringW(params[j]).Trim(L"&H"), NULL, 16);
+                    a = tag.corners[j];
                     style.mod_grad.alpha[i][j] = !p.IsEmpty()
                                                  ? (int)CalcAnimation(a, style.mod_grad.alpha[i][j], fAnimate) : org.mod_grad.alpha[i][j];
                 }
@@ -9318,6 +9341,17 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     }
                 }
             if (!valid) continue;
+            // Only transform evaluation depends on the clock for the admitted
+            // positioned events. Intersect all constant time intervals. Keep
+            // m_fAnimated set so collision and ordering semantics are preserved.
+            if (sub->m_reuseTransform) {
+                const int end = m_animEnd || m_exactAnimationEnd ? m_animEnd : m_delay;
+                if (m_time < m_animStart)
+                    sub->m_stableThrough = (std::min)(sub->m_stableThrough, m_animStart - 1);
+                else if (m_time >= end)
+                    sub->m_stableFrom = (std::max)(sub->m_stableFrom, (std::max)(m_animStart, end));
+                else sub->m_reuseTransform = false;
+            }
             ParseSSATag(sub, p, style, org, true, slides());
 #else
             ParseSSATag(sub, p, style, org, true);
@@ -9563,8 +9597,19 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
 {
     PROFILE_RENDER_STAGE(Subtitle);
     CSubtitle* previous = nullptr;
-    if (!measuringLayout && m_subtitleCache.Lookup(entry, previous) && !previous->m_fAnimated)
-        return previous;
+    if (!measuringLayout && m_subtitleCache.Lookup(entry, previous)) {
+        if (!previous->m_fAnimated) return previous;
+#ifdef _VSMOD
+        if (previous->m_reuseTransform && !m_doOverrideStyle && m_ePARCompensationType == EPCTDisabled &&
+            previous->m_transformDuration == m_delay && previous->m_stableFrom <= m_time &&
+            m_time <= previous->m_stableThrough && m_textGeometry &&
+            previous->m_fontGeneration == m_textGeometry->generation
+#ifdef _LUA
+            && !hasExternalLua
+#endif
+            ) return previous;
+#endif
+    }
 
     std::unique_ptr<CSubtitle> owned(DNew CSubtitle());
     CSubtitle* sub = owned.get();
@@ -9723,6 +9768,16 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
 #endif
     ParseEffect(sub, GetAt(entry).effect);
 #ifdef _VSMOD
+    sub->m_reuseTransform = !measuringLayout && !m_doOverrideStyle && m_ePARCompensationType == EPCTDisabled &&
+        m_metadataCarriers.empty() && stss.borderStyle == 0 && !stss.mod_jitter.enabled &&
+        !stss.mod_rand.X && !stss.mod_rand.Y && !stss.mod_rand.Z &&
+        !sub->m_effects[EF_BANNER] && !sub->m_effects[EF_SCROLL] &&
+#ifdef _LUA
+        !hasExternalLua && stss.LuaBeforeTransformHandler.IsEmpty() && stss.LuaAfterTransformHandler.IsEmpty() &&
+        stss.LuaCustomTransformHandler.IsEmpty() && stss.LuaRendererHandler.IsEmpty() &&
+        stss.LuaClipStyleHandler.IsEmpty() &&
+#endif
+        str.Find(L"\\t(") >= 0 && str.FindOneOf(L"<[$") < 0;
     if (str.Find(L"chatmode") >= 0 || str.Find(L'[') >= 0)
         for (int left = 0; !sub->m_chat && (left = str.Find(L'{', left)) >= 0;)
         {
@@ -10076,6 +10131,14 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
     if (sub->m_scrollContexts.empty() && !sub->m_chat) sub->ConfigurePerspective();
 #endif
 
+#ifdef _VSMOD
+    if (sub->m_reuseTransform) {
+        sub->m_reuseTransform = sub->m_fAnimated && sub->m_effects[EF_MOVE] && !sub->m_motion &&
+            !sub->m_effects[EF_ORG] && m_textGeometry;
+        sub->m_transformDuration = m_delay;
+        if (m_textGeometry) sub->m_fontGeneration = m_textGeometry->generation;
+    }
+#endif
     m_subtitleCache[entry] = sub;
     delete previous;
     return owned.release();

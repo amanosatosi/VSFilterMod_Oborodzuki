@@ -310,6 +310,9 @@ public:
     std::vector<std::unique_ptr<CWord>> m_eventBox;
     std::unique_ptr<AssNumeric::Context> m_layoutVariables;
     bool m_measuringLayout = false;
+    bool m_reuseTransform = false;
+    int m_stableFrom = INT_MIN, m_stableThrough = INT_MAX, m_transformDuration = 0;
+    unsigned long long m_fontGeneration = 0;
     std::unique_ptr<AssMotion::Track> m_motion;
     std::unique_ptr<std::array<AssNumeric::Operand, 2>> m_origin;
     std::shared_ptr<const RenderGeometry::Curve> m_curve;
