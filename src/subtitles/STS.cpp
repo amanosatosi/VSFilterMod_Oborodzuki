@@ -2545,32 +2545,6 @@ static bool SegmentCompStart(const STSSegment& segment, REFERENCE_TIME start)
 {
     return (segment.start < start);
 }
-#ifdef _VSMOD
-static bool ReadActorInterval(STSEntry& carrier)
-{
-    const CStringW prefix(L"{OBRCC:");
-    if (carrier.str.Left(prefix.GetLength()) != prefix)
-        return carrier.start < carrier.end;
-
-    int p = prefix.GetLength();
-    const auto read = [&](int& result, wchar_t delimiter) {
-        const int first = p;
-        result = 0;
-        while (p < carrier.str.GetLength() && carrier.str[p] >= L'0' && carrier.str[p] <= L'9')
-        {
-            const int digit = carrier.str[p++] - L'0';
-            if (result > (INT_MAX - digit) / 10) return false;
-            result = result * 10 + digit;
-        }
-        return p != first && p < carrier.str.GetLength() && carrier.str[p++] == delimiter;
-    };
-    if (!read(carrier.start, L',') || !read(carrier.end, L'}') || carrier.start >= carrier.end)
-        return false;
-    carrier.str.Delete(0, p);
-    return true;
-}
-#endif
-
 void CSimpleTextSubtitle::Add(CStringW str, bool fUnicode, int start, int end, CString style, CString actor, CString effect, CRect marginRect, int layer, int readorder)
 {
     if(str.Trim().IsEmpty() || start > end) return;
@@ -2602,7 +2576,7 @@ void CSimpleTextSubtitle::Add(CStringW str, bool fUnicode, int start, int end, C
             sub.actor = L"OBRCCS";
         if (m_metadataCarriers.size() < 8192 && str.GetLength() <= 16384 &&
             (!actorMetadata || sub.actor == L"OBRCCS" ||
-                (!sub.actor.IsEmpty() && ReadActorInterval(sub))))
+                (!sub.actor.IsEmpty() && start < end)))
         {
             m_metadataCarriers.push_back(std::move(sub));
             OnChanged();

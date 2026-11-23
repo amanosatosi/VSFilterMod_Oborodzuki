@@ -5135,10 +5135,13 @@ struct ActorMetadata
         }
     }
 
-    const OverrideTags* At(int start) const
+    const OverrideTags* At(int now, double fps) const
     {
-        auto change = std::upper_bound(changes.begin(), changes.end(), start,
-            [](int time, const Change& right) { return time < right.time; });
+        auto change = std::upper_bound(changes.begin(), changes.end(), now,
+            [fps](int time, const Change& right) {
+                // Frame-based tracks use the same conversion as TranslateStart.
+                return time < (fps ? int(right.time * 1000.0 / fps) : right.time);
+            });
         if (change == changes.begin() || (--change)->declaration < 0) return nullptr;
         return &declarations[change->declaration].tags;
     }
@@ -5152,7 +5155,12 @@ struct OverrideTagCache {
     std::shared_ptr<const OverrideTags> Get(const CStringW& text);
 #ifdef _VSMOD
     std::array<std::map<CStringW, AssNumeric::Program>, 2> programs;
-    std::map<int, AssNumeric::Context> layout;
+    struct Layout
+    {
+        const OverrideTags* actorPatch;
+        AssNumeric::Context bounds;
+    };
+    std::map<int, Layout> layout;
     std::map<CStringW, std::shared_ptr<const RenderGeometry::Curve>> curves;
     std::map<CString, OverrideTags> styleMetadata;
     std::map<CString, ActorMetadata> actorMetadata;
@@ -7044,65 +7052,63 @@ int MetadataPaintSlot(const OverrideTag& tag)
 }
 }
 
-void CRenderedTextSubtitle::ApplyMetadata(CSubtitle& sub, const CString& styleName, STSStyle& style, bool initial, bool named, const STSEntry* source)
+void CRenderedTextSubtitle::CompileMetadata()
 {
     if (!m_overrideTags) m_overrideTags = std::make_unique<OverrideTagCache>();
     auto& cache = *m_overrideTags;
-    if (!cache.metadataReady)
+    if (cache.metadataReady) return;
+
+    cache.styleMetadata.clear();
+    cache.actorMetadata.clear();
+    cache.actorStyles.clear();
+    for (const auto& carrier : m_metadataCarriers)
     {
-        cache.styleMetadata.clear();
-        cache.actorMetadata.clear();
-        cache.actorStyles.clear();
-        for (const auto& carrier : m_metadataCarriers)
+        const bool actor = carrier.effect == L"OBRCC";
+        const bool whitelist = actor && carrier.actor == L"OBRCCS";
+        OverrideTags tags;
+        std::vector<CString> styles;
+        const auto& source = carrier.str;
+        for (int i = 0; (i = source.Find(L'{', i)) >= 0;)
         {
-            const bool actor = carrier.effect == L"OBRCC";
-            const bool whitelist = actor && carrier.actor == L"OBRCCS";
-            OverrideTags tags;
-            std::vector<CString> styles;
-            const auto& source = carrier.str;
-            for (int i = 0; (i = source.Find(L'{', i)) >= 0;)
-            {
-                const int end = source.Find(L'}', i + 1);
-                if (end < 0) break;
-                const auto block = source.Mid(i + 1, end - i - 1);
-                if (whitelist)
-                {
-                    if (!block.IsEmpty()) styles.emplace_back(block);
-                }
-                else
-                {
-                    const auto parsed = cache.Get(block);
-                    for (auto tag : *parsed)
-                        if (MetadataTag(tag, actor))
-                        {
-                            if (tag.command == L"vc" || tag.command == L"va")
-                                tag.command = L"1" + tag.command;
-                            tags.push_back(std::move(tag));
-                        }
-                }
-                i = end + 1;
-            }
+            const int end = source.Find(L'}', i + 1);
+            if (end < 0) break;
+            const auto block = source.Mid(i + 1, end - i - 1);
             if (whitelist)
-                cache.actorStyles = std::move(styles);
-            else if (actor)
-                cache.actorMetadata[carrier.actor].declarations.push_back(
-                    {carrier.start, carrier.end, std::move(tags)});
-            else if (!tags.empty())
             {
-                auto& target = cache.styleMetadata[carrier.style];
-                target.insert(target.end(), std::make_move_iterator(tags.begin()), std::make_move_iterator(tags.end()));
+                if (!block.IsEmpty()) styles.emplace_back(block);
             }
+            else
+            {
+                const auto parsed = cache.Get(block);
+                for (auto tag : *parsed)
+                    if (MetadataTag(tag, actor))
+                    {
+                        if (tag.command == L"vc" || tag.command == L"va")
+                            tag.command = L"1" + tag.command;
+                        tags.push_back(std::move(tag));
+                    }
+            }
+            i = end + 1;
         }
-        for (auto& actor : cache.actorMetadata)
-            actor.second.Compile();
-        cache.metadataReady = true;
+        if (whitelist)
+            cache.actorStyles = std::move(styles);
+        else if (actor)
+            cache.actorMetadata[carrier.actor].declarations.push_back(
+                {carrier.start, carrier.end, std::move(tags)});
+        else if (!tags.empty())
+        {
+            auto& target = cache.styleMetadata[carrier.style];
+            target.insert(target.end(), std::make_move_iterator(tags.begin()), std::make_move_iterator(tags.end()));
+        }
     }
-    if (source)
-    {
-        const auto actor = cache.actorMetadata.find(source->actor);
-        if (actor != cache.actorMetadata.end())
-            sub.m_inherited->actorPatch = actor->second.At(source->start);
-    }
+    for (auto& actor : cache.actorMetadata)
+        actor.second.Compile();
+    cache.metadataReady = true;
+}
+
+void CRenderedTextSubtitle::ApplyMetadata(CSubtitle& sub, const CString& styleName, STSStyle& style, bool initial, bool named)
+{
+    const auto& cache = *m_overrideTags;
     STSStyle base(style);
     const auto select = cache.styleMetadata.find(styleName);
     if (select != cache.styleMetadata.end())
@@ -9669,11 +9675,15 @@ double CRenderedTextSubtitle::CalcAnimation(double dst, double src, bool fAnimat
     return(dst);
 }
 
-CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
+CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, const OverrideTags* actorPatch, bool measuringLayout)
 {
     PROFILE_RENDER_STAGE(Subtitle);
     CSubtitle* previous = nullptr;
-    if (!measuringLayout && m_subtitleCache.Lookup(entry, previous)) {
+    if (!measuringLayout && m_subtitleCache.Lookup(entry, previous)
+#ifdef _VSMOD
+        && (previous->m_inherited ? previous->m_inherited->actorPatch : nullptr) == actorPatch
+#endif
+        ) {
         if (!previous->m_fAnimated) return previous;
 #ifdef _VSMOD
         if (previous->m_reuseTransform && !m_doOverrideStyle && m_ePARCompensationType == EPCTDisabled &&
@@ -9709,11 +9719,11 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
             m_overrideTags = std::make_unique<OverrideTagCache>();
         auto& cache = m_overrideTags->layout;
         const auto existing = cache.find(entry);
-        if (!m_doOverrideStyle && existing != cache.end())
-            sub->m_layoutVariables = std::make_unique<AssNumeric::Context>(existing->second);
+        if (!m_doOverrideStyle && existing != cache.end() && existing->second.actorPatch == actorPatch)
+            sub->m_layoutVariables = std::make_unique<AssNumeric::Context>(existing->second.bounds);
         else
         {
-            std::unique_ptr<CSubtitle> baseline(GetSubtitle(entry, true));
+            std::unique_ptr<CSubtitle> baseline(GetSubtitle(entry, actorPatch, true));
             if (baseline && !baseline->IsEmpty() && baseline->m_scalex > 0 && baseline->m_scaley > 0)
             {
                 CRect rect = baseline->m_rect;
@@ -9751,7 +9761,7 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
                 if (!m_doOverrideStyle)
                 {
                     if (cache.size() >= 256) cache.clear();
-                    cache.emplace(entry, bounds);
+                    cache.insert_or_assign(entry, OverrideTagCache::Layout{actorPatch, bounds});
                 }
             }
         }
@@ -9937,7 +9947,8 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
         auto& defaults = *sub->m_inherited;
         defaults.style = source.style;
         defaults.original = stss;
-        ApplyMetadata(*sub, defaults.style, stss, true, false, &source);
+        defaults.actorPatch = actorPatch;
+        ApplyMetadata(*sub, defaults.style, stss, true, false);
         defaults.ruby = sub->m_rubyOptions;
         defaults.wrap = sub->m_wrapStyle;
         orgstss = stss;
@@ -10274,6 +10285,7 @@ STDMETHODIMP_(bool) CRenderedTextSubtitle::IsAnimated(POSITION pos)
 struct LSub
 {
     int idx, layer, readorder;
+    const OverrideTags* actorPatch;
 };
 
 static int lscomp(const void* ls1, const void* ls2)
@@ -10539,12 +10551,38 @@ try
 
     {
         PROFILE_RENDER_STAGE(ActiveEvents);
+#ifdef _VSMOD
+        const bool hasMetadata = !m_metadataCarriers.empty() && !m_doOverrideStyle;
+        if (hasMetadata) CompileMetadata();
+        const bool hasActors = hasMetadata && !m_overrideTags->actorMetadata.empty();
+        bool collisionLayoutChanged = false;
+        const double actorFps = m_mode == FRAME ? fps : 0;
+#endif
         for(ptrdiff_t i = 0, j = stss->subs.GetCount(); i < j; i++)
         {
             const int index = stss->subs[i];
             const auto& entry = GetAt(index);
-            subs.Add({index, entry.layer, entry.readorder});
+            const OverrideTags* actorPatch = nullptr;
+#ifdef _VSMOD
+            if (hasActors && !entry.actor.IsEmpty())
+            {
+                const auto actor = m_overrideTags->actorMetadata.find(entry.actor);
+                if (actor != m_overrideTags->actorMetadata.end())
+                {
+                    actorPatch = actor->second.At(t, actorFps);
+                    CSubtitle* previous = nullptr;
+                    if (!collisionLayoutChanged && m_subtitleCache.Lookup(index, previous))
+                        collisionLayoutChanged =
+                            (previous->m_inherited ? previous->m_inherited->actorPatch : nullptr) != actorPatch;
+                }
+            }
+#endif
+            subs.Add({index, entry.layer, entry.readorder, actorPatch});
         }
+#ifdef _VSMOD
+        // Actor appearance can change geometry while the active dialogue set stays the same.
+        if (collisionLayoutChanged) m_sla.Empty();
+#endif
         qsort(subs.GetData(), subs.GetCount(), sizeof(LSub), lscomp);
     }
 
@@ -10622,7 +10660,7 @@ try
 #endif
         }
 
-        CSubtitle* s = GetSubtitle(entry);
+        CSubtitle* s = GetSubtitle(entry, subs[i].actorPatch);
         if(!s) continue;
 #if defined(_VSMOD) && defined(_LUA)
         if (parallel && hasExternalLua)

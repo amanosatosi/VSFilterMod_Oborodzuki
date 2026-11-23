@@ -475,8 +475,8 @@ class CRenderedTextSubtitle : public CSimpleTextSubtitle, public ISubPicProvider
     bool ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org, bool fAnimate = false,
         const KfxPaint::SlideSettings* inheritedSlides = nullptr, const std::vector<OverrideTag>* compiled = nullptr);
 #ifdef _VSMOD
-    void ApplyMetadata(CSubtitle& subtitle, const CString& styleName, STSStyle& style, bool initial, bool named,
-                       const STSEntry* source = nullptr);
+    void CompileMetadata();
+    void ApplyMetadata(CSubtitle& subtitle, const CString& styleName, STSStyle& style, bool initial, bool named);
 #endif
     bool ParseHtmlTag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org);
 
@@ -486,7 +486,8 @@ class CRenderedTextSubtitle : public CSimpleTextSubtitle, public ISubPicProvider
 
     double CalcAnimation(double dst, double src, bool fAnimate);
 
-    CSubtitle* GetSubtitle(int entry, bool measuringLayout = false);
+    CSubtitle* GetSubtitle(int entry, const std::vector<OverrideTag>* actorPatch,
+                           bool measuringLayout = false);
 
 protected:
     virtual void OnChanged();
