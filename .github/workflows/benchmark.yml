@@ -41,7 +41,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $mangetsu = '3f5640045bbd737661f3858480ec948fece929cb'
+          $mangetsu = '60e06ef0d4535c5403f446fd46b996df4d0d2560'
           $inputs = @(
               @{ kind = 'candidate'; repository = $env:GITHUB_REPOSITORY; ref = $env:GITHUB_SHA },
               @{ kind = 'original'; repository = 'Masaiki/VSFilterMod'; ref = '64ea41f6cf58c2e60e4ede75fe0a56de76ffef54' },
@@ -55,6 +55,7 @@ jobs:
           "mangetsu_revision=$mangetsu" >> $env:GITHUB_OUTPUT
           "renderers=$(ConvertTo-Json -InputObject $inputs -Compress)" >> $env:GITHUB_OUTPUT
           "Primary benchmark: op.fx.4testing.ass (SHA-256 $digest)" >> $env:GITHUB_STEP_SUMMARY
+          "Mangetsu comparison: amanosatosi/libassmod mangetsu branch at $mangetsu" >> $env:GITHUB_STEP_SUMMARY
 
   build-renderer:
     name: Build ${{ matrix.kind }}
@@ -165,6 +166,7 @@ jobs:
     env:
       BENCH_RENDERERS: ${{ needs.prepare.outputs.renderers }}
       BENCH_INPUT_SHA256: ${{ needs.prepare.outputs.input_sha256 }}
+      BENCH_MANGETSU_REVISION: ${{ needs.prepare.outputs.mangetsu_revision }}
       OBORODZUKI_WORKERS: 1
     steps:
       - uses: actions/checkout@v4
