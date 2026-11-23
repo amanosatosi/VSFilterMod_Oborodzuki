@@ -36,7 +36,8 @@ def line(start, end, actor="", effect="", text="", style="Default"):
             f"{style},{actor},0,0,0,{effect},{text}\n")
 
 
-def fixture(transport=None, *, window=INNER_WINDOW, frame=None, actor_comment="", voices=8):
+def fixture(transport=None, *, window=INNER_WINDOW, frame=None, actor_comment="",
+            voices=8, events_format=False):
     rows = []
 
     def emit(start, end, *args, **kwargs):
@@ -76,7 +77,7 @@ def fixture(transport=None, *, window=INNER_WINDOW, frame=None, actor_comment=""
                 tags += r"\vert1\vdir2"
             if i == 6 and patch is None:
                 # The inline reference already contains the reset default.
-                tags += r"\alpha&H70&\alpha"
+                tags += r"\1a&H70&\1a"
             # OBRCCS is ordinary when used as Effect.
             ordinary_effect = "OBRCCS" if i == 7 else ""
             body = SAMPLE if not reset else "明日 မင်္ဂလာပါ"
@@ -84,8 +85,10 @@ def fixture(transport=None, *, window=INNER_WINDOW, frame=None, actor_comment=""
 
     header = HEADER
     if frame is not None:
-        # Aegisub's serialization omits the Format lines.
-        header = "\n".join(row for row in header.split("\n") if not row.startswith("Format:"))
+        # Toshi-ban retains the Events Format line in its filtered serialization.
+        styles, events = header.split("[Events]\n", 1)
+        styles = "\n".join(row for row in styles.split("\n") if not row.startswith("Format:"))
+        header = styles + "[Events]\n" + (events if events_format else "")
     return (header + "".join(rows)).encode("utf-8-sig")
 
 
@@ -122,13 +125,15 @@ def main():
 
     # An initial frame can arrive in any order, with only currently active rows.
     for ms in (5000, 4000, 2999, 3000, 4250, 8000, 9000, 9900):
-        got = RENDER(CSRI, fixture("mixed", frame=ms), 4, [ms])
-        assert got == RENDER(CSRI, fixture(frame=ms), 4, [ms]), ("filtered seek", ms)
+        ref = RENDER(CSRI, fixture(frame=ms), 4, [ms])
+        for events_format in (False, True):
+            got = RENDER(CSRI, fixture("mixed", frame=ms, events_format=events_format), 4, [ms])
+            assert got == ref, ("filtered seek", ms, events_format)
 
     # Move Start and End while paused on the old boundaries and reopen.
     for ms in INNER_WINDOW:
-        paused = RENDER(CSRI, fixture("compact", frame=ms), 2, [ms])
-        edited = RENDER(CSRI, fixture("compact", frame=ms, window=EDITED_WINDOW), 2, [ms])
+        paused = RENDER(CSRI, fixture("compact", frame=ms, events_format=True), 2, [ms])
+        edited = RENDER(CSRI, fixture("compact", frame=ms, window=EDITED_WINDOW, events_format=True), 2, [ms])
         assert paused != edited, ("timing edit did not change pixels", ms)
         assert edited == RENDER(CSRI, fixture(frame=ms, window=EDITED_WINDOW), 2, [ms]), ms
 
