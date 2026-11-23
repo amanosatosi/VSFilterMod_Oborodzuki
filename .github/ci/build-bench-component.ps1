@@ -57,7 +57,7 @@ switch ($Component) {
         } finally {
             Pop-Location
         }
-        $name = if ($Component -in 'candidate','profile') { 'VSFilterModOborodzuki.dll' } else { 'VSFilterMod.dll' }
+        $name = if ($Component -eq 'original' -or !(Test-Path "$source\bin\x64\VSFilter\Release (MOD)\VSFilterModOborodzuki.dll")) { 'VSFilterMod.dll' } else { 'VSFilterModOborodzuki.dll' }
         Copy-Item "$source\bin\x64\VSFilter\Release (MOD)\$name" "$bundle\renderer.dll"
     }
 }

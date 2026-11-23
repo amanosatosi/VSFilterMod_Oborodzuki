@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -24,12 +25,13 @@
 uint64_t cpu_ticks();
 uint64_t frame_hash(const std::vector<uint8_t>& pixels);
 void blend_legacy(const ASS_Image* image, uint8_t* pixels);
+void blend_rgba(const ASS_ImageRGBA* image, uint8_t* pixels);
 
 namespace {
 using Clock = std::chrono::steady_clock;
-constexpr int width = 1920;
-constexpr int height = 1080;
-constexpr int pitch = width * 4;
+const int width = std::getenv("OBORODZUKI_BENCH_4K") ? 3840 : 1920;
+const int height = width * 9 / 16;
+const int pitch = width * 4;
 constexpr int frameCount = 5400;
 constexpr int fps = 60;
 using ProfileReset = void (*)();
@@ -160,7 +162,7 @@ void run_csri(HMODULE dll, const std::vector<char>& input, const Playback& playb
     const auto start = Clock::now();
     const std::unique_ptr<csri_inst, decltype(csri_close)> instance(
         csri_open_mem(csri_renderer_default(), input.data(), input.size(), nullptr), csri_close);
-    const csri_fmt format{CSRI_F_BGR_, width, height};
+    const csri_fmt format{CSRI_F_BGR_, unsigned(width), unsigned(height)};
     if (!instance || csri_request_fmt(instance.get(), &format))
         throw std::runtime_error("CSRI rejected the input file or playback format");
     const auto reset = reinterpret_cast<ProfileReset>(GetProcAddress(dll, "csri_oborodzuki_profile_reset"));
@@ -211,7 +213,9 @@ void run_mangetsu(HMODULE dll, std::vector<char>& input, const Playback& playbac
     API(ass_set_fonts);
     API(ass_render_frame);
     API(ass_render_frame_rgba);
+#ifdef LIBASSMOD_FEATURE_BLEND_BGRA
     API(ass_composite_images_bgra);
+#endif
     API(ass_free_images_rgba);
 
     const auto start = Clock::now();
@@ -235,8 +239,12 @@ void run_mangetsu(HMODULE dll, std::vector<char>& input, const Playback& playbac
         if (rgba) {
             const std::unique_ptr<ASS_ImageRGBA, decltype(ass_free_images_rgba)> images(
                 ass_render_frame_rgba(renderer.get(), track.get(), timestamp, nullptr), ass_free_images_rgba);
+#ifdef LIBASSMOD_FEATURE_BLEND_BGRA
             if (images && ass_composite_images_bgra(images.get(), pixels, width, height, pitch))
                 throw std::runtime_error("Mangetsu RGBA compositing failed");
+#else
+            blend_rgba(images.get(), pixels);
+#endif
         } else {
             blend_legacy(ass_render_frame(renderer.get(), track.get(), timestamp, nullptr), pixels);
         }

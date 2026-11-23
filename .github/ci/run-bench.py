@@ -109,7 +109,7 @@ environment = json.loads((output / "environment.json").read_text(encoding="utf-8
 registered_fonts = {name.casefold() for name in environment["registered_fonts"]}
 missing_fonts = sorted(font for font in style_fonts if font.casefold() not in registered_fonts)
 engines = [
-    ("Original VSFilterMod r5.2.7", "csri", original),
+    ("Original VSFilterMod", "csri", original),
     ("Oborodzuki baseline", "csri", baseline),
     ("Mangetsu legacy", "legacy", mangetsu),
     ("Mangetsu RGBA", "rgba", mangetsu),

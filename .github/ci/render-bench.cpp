@@ -18,9 +18,9 @@
 #include "../../src/subtitles/RenderProfile.h"
 
 using Clock = std::chrono::steady_clock;
-constexpr int width = 1920;
-constexpr int height = 1080;
-constexpr int pitch = width * 4;
+const int width = std::getenv("OBORODZUKI_BENCH_4K") ? 3840 : 1920;
+const int height = width * 9 / 16;
+const int pitch = width * 4;
 
 template <class Function>
 Function symbol(HMODULE dll, const char* name)
@@ -66,6 +66,28 @@ void blend_legacy(const ASS_Image* image, uint8_t* pixels)
                 auto dst = pixels + y * pitch + x * 4;
                 for (int c = 0; c < 3; ++c)
                     dst[c] = uint8_t((dst[c] * (255 - a) + color[c] * a + 127) / 255);
+            }
+        }
+    }
+}
+
+// Some Mangetsu revisions return premultiplied RGBA tiles without exporting
+// a host compositor. Clip and blend them in their supplied list order.
+void blend_rgba(const ASS_ImageRGBA* image, uint8_t* pixels)
+{
+    for (; image; image = image->next) {
+        const int left = std::max(0, image->dst_x);
+        const int right = std::min(width, image->dst_x + image->w);
+        const int top = std::max(0, image->dst_y);
+        const int bottom = std::min(height, image->dst_y + image->h);
+        if (right <= left || bottom <= top) continue;
+        for (int y = top; y < bottom; ++y) {
+            auto src = image->rgba + (y - image->dst_y) * image->stride + 4 * (left - image->dst_x);
+            auto dst = pixels + y * pitch + 4 * left;
+            for (int x = left; x < right; ++x, src += 4, dst += 4) {
+                unsigned inverse = 255 - src[3];
+                for (int c = 0; c < 4; ++c)
+                    dst[c] = uint8_t(src[c == 3 ? 3 : 2 - c] + (dst[c] * inverse + 127) / 255);
             }
         }
     }
@@ -165,10 +187,11 @@ void measure(Render render, const Workload& workload, double setup_ms,
     if (!GetProcessMemoryInfo(GetCurrentProcess(), &memory, sizeof(memory)))
         throw std::runtime_error("GetProcessMemoryInfo failed");
     std::printf("{\"frames\":%d,\"warmup_frames\":%d,\"setup_ms\":%.6f,\"first_frame_ms\":%.6f,\"avg_ms\":%.6f,"
-        "\"median_ms\":%.6f,\"p95_ms\":%.6f,\"fps\":%.3f,\"cpu_ms\":%.3f,"
+        "\"median_ms\":%.6f,\"p95_ms\":%.6f,\"p99_ms\":%.6f,\"worst_ms\":%.6f,\"fps\":%.3f,\"cpu_ms\":%.3f,"
         "\"cpu_percent_of_one_core\":%.3f,\"peak_working_set_bytes\":%llu,\"hashes\":[",
         count, warmup, setup_ms, first, total / count, (timings[count / 2 - 1] + timings[count / 2]) / 2,
-        timings[(count * 95 + 99) / 100 - 1], 1000 * count / total, cpu_ms, 100 * cpu_ms / total,
+        timings[(count * 95 + 99) / 100 - 1], timings[(count * 99 + 99) / 100 - 1], timings.back(),
+        1000 * count / total, cpu_ms, 100 * cpu_ms / total,
         static_cast<unsigned long long>(memory.PeakWorkingSetSize));
     for (size_t i = 0; i < hashes.size(); ++i)
         std::printf("%s\"%016llx\"", i ? "," : "", static_cast<unsigned long long>(hashes[i]));
@@ -192,7 +215,7 @@ void run_csri(HMODULE dll, const std::vector<char>& script, const Workload& work
     API(csri_close);
     const auto start = Clock::now();
     auto instance = csri_open_mem(csri_renderer_default(), script.data(), script.size(), nullptr);
-    constexpr csri_fmt format{CSRI_F_BGR_, width, height};
+    const csri_fmt format{CSRI_F_BGR_, unsigned(width), unsigned(height)};
     if (!instance || csri_request_fmt(instance, &format))
         throw std::runtime_error("CSRI initialization failed");
     auto reset = reinterpret_cast<ProfileReset>(GetProcAddress(dll, "csri_oborodzuki_profile_reset"));
@@ -220,7 +243,9 @@ void run_mangetsu(HMODULE dll, std::vector<char>& script, const Workload& worklo
     API(ass_free_track);
     API(ass_render_frame);
     API(ass_render_frame_rgba);
+#ifdef LIBASSMOD_FEATURE_BLEND_BGRA
     API(ass_composite_images_bgra);
+#endif
     API(ass_free_images_rgba);
 
     const auto start = Clock::now();
@@ -239,7 +264,12 @@ void run_mangetsu(HMODULE dll, std::vector<char>& script, const Workload& worklo
         if (rgba) {
             auto images = ass_render_frame_rgba(renderer, track, t, nullptr);
             if (images) {
+#ifdef LIBASSMOD_FEATURE_BLEND_BGRA
                 const int result = ass_composite_images_bgra(images, pixels, width, height, pitch);
+#else
+                blend_rgba(images, pixels);
+                const int result = 0;
+#endif
                 ass_free_images_rgba(images);
                 if (result)
                     throw std::runtime_error("Mangetsu RGBA compositing failed");

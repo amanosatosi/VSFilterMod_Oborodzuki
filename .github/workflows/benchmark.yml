@@ -2,7 +2,7 @@ name: Renderer benchmarks
 
 on:
   push:
-    branches: [develop/oborodzuki, feature/parallel-event-rendering, codex/kfx-paint-extensions, codex/mangetsu-extensions-round-2, codex/mangetsu-extensions-round-3, codex/mangetsu-extensions-round-4]
+    branches: [develop/oborodzuki, feature/parallel-event-rendering, codex/kfx-paint-extensions, codex/mangetsu-extensions-round-2, codex/mangetsu-extensions-round-3, codex/mangetsu-extensions-round-4, astra/extra-optimization-JustInCase]
     paths:
       - 'src/**'
       - 'include/**'
@@ -41,11 +41,11 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $mangetsu = '60e06ef0d4535c5403f446fd46b996df4d0d2560'
+          $mangetsu = '3f5640045bbd737661f3858480ec948fece929cb'
           $inputs = @(
               @{ kind = 'candidate'; repository = $env:GITHUB_REPOSITORY; ref = $env:GITHUB_SHA },
-              @{ kind = 'original'; repository = 'Masaiki/VSFilterMod'; ref = '808f492f2e6feb92c975cbed9faaa7b4272cfec5' },
-              @{ kind = 'baseline'; repository = $env:GITHUB_REPOSITORY; ref = 'b31674c1341487b706712ecc213482562687781a' },
+              @{ kind = 'original'; repository = 'Masaiki/VSFilterMod'; ref = '64ea41f6cf58c2e60e4ede75fe0a56de76ffef54' },
+              @{ kind = 'baseline'; repository = $env:GITHUB_REPOSITORY; ref = '79db5609394b6f27465cd7f24ccf804f803e075e' },
               @{ kind = 'mangetsu'; repository = 'amanosatosi/libassmod'; ref = $mangetsu }
           )
           $digest = (Get-FileHash -LiteralPath .github/ci/op.fx.4testing.ass).Hash.ToLowerInvariant()
@@ -145,6 +145,8 @@ jobs:
         run: |
           call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
           pwsh -NoProfile -File .github\ci\build-bench-component.ps1 -Component harness -Revision "%GITHUB_SHA%" || exit /b 1
+          set "MANGETSU_REVISION=${{ needs.prepare.outputs.mangetsu_revision }}"
+          pwsh -NoProfile -File .github\kfx\build-harness.ps1 -Revision "%GITHUB_SHA%" || exit /b 1
       - uses: actions/upload-artifact@v4
         with:
           name: harness-${{ github.sha }}
@@ -159,6 +161,7 @@ jobs:
     env:
       BENCH_RENDERERS: ${{ needs.prepare.outputs.renderers }}
       BENCH_INPUT_SHA256: ${{ needs.prepare.outputs.input_sha256 }}
+      OBORODZUKI_WORKERS: 1
     steps:
       - uses: actions/checkout@v4
         with:
@@ -208,4 +211,5 @@ jobs:
           path: |
             profile-results/
             bundle/build.json
+            bundle/renderer.dll
           if-no-files-found: warn
