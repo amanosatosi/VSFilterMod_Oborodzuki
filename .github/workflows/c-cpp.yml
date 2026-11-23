@@ -51,7 +51,7 @@ jobs:
           copy README.md dist\ || exit /b 1
 
       - name: Run focused CSRI gradient direction pixels
-        if: inputs.gradient_direction && matrix.arch == 'x64'
+        if: (inputs.gradient_direction || contains(github.event.head_commit.message, 'Gradient-Direction-CI')) && matrix.arch == 'x64'
         run: python .github/parallel/gradient-slide-direction.py dist/VSFilterModOborodzuki.dll
 
       - uses: actions/upload-artifact@v4
