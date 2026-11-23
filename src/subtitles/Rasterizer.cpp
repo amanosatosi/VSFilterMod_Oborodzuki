@@ -29,6 +29,7 @@
 #include <algorithm>
 #include "Rasterizer.h"
 #include "SeparableFilter.h"
+#include "RoundOutline.h"
 #include "OverlayMix.h"
 
 #ifndef _MAX	/* avoid collision with common (nonconforming) macros */
@@ -820,8 +821,29 @@ bool Rasterizer::WidenOutlineByRow(int rx, int ry)
     auto row = &rowStorage[0];
     auto scratch = &scratchStorage[0];
     mWideOutline.reserve(mOutline.size());
+    RoundOutline::Rows strips;
+    const bool useStrips = (g_cpuid.m_flags & CCpuID::sse2) &&
+        RoundOutline::Build(rows, sourceSpans, radius, strips);
     for (int y = -ry; y < mHeight + ry; ++y)
     {
+        const auto packedY = (static_cast<unsigned __int64>(y) + 0x40000000) << 32;
+        if (useStrips && strips.safe[y + ry])
+        {
+            auto& spans = strips.intervals[y + ry];
+            std::sort(spans.begin(), spans.end());
+            for (size_t i = 0; i < spans.size();)
+            {
+                auto merged = spans[i++];
+                while (i < spans.size() && spans[i].first <= merged.second)
+                {
+                    merged.second = (std::max)(merged.second, spans[i].second);
+                    ++i;
+                }
+                mWideOutline.emplace_back(packedY | DWORD(0x40000000 + merged.first),
+                    packedY | DWORD(0x40000000 + merged.second));
+            }
+            continue;
+        }
         size_t rowCount = 0;
         const int firstSource = min(y + ry, mHeight - 1);
         const int lastSource = max(y - ry, 0);
@@ -911,7 +933,6 @@ bool Rasterizer::WidenOutlineByRow(int rx, int ry)
                 rowCount = count;
             }
         }
-        const auto packedY = (static_cast<unsigned __int64>(y) + 0x40000000) << 32;
         for (size_t i = 0; i < rowCount; ++i)
             mWideOutline.emplace_back(packedY | row[i].first, packedY | row[i].second);
     }
@@ -1283,7 +1304,13 @@ bool Rasterizer::Rasterize(int xsub, int ysub, int fBlur, double fGaussianBlurX,
     if(fGaussianBlur > 0)
     {
         GaussianKernel filter(fGaussianBlur);
-        if(mOverlayWidth >= filter.width && mOverlayHeight >= filter.width)
+        if (mOverlayWidth >= filter.width && mOverlayHeight >= filter.width &&
+            (g_cpuid.m_flags & CCpuID::sse2) && filter.divisor > 1 && filter.divisor <= 257)
+        {
+            GaussianCoverage(mpOverlayBuffer, mOverlayWidth, mOverlayHeight, !mWideOutline.empty(),
+                filter, direction);
+        }
+        else if(mOverlayWidth >= filter.width && mOverlayHeight >= filter.width)
         {
             size_t pitch = mOverlayWidth * 2;
 

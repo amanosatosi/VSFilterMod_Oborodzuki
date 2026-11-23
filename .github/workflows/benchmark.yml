@@ -147,6 +147,10 @@ jobs:
           pwsh -NoProfile -File .github\ci\build-bench-component.ps1 -Component harness -Revision "%GITHUB_SHA%" || exit /b 1
           set "MANGETSU_REVISION=${{ needs.prepare.outputs.mangetsu_revision }}"
           pwsh -NoProfile -File .github\kfx\build-harness.ps1 -Revision "%GITHUB_SHA%" || exit /b 1
+          cl /nologo /EHsc /O2 /MT .github\parallel\gaussian-check.cpp /Fe:gaussian-check.exe || exit /b 1
+          gaussian-check.exe || exit /b 1
+          cl /nologo /EHsc /O2 /MT .github\parallel\outline-check.cpp /Fe:outline-check.exe || exit /b 1
+          outline-check.exe || exit /b 1
       - uses: actions/upload-artifact@v4
         with:
           name: harness-${{ github.sha }}

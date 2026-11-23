@@ -27,6 +27,8 @@
 #include <omp.h>
 #endif
 #include <math.h>
+#include <algorithm>
+#include <emmintrin.h>
 #include <vector>
 
 inline unsigned char NormalizeFilterValue(int sum, int divisor)
@@ -148,3 +150,74 @@ struct GaussianKernel
         delete[] kernel;
     }
 };
+
+// Filter eight neighbouring coverage bytes at once. Symmetric taps share one
+// multiply. The caller checks that even an all-255 row fits a 16-bit sum.
+inline void GaussianRow(const std::vector<const unsigned char*>& taps,
+    const GaussianKernel& filter, unsigned char* result, int width)
+{
+    const auto zero = _mm_setzero_si128();
+    const auto divisor = _mm_set1_epi16(short(filter.divisor));
+    const auto reciprocal = _mm_set1_epi16(short(65536 / filter.divisor));
+    const auto load = [&](const unsigned char* src) {
+        return _mm_unpacklo_epi8(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(src)), zero);
+    };
+    const int mid = filter.width / 2;
+    int x = 0;
+    for (; x <= width - 8; x += 8) {
+        auto sum = _mm_mullo_epi16(load(taps[mid] + x), _mm_set1_epi16(short(filter.kernel[mid])));
+        for (int k = 0; k < mid; ++k) {
+            const auto pair = _mm_add_epi16(load(taps[k] + x), load(taps[2 * mid - k] + x));
+            sum = _mm_add_epi16(sum, _mm_mullo_epi16(pair, _mm_set1_epi16(short(filter.kernel[k]))));
+        }
+        // The truncated reciprocal underestimates by at most one. Its
+        // remainder fits in a signed lane (less than twice the divisor).
+        auto q = _mm_mulhi_epu16(sum, reciprocal);
+        const auto remainder = _mm_sub_epi16(sum, _mm_mullo_epi16(q, divisor));
+        q = _mm_sub_epi16(q, _mm_cmpgt_epi16(remainder, _mm_set1_epi16(short(filter.divisor - 1))));
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(result + x), _mm_packus_epi16(q, zero));
+    }
+    for (; x < width; ++x) {
+        int sum = 0;
+        for (int k = 0; k < filter.width; ++k)
+            sum += taps[k][x] * filter.kernel[k];
+        result[x] = static_cast<unsigned char>(sum / filter.divisor);
+    }
+}
+
+inline void GaussianCoverage(unsigned char* pixels, int width, int height, int channel,
+    const GaussianKernel& filter, int direction)
+{
+    const int radius = filter.width / 2;
+    const size_t pitch = size_t(width) * 2;
+    std::vector<unsigned char> intermediate(size_t(width) * height);
+    std::vector<unsigned char> row(size_t(width) + 2 * radius);
+    std::vector<const unsigned char*> taps(filter.width);
+    for (int k = 0; k < filter.width; ++k) taps[k] = row.data() + k;
+    for (int y = 0; y < height; ++y) {
+        const auto* src = pixels + y * pitch + channel;
+        auto* dst = intermediate.data() + size_t(y) * width;
+        auto* center = direction == 2 ? dst : row.data() + radius;
+        for (int x = 0; x < width; ++x) center[x] = src[2 * x];
+        if (direction != 2) {
+            std::copy_n(center + width - radius, radius, row.data());
+            std::copy_n(center, radius, center + width);
+            GaussianRow(taps, filter, dst, width);
+        }
+    }
+    for (int y = 0; y < height; ++y) {
+        const auto* src = intermediate.data() + size_t(y) * width;
+        if (direction != 1) {
+            for (int k = 0; k < filter.width; ++k) {
+                int iy = y + k - radius;
+                if (iy < 0) iy += height;
+                if (iy >= height) iy -= height;
+                taps[k] = intermediate.data() + size_t(iy) * width;
+            }
+            GaussianRow(taps, filter, row.data(), width);
+            src = row.data();
+        }
+        auto* dst = pixels + y * pitch + channel;
+        for (int x = 0; x < width; ++x) dst[2 * x] = src[x];
+    }
+}
