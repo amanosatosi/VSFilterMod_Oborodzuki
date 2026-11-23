@@ -41,7 +41,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $mangetsu = '60e06ef0d4535c5403f446fd46b996df4d0d2560'
+          $mangetsu = '571e014931a7eb2c1d3632761aebbd3b4e84f838'
           $inputs = @(
               @{ kind = 'candidate'; repository = $env:GITHUB_REPOSITORY; ref = $env:GITHUB_SHA },
               @{ kind = 'original'; repository = 'Masaiki/VSFilterMod'; ref = '64ea41f6cf58c2e60e4ede75fe0a56de76ffef54' },

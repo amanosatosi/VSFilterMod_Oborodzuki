@@ -17,7 +17,7 @@ class Frame(c.Structure):
     _fields_ = [("pixfmt", c.c_int), ("planes", c.c_void_p * 4), ("strides", c.c_ssize_t * 4)]
 
 
-def render(path, source, workers):
+def render(path, source, workers, times=None, sizes=((640, 360), (923, 519), (640, 360))):
     os.environ["OBORODZUKI_WORKERS"] = str(workers)
     dll = c.CDLL(str(path.resolve()))
     def api(name, result, *args):
@@ -32,15 +32,16 @@ def render(path, source, workers):
     fmt = api("request_fmt", c.c_int, c.c_void_p, c.POINTER(Format))
     draw = api("render", None, c.c_void_p, c.POINTER(Frame), c.c_double)
     close = api("close", None, c.c_void_p)
+    if times is None:
+        times = [0, 1000, 1099, 1100, 1150, 1199, 1200, 1201, 1450, 1499,
+                 1500, 1537, 1620, 1999, 2500, 1150, 1201, 1100, 1000, 2500]
     results = []
     try:
-        for w, h in [(640, 360), (923, 519), (640, 360)]:
+        for w, h in sizes:
             if fmt(instance, c.byref(Format(BGRX, w, h))):
                 raise RuntimeError("CSRI rejected the test dimensions")
             stride = 4 * w + 12
             pixelbuf = c.create_string_buffer(stride * h)
-            times = [0, 1000, 1099, 1100, 1150, 1199, 1200, 1201, 1450, 1499,
-                     1500, 1537, 1620, 1999, 2500, 1150, 1201, 1100, 1000, 2500]
             for background in [bytes((0, 0, 0, 255)), bytes((255, 255, 255, 255))]:
                 blank = (background * w + bytes([31]) * 12) * h
                 for ms in times:

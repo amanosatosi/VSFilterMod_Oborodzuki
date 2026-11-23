@@ -5083,6 +5083,68 @@ struct OverrideTag {
 
 using OverrideTags = std::vector<OverrideTag>;
 
+#ifdef _VSMOD
+struct ActorMetadata
+{
+    struct Declaration
+    {
+        int start, end;
+        OverrideTags tags;
+    };
+    struct Change
+    {
+        int time;
+        int declaration;
+    };
+    std::vector<Declaration> declarations;
+    std::vector<Change> changes;
+
+    void Compile()
+    {
+        struct Boundary
+        {
+            int time, declaration;
+            bool start;
+        };
+        std::vector<Boundary> boundaries;
+        boundaries.reserve(2 * declarations.size());
+        for (int i = 0; i < int(declarations.size()); ++i)
+        {
+            const auto& declaration = declarations[i];
+            if (declaration.start >= declaration.end) continue;
+            boundaries.push_back({declaration.start, i, true});
+            boundaries.push_back({declaration.end, i, false});
+        }
+        std::sort(boundaries.begin(), boundaries.end(), [](const auto& a, const auto& b) {
+            return a.time < b.time;
+        });
+        std::set<int> active;
+        for (size_t i = 0; i < boundaries.size();)
+        {
+            const int time = boundaries[i].time;
+            do
+            {
+                const auto& boundary = boundaries[i++];
+                if (boundary.start) active.insert(boundary.declaration);
+                else active.erase(boundary.declaration);
+            }
+            while (i < boundaries.size() && boundaries[i].time == time);
+            const int selected = active.empty() ? -1 : *active.rbegin();
+            if (changes.empty() || changes.back().declaration != selected)
+                changes.push_back({time, selected});
+        }
+    }
+
+    const OverrideTags* At(int start) const
+    {
+        auto change = std::upper_bound(changes.begin(), changes.end(), start,
+            [](int time, const Change& right) { return time < right.time; });
+        if (change == changes.begin() || (--change)->declaration < 0) return nullptr;
+        return &declarations[change->declaration].tags;
+    }
+};
+#endif
+
 struct OverrideTagCache {
     std::map<CStringW, std::shared_ptr<const OverrideTags>> blocks;
     size_t characters = 0;
@@ -5092,7 +5154,8 @@ struct OverrideTagCache {
     std::array<std::map<CStringW, AssNumeric::Program>, 2> programs;
     std::map<int, AssNumeric::Context> layout;
     std::map<CStringW, std::shared_ptr<const RenderGeometry::Curve>> curves;
-    std::map<CString, OverrideTags> styleMetadata, actorMetadata;
+    std::map<CString, OverrideTags> styleMetadata;
+    std::map<CString, ActorMetadata> actorMetadata;
     std::vector<CString> actorStyles;
     bool metadataReady = false;
 
@@ -6981,7 +7044,7 @@ int MetadataPaintSlot(const OverrideTag& tag)
 }
 }
 
-void CRenderedTextSubtitle::ApplyMetadata(CSubtitle& sub, const CString& styleName, STSStyle& style, bool initial, bool named)
+void CRenderedTextSubtitle::ApplyMetadata(CSubtitle& sub, const CString& styleName, STSStyle& style, bool initial, bool named, const STSEntry* source)
 {
     if (!m_overrideTags) m_overrideTags = std::make_unique<OverrideTagCache>();
     auto& cache = *m_overrideTags;
@@ -6992,8 +7055,8 @@ void CRenderedTextSubtitle::ApplyMetadata(CSubtitle& sub, const CString& styleNa
         cache.actorStyles.clear();
         for (const auto& carrier : m_metadataCarriers)
         {
-            const bool actor = carrier.effect == L"oborodzuki-colorcoding";
-            const bool whitelist = actor && carrier.actor == L"oborodzuki-colorcode-applied-styles";
+            const bool actor = carrier.effect == L"OBRCC";
+            const bool whitelist = actor && carrier.actor == L"OBRCCS";
             OverrideTags tags;
             std::vector<CString> styles;
             const auto& source = carrier.str;
@@ -7021,17 +7084,24 @@ void CRenderedTextSubtitle::ApplyMetadata(CSubtitle& sub, const CString& styleNa
             }
             if (whitelist)
                 cache.actorStyles = std::move(styles);
+            else if (actor)
+                cache.actorMetadata[carrier.actor].declarations.push_back(
+                    {carrier.start, carrier.end, std::move(tags)});
             else if (!tags.empty())
             {
-                if (actor && !carrier.actor.IsEmpty()) cache.actorMetadata[carrier.actor] = std::move(tags);
-                else if (!actor)
-                {
-                    auto& target = cache.styleMetadata[carrier.style];
-                    target.insert(target.end(), std::make_move_iterator(tags.begin()), std::make_move_iterator(tags.end()));
-                }
+                auto& target = cache.styleMetadata[carrier.style];
+                target.insert(target.end(), std::make_move_iterator(tags.begin()), std::make_move_iterator(tags.end()));
             }
         }
+        for (auto& actor : cache.actorMetadata)
+            actor.second.Compile();
         cache.metadataReady = true;
+    }
+    if (source)
+    {
+        const auto actor = cache.actorMetadata.find(source->actor);
+        if (actor != cache.actorMetadata.end())
+            sub.m_inherited->actorPatch = actor->second.At(source->start);
     }
     STSStyle base(style);
     const auto select = cache.styleMetadata.find(styleName);
@@ -7061,15 +7131,12 @@ void CRenderedTextSubtitle::ApplyMetadata(CSubtitle& sub, const CString& styleNa
                     bits != style.mod_grad.legacyParts;
         }
     }
-    if (cache.actorStyles.empty() ? !named :
-        std::find(cache.actorStyles.begin(), cache.actorStyles.end(), styleName) != cache.actorStyles.end())
+    const auto* patch = sub.m_inherited->actorPatch;
+    if (patch && !patch->empty() && (cache.actorStyles.empty() ? !named :
+        std::find(cache.actorStyles.begin(), cache.actorStyles.end(), styleName) != cache.actorStyles.end()))
     {
-        const auto actor = cache.actorMetadata.find(sub.m_inherited->actor);
-        if (actor != cache.actorMetadata.end())
-        {
-            STSStyle inherited(style);
-            ParseSSATag(&sub, {}, style, inherited, false, nullptr, &actor->second);
-        }
+        STSStyle inherited(style);
+        ParseSSATag(&sub, {}, style, inherited, false, nullptr, patch);
     }
 }
 #endif
@@ -9869,9 +9936,8 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
         sub->m_inherited = std::make_unique<CSubtitle::InheritedMetadata>();
         auto& defaults = *sub->m_inherited;
         defaults.style = source.style;
-        defaults.actor = source.actor;
         defaults.original = stss;
-        ApplyMetadata(*sub, defaults.style, stss, true, false);
+        ApplyMetadata(*sub, defaults.style, stss, true, false, &source);
         defaults.ruby = sub->m_rubyOptions;
         defaults.wrap = sub->m_wrapStyle;
         orgstss = stss;

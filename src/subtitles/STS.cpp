@@ -27,7 +27,10 @@
 #include <atlstr.h>
 
 #include "RealTextParser.h"
+#include <algorithm>
 #include <atomic>
+#include <climits>
+#include <cstdint>
 #include <fstream>
 
 static std::atomic<unsigned> subtitleFontRevision{0};
@@ -2457,8 +2460,16 @@ void CSimpleTextSubtitle::Append(CSimpleTextSubtitle& sts, int timeoff)
     CopyStyles(sts.m_styles, true);
 #ifdef _VSMOD
     for (const auto& carrier : sts.m_metadataCarriers)
-        if (m_metadataCarriers.size() < 8192)
-            m_metadataCarriers.push_back(carrier);
+    {
+        if (m_metadataCarriers.size() >= 8192) break;
+        auto copy = carrier;
+        if (copy.effect == L"OBRCC" && copy.actor != L"OBRCCS")
+        {
+            copy.start = int((std::min)(int64_t(INT_MAX), int64_t(copy.start) + timeoff));
+            copy.end = int((std::min)(int64_t(INT_MAX), int64_t(copy.end) + timeoff));
+        }
+        m_metadataCarriers.push_back(std::move(copy));
+    }
 #endif
 
     for(ptrdiff_t i = 0, j = sts.GetCount(); i < j; i++)
@@ -2534,6 +2545,32 @@ static bool SegmentCompStart(const STSSegment& segment, REFERENCE_TIME start)
 {
     return (segment.start < start);
 }
+#ifdef _VSMOD
+static bool ReadActorInterval(STSEntry& carrier)
+{
+    const CStringW prefix(L"{OBRCC:");
+    if (carrier.str.Left(prefix.GetLength()) != prefix)
+        return carrier.start < carrier.end;
+
+    int p = prefix.GetLength();
+    const auto read = [&](int& result, wchar_t delimiter) {
+        const int first = p;
+        result = 0;
+        while (p < carrier.str.GetLength() && carrier.str[p] >= L'0' && carrier.str[p] <= L'9')
+        {
+            const int digit = carrier.str[p++] - L'0';
+            if (result > (INT_MAX - digit) / 10) return false;
+            result = result * 10 + digit;
+        }
+        return p != first && p < carrier.str.GetLength() && carrier.str[p++] == delimiter;
+    };
+    if (!read(carrier.start, L',') || !read(carrier.end, L'}') || carrier.start >= carrier.end)
+        return false;
+    carrier.str.Delete(0, p);
+    return true;
+}
+#endif
+
 void CSimpleTextSubtitle::Add(CStringW str, bool fUnicode, int start, int end, CString style, CString actor, CString effect, CRect marginRect, int layer, int readorder)
 {
     if(str.Trim().IsEmpty() || start > end) return;
@@ -2556,9 +2593,16 @@ void CSimpleTextSubtitle::Add(CStringW str, bool fUnicode, int start, int end, C
     sub.readorder = readorder < 0 ? GetCount() : readorder;
 
 #ifdef _VSMOD
-    if (effect == L"oborodzuki-style" || effect == L"oborodzuki-colorcoding")
+    const bool actorMetadata = effect == L"OBRCC" || effect == L"oborodzuki-colorcoding";
+    if (actorMetadata || effect == L"OBRS" || effect == L"oborodzuki-style")
     {
-        if (start < end && m_metadataCarriers.size() < 8192 && str.GetLength() <= 16384)
+        // Normalize the in-memory carrier, preserving the source ASS bytes.
+        sub.effect = actorMetadata ? L"OBRCC" : L"OBRS";
+        if (actorMetadata && sub.actor == L"oborodzuki-colorcode-applied-styles")
+            sub.actor = L"OBRCCS";
+        if (m_metadataCarriers.size() < 8192 && str.GetLength() <= 16384 &&
+            (!actorMetadata || sub.actor == L"OBRCCS" ||
+                (!sub.actor.IsEmpty() && ReadActorInterval(sub))))
         {
             m_metadataCarriers.push_back(std::move(sub));
             OnChanged();
@@ -2833,6 +2877,14 @@ void CSimpleTextSubtitle::ConvertToTimeBased(double fps)
         stse.end = int(1.0 * stse.end * 1000 / fps + 0.5);
     }
 
+#ifdef _VSMOD
+    for (auto& carrier : m_metadataCarriers)
+    {
+        carrier.start = int(1.0 * carrier.start * 1000 / fps + 0.5);
+        carrier.end = int(1.0 * carrier.end * 1000 / fps + 0.5);
+    }
+#endif
+
     m_mode = TIME;
 
     CreateSegments();
@@ -2848,6 +2900,14 @@ void CSimpleTextSubtitle::ConvertToFrameBased(double fps)
         stse.start = int(1.0 * stse.start * fps / 1000 + 0.5);
         stse.end = int(1.0 * stse.end * fps / 1000 + 0.5);
     }
+
+#ifdef _VSMOD
+    for (auto& carrier : m_metadataCarriers)
+    {
+        carrier.start = int(1.0 * carrier.start * fps / 1000 + 0.5);
+        carrier.end = int(1.0 * carrier.end * fps / 1000 + 0.5);
+    }
+#endif
 
     m_mode = FRAME;
 

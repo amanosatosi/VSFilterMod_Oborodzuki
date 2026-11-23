@@ -292,6 +292,8 @@ public:
 #if defined (_VSMOD) && defined(_LUA)
 class CSubtitle : public CAtlList<CLine*>, public CMyLua
 #else
+struct OverrideTag;
+
 class CSubtitle : public CAtlList<CLine*>
 #endif
 {
@@ -343,7 +345,8 @@ public:
     Furigana::Options m_rubyOptions;
     struct InheritedMetadata
     {
-        CString style, actor;
+        CString style;
+        const std::vector<OverrideTag>* actorPatch = nullptr;
         STSStyle original;
         Furigana::Options ruby;
         int wrap = 0, boxMode = -1;
@@ -424,7 +427,6 @@ public:
 };
 
 struct OverrideTagCache;
-struct OverrideTag;
 struct TextGeometryCache;
 struct TextDeviceContext;
 class EventWorkerPool;
@@ -473,7 +475,8 @@ class CRenderedTextSubtitle : public CSimpleTextSubtitle, public ISubPicProvider
     bool ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org, bool fAnimate = false,
         const KfxPaint::SlideSettings* inheritedSlides = nullptr, const std::vector<OverrideTag>* compiled = nullptr);
 #ifdef _VSMOD
-    void ApplyMetadata(CSubtitle& subtitle, const CString& styleName, STSStyle& style, bool initial, bool named);
+    void ApplyMetadata(CSubtitle& subtitle, const CString& styleName, STSStyle& style, bool initial, bool named,
+                       const STSEntry* source = nullptr);
 #endif
     bool ParseHtmlTag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org);
 
