@@ -198,6 +198,7 @@ struct TextGeometry
 
 struct TextGeometryCache
 {
+    Rasterizer::OutlineCache outlines;
     std::unordered_map<TextGeometryKey, TextGeometry, TextGeometryHash> runs;
     CRegKey machineFonts, userFonts;
     FILETIME machineStamp{}, userStamp{};
@@ -1230,7 +1231,16 @@ void CWord::Paint(CPoint p, CPoint org)
 #endif
 
 #ifdef _VSMOD
-        if(!ScanConvert(m_style.borderStyle == 3)) return;
+        const bool nativeOutline = HasNativeOutline();
+        const bool plainOutline = activeTextGeometry && !nativeOutline && m_style.borderStyle == 0;
+        if (plainOutline)
+        {
+            const bool border = m_style.outlineWidthX + m_style.outlineWidthY > 0;
+            const int rx = border ? (std::max)(0, int(m_style.outlineWidthX + 0.5)) : 0;
+            const int ry = border ? (std::max)(0, int(m_style.outlineWidthY + 0.5)) : 0;
+            if (!PrepareOutline(activeTextGeometry->outlines, rx, ry)) return;
+        }
+        else if(!ScanConvert(m_style.borderStyle == 3)) return;
 #else
         if(!ScanConvert()) return;
 #endif
@@ -1244,11 +1254,11 @@ void CWord::Paint(CPoint p, CPoint org)
             if (NeedsDecorationMask())
                 m_undecoratedGlyphs = CreateUndecoratedWord();
         }
-        if (HasNativeOutline())
+        if (nativeOutline)
         {
             if (!CreateNativeOutline()) return;
         }
-        else
+        else if (!plainOutline)
 #endif
         if(m_style.borderStyle != 1 && (m_style.outlineWidthX + m_style.outlineWidthY > 0))
         {

@@ -918,6 +918,65 @@ bool Rasterizer::WidenOutlineByRow(int rx, int ry)
     return true;
 }
 
+bool Rasterizer::PrepareOutline(OutlineCache& cache, int rx, int ry)
+{
+    const auto build = [&] {
+        return ScanConvert() && (!(rx || ry) || CreateWidenedRegion(rx, ry));
+    };
+    if (!mPathPoints || mPathPoints > 2048)
+        return build();
+
+    // Sampling chooses a slot only. The full transformed path and both
+    // integer radii must match before any geometry can be reused.
+    uint64_t probe = mPathPoints;
+    for (size_t i = 0; i < 8; ++i) {
+        const auto& p = mpPathPoints[(mPathPoints - 1) * i / 7];
+        probe = (probe ^ DWORD(p.x)) * 1099511628211ull;
+        probe = (probe ^ DWORD(p.y)) * 1099511628211ull;
+    }
+    probe = (probe ^ DWORD(rx)) * 1099511628211ull ^ DWORD(ry);
+    auto& slot = cache.slots[(probe ^ (probe >> 32) ^ (probe >> 17)) % cache.slots.size()];
+    const auto* hit = slot.entry.get();
+    if (hit && hit->points.size() == mPathPoints && hit->rx == rx && hit->ry == ry &&
+        !memcmp(hit->points.data(), mpPathPoints, mPathPoints * sizeof(POINT)) &&
+        !memcmp(hit->types.data(), mpPathTypes, mPathPoints)) {
+        mOutline = hit->fill;
+        mWideOutline = hit->border;
+        mWidth = hit->width;
+        mHeight = hit->height;
+        mPathOffsetX = hit->offsetX;
+        mPathOffsetY = hit->offsetY;
+        mWideBorder = (std::max)(rx, ry);
+        _TrashPath();
+        return true;
+    }
+
+    // An animation with a different outline every frame should not allocate
+    // cache entries or evict a useful shape on every miss.
+    if (slot.lastProbe != probe) {
+        slot.lastProbe = probe;
+        return build();
+    }
+    auto entry = std::make_unique<OutlineCache::Entry>();
+    entry->points.assign(mpPathPoints, mpPathPoints + mPathPoints);
+    entry->types.assign(mpPathTypes, mpPathTypes + mPathPoints);
+    if (!build()) return false;
+    const size_t pathBytes = entry->points.size() * (sizeof(POINT) + sizeof(BYTE));
+    const size_t spanLimit = (65536 - pathBytes) / sizeof(tSpan);
+    if (mOutline.size() > spanLimit || mWideOutline.size() > spanLimit - mOutline.size())
+        return true;
+    entry->rx = rx;
+    entry->ry = ry;
+    entry->width = mWidth;
+    entry->height = mHeight;
+    entry->offsetX = mPathOffsetX;
+    entry->offsetY = mPathOffsetY;
+    entry->fill = mOutline;
+    entry->border = mWideOutline;
+    slot.entry = std::move(entry);
+    return true;
+}
+
 bool Rasterizer::CreateWidenedRegion(int rx, int ry)
 {
     PROFILE_RENDER_STAGE(WidenOutline);
