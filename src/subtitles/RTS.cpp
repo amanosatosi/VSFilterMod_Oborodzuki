@@ -583,6 +583,533 @@ EventWorkerStatistics CRenderedTextSubtitle::WorkerStatistics() const
 
 // CWord
 
+#ifdef _VSMOD
+struct CWord::NativeOutlineMasks
+{
+    struct Ring
+    {
+        const KfxPaint::OutlineLayer* layer;
+        std::unique_ptr<Rasterizer> mask;
+        std::shared_ptr<const KfxPaint::Sources> paint;
+    };
+    std::vector<Ring> rings;
+    std::unique_ptr<Rasterizer> shadow;
+};
+
+bool CWord::HasNativeOutline() const
+{
+    if (!m_style.nativeOutline || m_style.borderStyle == 1)
+        return false;
+    for (const auto& layer : m_style.nativeOutline->layers)
+    {
+        if (layer.number ? layer.x > 0 || layer.y > 0 :
+            (layer.blur >= 0 || layer.edgeBlur >= 0 || layer.waitingColor >= 0 || layer.waitingPaint) &&
+                m_style.outlineWidthX + m_style.outlineWidthY > 0)
+            return true;
+    }
+    return false;
+}
+
+CPoint CWord::LayoutPosition(CPoint flat) const
+{
+    return m_layoutPlacement ? flat + m_layoutPlacement->offset : flat;
+}
+
+void CWord::PlaceLayout(CPoint offset, double cosine, double sine, double center, double baseline)
+{
+    m_layoutPlacement = std::make_unique<LayoutPlacement>();
+    m_layoutPlacement->offset = offset;
+    m_layoutPlacement->cosine = cosine;
+    m_layoutPlacement->sine = sine;
+    m_layoutPlacement->center = center;
+    m_layoutPlacement->baseline = baseline;
+    m_layoutPlacement->rotate = cosine != 1 || sine != 0 || center != 0 || baseline != 0;
+}
+
+void CWord::OffsetLayout(CPoint offset)
+{
+    if (!m_layoutPlacement) m_layoutPlacement = std::make_unique<LayoutPlacement>();
+    m_layoutPlacement->offset += offset;
+}
+
+KfxPaint::PaintBoundary CWord::CurvePaintBoundary(CPoint position, CPoint origin, double progress) const
+{
+    const auto& pose = *m_layoutPlacement;
+    const double angle = m_style.fontAngleZ * (3.1415 / 180.);
+    const double c = std::cos(angle), s = std::sin(angle);
+    const double nx = c * pose.cosine + s * pose.sine;
+    const double ny = c * pose.sine - s * pose.cosine;
+    const double dx = position.x - origin.x, dy = position.y - origin.y;
+    const double x = (origin.x + c * dx + s * dy) / 8;
+    const double y = (origin.y + c * dy - s * dx) / 8;
+    return {nx, ny, x * nx + y * ny + (2 * progress - 1) * pose.center / 64};
+}
+
+bool CWord::RawOutlineBounds(CRect& rectangle)
+{
+    if (!m_rawPathReady) m_rawPathReady = CreatePath();
+    if (!m_rawPathReady || !mPathPoints) return false;
+    rectangle.SetRect(INT_MAX, INT_MAX, INT_MIN, INT_MIN);
+    for (size_t i = 0; i < mPathPoints; ++i)
+    {
+        const auto& point = mpPathPoints[i];
+        rectangle.left = (std::min)(rectangle.left, point.x);
+        rectangle.top = (std::min)(rectangle.top, point.y);
+        rectangle.right = (std::max)(rectangle.right, point.x);
+        rectangle.bottom = (std::max)(rectangle.bottom, point.y);
+    }
+    return true;
+}
+
+static RenderGeometry::Point WarpPoint(RenderGeometry::Point point, const MOD_DISTORT& warp, const CRect& domain)
+{
+    if (!domain.Width() || !domain.Height()) return point;
+    const double u = (point.x - domain.left) / domain.Width();
+    const double v = (point.y - domain.top) / domain.Height();
+    const double p0 = (1 - u) * (1 - v);
+    return {
+        domain.left + domain.Width() * (u * warp.pointsx[0] + v * warp.pointsx[2] +
+            u * v * (warp.pointsx[1] - warp.pointsx[0] - warp.pointsx[2]) + p0 * warp.x0),
+        domain.top + domain.Height() * (u * warp.pointsy[0] + v * warp.pointsy[2] +
+            u * v * (warp.pointsy[1] - warp.pointsy[0] - warp.pointsy[2]) + p0 * warp.y0)
+    };
+}
+
+bool CWord::WarpBeforeLayout()
+{
+    if (!m_style.mod_distort.enabled || !m_layoutPlacement || !m_layoutPlacement->rotate || !m_distortionDomain)
+        return false;
+    const auto& domain = *m_distortionDomain;
+    for (size_t i = 0; i < mPathPoints; ++i)
+    {
+        auto& point = mpPathPoints[i];
+        const auto warped = WarpPoint({double(point.x), double(point.y)}, m_style.mod_distort, domain);
+        point = {LONG(std::lround(warped.x)), LONG(std::lround(warped.y))};
+    }
+    return true;
+}
+
+void CWord::AddWarpedBounds(CPoint position, RenderGeometry::Point& min, RenderGeometry::Point& max) const
+{
+    if (!m_rawPathReady) return;
+    const double sx = isOpaqueBox ? 1 : m_style.fontScaleX / 100;
+    const double sy = isOpaqueBox ? 1 : m_style.fontScaleY / 100;
+    const auto& warp = m_style.mod_distort;
+    const auto* domain = m_distortionDomain.get();
+    for (size_t i = 0; i < mPathPoints; ++i)
+    {
+        auto point = RenderGeometry::Point{double(mpPathPoints[i].x), double(mpPathPoints[i].y)};
+        if (domain && warp.enabled) point = WarpPoint(point, warp, *domain);
+        const auto* pose = m_layoutPlacement.get();
+        if (pose && pose->rotate && sx && sy)
+        {
+            const double dx = point.x * sx - pose->center, dy = point.y * sy - pose->baseline;
+            point.x = (dx * pose->cosine - dy * pose->sine) / sx;
+            point.y = (dx * pose->sine + dy * pose->cosine) / sy;
+        }
+        const double px = position.x + point.x * sx / 8, py = position.y + point.y * sy / 8;
+        min.x = (std::min)(min.x, px);
+        min.y = (std::min)(min.y, py);
+        max.x = (std::max)(max.x, px);
+        max.y = (std::max)(max.y, py);
+    }
+}
+
+static thread_local const std::vector<NativeScroll::Frame>* activeScroll = nullptr;
+
+class ScrollFrameScope
+{
+    const std::vector<NativeScroll::Frame>* previous;
+public:
+    explicit ScrollFrameScope(const std::vector<NativeScroll::Frame>& frame) : previous(activeScroll)
+    {
+        activeScroll = frame.empty() ? nullptr : &frame;
+    }
+    ~ScrollFrameScope() { activeScroll = previous; }
+};
+
+static const NativeScroll::Frame* WordScroll(const CWord& word)
+{
+    return word.m_scrollGroup && activeScroll && word.m_scrollGroup <= activeScroll->size() ?
+        &(*activeScroll)[word.m_scrollGroup - 1] : nullptr;
+}
+
+static int ScrollOffset(const CWord& word)
+{
+    const auto* scroll = WordScroll(word);
+    return scroll ? scroll->offset : 0;
+}
+
+CRect CWord::RubyClip(const CRect& clip, int x, int y) const
+{
+    CRect result = clip;
+    if (const auto* scroll = WordScroll(*this))
+        if (scroll->hidden) result.SetRectEmpty();
+        else if (scroll->clipped)
+        {
+            result.top = (std::max)(result.top, LONG(scroll->top));
+            result.bottom = (std::min)(result.bottom, LONG(scroll->bottom));
+        }
+    if (m_layoutPlacement)
+    {
+        const auto& pose = *m_layoutPlacement;
+        if (m_verticalWord)
+        {
+            if (pose.clipStart != INT_MIN) result.top = (std::max)(result.top, LONG((y + pose.clipStart + 4) >> 3));
+            if (pose.clipEnd != INT_MAX) result.bottom = (std::min)(result.bottom, LONG((y + pose.clipEnd + 4) >> 3));
+        }
+        else
+        {
+            if (pose.clipStart != INT_MIN) result.left = (std::max)(result.left, LONG((x + pose.clipStart + 4) >> 3));
+            if (pose.clipEnd != INT_MAX) result.right = (std::min)(result.right, LONG((x + pose.clipEnd + 4) >> 3));
+        }
+    }
+    return result;
+}
+
+void CWord::RotateLayoutOutline()
+{
+    const auto& pose = *m_layoutPlacement;
+    const double sx = m_style.fontScaleX / 100;
+    const double sy = m_style.fontScaleY / 100;
+    if (!sx || !sy) return;
+    for (size_t i = 0; i < mPathPoints; ++i)
+    {
+        auto& p = mpPathPoints[i];
+        const double x = p.x * sx - pose.center;
+        const double y = p.y * sy - pose.baseline;
+        p.x = LONG(std::lround((x * pose.cosine - y * pose.sine) / sx));
+        p.y = LONG(std::lround((x * pose.sine + y * pose.cosine) / sy));
+    }
+}
+
+void CWord::ResetProjectedPath()
+{
+    m_projectedPath = m_fDrawn = false;
+    if (m_pOpaqueBox) m_pOpaqueBox->ResetProjectedPath();
+    m_undecoratedGlyphs.reset();
+}
+
+bool CWord::PrepareProjectedPath(const RenderGeometry::Perspective& projection, CPoint relativeOrigin,
+    CPoint position, int64_t& areaBudget)
+{
+    if (m_fLineBreak || m_fWhiteSpaceChar) return true;
+    ResetProjectedPath();
+    if (!m_rawPathReady && !CreatePath()) return false;
+    m_rawPathReady = false;
+    const bool layoutWarped = WarpBeforeLayout();
+    if (m_layoutPlacement && m_layoutPlacement->rotate) RotateLayoutOutline();
+    Transform(CPoint(relativeOrigin.x * 8, relativeOrigin.y * 8), layoutWarped);
+    using namespace RenderGeometry;
+    const Point offset{position.x * 8., position.y * 8.};
+    std::vector<POINT> points;
+    std::vector<BYTE> types;
+    points.reserve(mPathPoints);
+    types.reserve(mPathPoints);
+    LONG left = LONG_MAX, right = LONG_MIN, top = LONG_MAX, bottom = LONG_MIN;
+    const auto append = [&](Point projected, BYTE type) {
+        if (points.size() >= 65536) return false;
+        const POINT p{LONG(std::lround(projected.x - offset.x)), LONG(std::lround(projected.y - offset.y))};
+        left = (std::min)(left, p.x);
+        right = (std::max)(right, p.x);
+        top = (std::min)(top, p.y);
+        bottom = (std::max)(bottom, p.y);
+        points.push_back(p);
+        types.push_back(type);
+        return true;
+    };
+    const auto source = [&](size_t i) {
+        return Point{double(mpPathPoints[i].x), double(mpPathPoints[i].y)} + offset;
+    };
+    const auto distance = [](Point p, Point a, Point b) {
+        const auto chord = b - a;
+        const auto lengthSquared = Dot(chord, chord);
+        const double t = lengthSquared > 0 ?
+            (std::max)(0., (std::min)(1., Dot(p - a, chord) / lengthSquared)) : 0.;
+        return Length(p - (a + chord * t));
+    };
+    const auto cubic = [&](auto&& self, Point a, Point b, Point c, Point d, int depth) -> bool {
+        Point pa, pb, pc, pd;
+        if (!projection.Map(a, pa) || !projection.Map(b, pb) || !projection.Map(c, pc) || !projection.Map(d, pd))
+            return false;
+        if (distance(pb, pa, pd) <= 2 && distance(pc, pa, pd) <= 2)
+            return append(pd, PT_LINETO);
+        if (depth == 14) return false;
+        const auto ab = (a+b)*.5, bc = (b+c)*.5, cd = (c+d)*.5;
+        const auto l = (ab+bc)*.5, r = (bc+cd)*.5, mid = (l+r)*.5;
+        return self(self, a, ab, l, mid, depth+1) && self(self, mid, r, cd, d, depth+1);
+    };
+    for (size_t i = 0; i < mPathPoints; ++i)
+    {
+        const auto type = mpPathTypes[i] & ~PT_CLOSEFIGURE;
+        if (!projection.Affine() && type == PT_BEZIERTO && i && i + 2 < mPathPoints)
+        {
+            if (!cubic(cubic, source(i - 1), source(i), source(i + 1), source(i + 2), 0)) return false;
+            types.back() |= mpPathTypes[i + 2] & PT_CLOSEFIGURE;
+            i += 2;
+        }
+        else if (!projection.Affine() && (type == PT_BSPLINETO || type == PT_BSPLINEPATCHTO))
+        {
+            const size_t lookback = type == PT_BSPLINETO ? 1 : 3;
+            if (i < lookback || i - lookback + 3 >= mPathPoints) return false;
+            const auto start = i - lookback;
+            const auto a = source(start), b = source(start + 1), c = source(start + 2), d = source(start + 3);
+            const auto first = (a + b*4 + c)*(1./6), last = (b + c*4 + d)*(1./6);
+            if (type == PT_BSPLINETO)
+            {
+                Point projected;
+                if (!projection.Map(first, projected) || !append(projected, PT_MOVETO)) return false;
+                i += 2;
+            }
+            if (!cubic(cubic, first, (b*2+c)*(1./3), (b+c*2)*(1./3), last, 0)) return false;
+        }
+        else
+        {
+            Point projected;
+            if (!projection.Map(source(i), projected) || !append(projected, mpPathTypes[i])) return false;
+        }
+    }
+    if (points.empty()) return true;
+    const int64_t rasterWidth = ((int64_t(right) - left) >> 6) + 16;
+    const int64_t rasterHeight = ((int64_t(bottom) - top) >> 6) + 16;
+    areaBudget -= rasterWidth * rasterHeight;
+    if (areaBudget < 0 || rasterWidth > 16384 || rasterHeight > 16384) return false;
+    m_projectedPath = CopyPath(points.data(), types.data(), points.size());
+    if (!m_projectedPath) return false;
+    if (m_style.borderStyle == 1 && (!CreateOpaqueBox() ||
+            !m_pOpaqueBox->PrepareProjectedPath(projection, relativeOrigin, position, areaBudget)))
+        return false;
+    if (NeedsDecorationMask())
+    {
+        m_undecoratedGlyphs = CreateUndecoratedWord();
+        if (m_undecoratedGlyphs &&
+            !m_undecoratedGlyphs->PrepareProjectedPath(projection, relativeOrigin, position, areaBudget))
+            return false;
+    }
+    return true;
+}
+
+bool CWord::CreateNativeOutline()
+{
+    const auto& style = *m_style.nativeOutline;
+    auto masks = std::make_unique<NativeOutlineMasks>();
+    std::vector<OutlineTarget> targets;
+    // Keep the additional masks bounded even for pathological tag values.
+    constexpr double maxRadius = 2048; // subpixels
+    double rx = 0, ry = 0;
+    int previousX = 0, previousY = 0;
+    auto add = [&](double x, double y, const KfxPaint::OutlineLayer* layer) {
+        rx = (std::min)(maxRadius, rx + x);
+        ry = (std::min)(maxRadius, ry + y);
+        const int roundedX = int(rx + 0.5);
+        const int roundedY = int(ry + 0.5);
+        if (roundedX == previousX && roundedY == previousY)
+            return;
+        previousX = roundedX;
+        previousY = roundedY;
+        auto mask = std::make_unique<Rasterizer>();
+        targets.push_back({roundedX, roundedY, mask.get()});
+        std::shared_ptr<const KfxPaint::Sources> paint;
+        const auto* face = m_style.mod_grad.paint.get();
+        if (layer && layer->number && (layer->paint[0] || layer->paint[1] || (face && face->dots)))
+        {
+            auto parts = std::make_shared<KfxPaint::Sources>();
+            parts->parts[4] = layer->paint[0];
+            parts->parts[5] = layer->paint[1];
+            if (face)
+            {
+                parts->dots = face->dots;
+                parts->dotTarget = int(layer->number + 2);
+            }
+            paint = std::move(parts);
+        }
+        masks->rings.push_back({layer, std::move(mask), std::move(paint)});
+    };
+    const auto* first = !style.layers.empty() && style.layers.front().number == 0 ? &style.layers.front() : nullptr;
+    add(m_style.outlineWidthX, m_style.outlineWidthY, first);
+    for (const auto& layer : style.layers)
+        if (layer.number)
+            add(layer.x * style.scaleX * m_style.objectScale / 100,
+                layer.y * style.scaleY * m_style.objectScale / 100, &layer);
+    if (targets.empty())
+        return true;
+    if (m_style.shadowDepthX != 0 || m_style.shadowDepthY != 0)
+        masks->shadow = std::make_unique<Rasterizer>();
+    if (!CreateOutlineRings(targets, masks->shadow.get()))
+        return false;
+    m_nativeMasks = std::move(masks);
+    return true;
+}
+
+bool CWord::RasterizeNativeOutline(CPoint p)
+{
+    if (!m_nativeMasks)
+        return true;
+    for (const auto& ring : m_nativeMasks->rings)
+    {
+        const auto* layer = ring.layer;
+        const double blur = layer && layer->blur >= 0 ? layer->blur * m_style.objectScale / 100 : -1;
+        const int edge = layer && layer->edgeBlur >= 0 ? layer->edgeBlur : m_style.fBlur;
+        if (!ring.mask->Rasterize(p.x, p.y, edge,
+                blur >= 0 ? blur : m_style.fGaussianBlurX, blur >= 0 ? blur : m_style.fGaussianBlurY, true))
+            return false;
+    }
+    return !m_nativeMasks->shadow || m_nativeMasks->shadow->Rasterize(p.x, p.y, m_style.fBlur,
+        m_style.fGaussianBlurX, m_style.fGaussianBlurY, true);
+}
+
+CRect CWord::DrawNativeOutline(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int y, int time, int fade,
+    MOD_MOVEVC& vectorClip)
+{
+    CRect bounds(0, 0, 0, 0);
+    if (!m_nativeMasks)
+        return bounds;
+    // Each mask contains only its own ring. Traverse exterior to interior,
+    // which also defines compositing order where independent blurs overlap.
+    for (auto r = m_nativeMasks->rings.rbegin(); r != m_nativeMasks->rings.rend(); ++r)
+    {
+        const auto* layer = r->layer;
+        const DWORD rgb = layer && layer->color >= 0 ? DWORD(layer->color) : revcolor(m_style.colors[2]);
+        const int alpha = layer && layer->inverseAlpha >= 0 ? layer->inverseAlpha : m_style.alpha[2];
+        const DWORD opacity = MulDiv(255 - alpha, 255 - fade, 255);
+        MOD_GRADIENT extra;
+        extra.paint = r->paint;
+        extra.positionedOpacity = m_style.mod_grad.positionedOpacity;
+        extra.paintOffsetY = m_style.mod_grad.paintOffsetY;
+        extra.paintGroup = m_style.mod_grad.paintGroup;
+        extra.fadalpha = fade;
+        MOD_GRADIENT& paint = layer && layer->number ? extra : m_style.mod_grad;
+        const auto draw = [&](CRect region, DWORD color, MOD_GRADIENT& shading) {
+            if (region.IsRectEmpty()) return;
+            const DWORD colors[4] = {color | (opacity << 24), DWORD(-1), 0, 0};
+            bounds |= r->mask->Draw(spd, region, mask, x, y, colors, true, false, 2,
+                shading, vectorClip, m_style.mod_blendMode);
+        };
+        const bool waiting = layer && (layer->waitingColor >= 0 || layer->waitingPaint) && m_ktype != 2 && m_ktype != 3 &&
+            time < (m_ktype == 1 ? m_kend : m_kstart);
+        if (!waiting)
+        {
+            draw(clip, rgb, paint);
+            continue;
+        }
+        CRect active(clip), inactive(clip);
+        if (m_ktype == 1 && m_kstart < time)
+        {
+            const double progress = double(time - m_kstart) / (m_kend - m_kstart);
+            const double angle = std::remainder(m_style.fontAngleZ, 360.0);
+            const bool reversed = std::abs(angle) > 90;
+            const int edge = (x + int((reversed ? 1 - progress : progress) * m_width)) >> 3;
+            if (m_verticalWord)
+            {
+                const LONG verticalEdge = VerticalPaintSplit(y, progress);
+                active.bottom = (std::min)(verticalEdge, active.bottom);
+                inactive.top = (std::max)(verticalEdge, inactive.top);
+            }
+            else if (reversed)
+            {
+                active.left = (std::max)(LONG(edge), active.left);
+                inactive.right = (std::min)(LONG(edge), inactive.right);
+            }
+            else
+            {
+                active.right = (std::min)(LONG(edge), active.right);
+                inactive.left = (std::max)(LONG(edge), inactive.left);
+            }
+            draw(active, rgb, paint);
+        }
+        auto waitingPaint = paint;
+        auto parts = paint.paint ? std::make_shared<KfxPaint::Sources>(*paint.paint) :
+            std::make_shared<KfxPaint::Sources>();
+        parts->parts[4] = layer->waitingPaint;
+        parts->dots.reset();
+        waitingPaint.paint = std::move(parts);
+        waitingPaint.legacyParts &= ~(1u << 4);
+        draw(inactive, layer->waitingColor >= 0 ? DWORD(layer->waitingColor) : rgb, waitingPaint);
+    }
+    return bounds;
+}
+
+CRect CWord::DrawNativeShadow(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int y, DWORD* colors,
+    MOD_MOVEVC& vectorClip)
+{
+    auto* rasterizer = m_nativeMasks && m_nativeMasks->shadow ? m_nativeMasks->shadow.get() : this;
+    return rasterizer->Draw(spd, clip, mask, x, y, colors, true, false, 3, m_style.mod_grad,
+        vectorClip, m_style.mod_blendMode);
+}
+
+bool CWord::RasterizeDecorations(CPoint p, CPoint org)
+{
+    if (!m_undecoratedGlyphs)
+        return true;
+#ifdef _LUA
+    m_undecoratedGlyphs->Paint(p, org, m_layer);
+#else
+    m_undecoratedGlyphs->Paint(p, org);
+#endif
+    if (!m_decorationMask)
+    {
+        auto mask = std::make_unique<Rasterizer>();
+        if (!mask->CreateDecorationMask(*this, *m_undecoratedGlyphs))
+        {
+            m_undecoratedGlyphs.reset();
+            return true;
+        }
+        m_decorationMask = std::move(mask);
+    }
+    return m_decorationMask->Rasterize(p.x, p.y, m_style.fBlur, m_style.fGaussianBlurX, m_style.fGaussianBlurY);
+}
+
+bool CWord::NeedsDecorationMask() const
+{
+    return (m_style.fUnderline || m_style.fStrikeOut) &&
+        ((m_style.decoration && m_style.decoration->Active()) ||
+            (m_style.mod_grad.paint && m_style.mod_grad.paint->dots));
+}
+
+CRect CWord::DrawBodyPaint(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int y, const DWORD* colors,
+    MOD_MOVEVC& vectorClip, bool reverse, int channel, const KfxPaint::PaintBoundary* boundary)
+{
+    auto& style = m_style.mod_grad;
+    if (!m_decorationMask)
+        return Draw(spd, clip, mask, x, y, colors, true, false, channel, style, vectorClip, m_style.mod_blendMode,
+            reverse, true, boundary);
+
+    auto bounds = m_undecoratedGlyphs->Draw(spd, clip, mask, x, y, colors, true, false, channel,
+        style, vectorClip, m_style.mod_blendMode, reverse, true, boundary);
+    const KfxPaint::DecorationPaint plain;
+    const auto& deco = m_style.decoration ? *m_style.decoration : plain;
+    auto gradient = style;
+    auto sources = style.paint ? std::make_shared<KfxPaint::Sources>(*style.paint) :
+        std::make_shared<KfxPaint::Sources>();
+    sources->dots.reset();
+    DWORD palette[4];
+    std::copy_n(colors, 4, palette);
+    for (int i = 0; i < 2; ++i)
+    {
+        for (int component = 0; component < 2; ++component)
+        {
+            const int part = 2 * i + component;
+            if (deco.paint[component] || (component ? deco.inverseAlpha : deco.color) >= 0)
+            {
+                sources->parts[part] = deco.paint[component];
+                gradient.legacyParts &= ~(1u << part);
+            }
+        }
+        if (deco.color >= 0)
+            palette[2 * i] = (palette[2 * i] & 0xff000000u) | DWORD(deco.color);
+        if (deco.inverseAlpha >= 0)
+        {
+            const DWORD opacity = MulDiv(255 - deco.inverseAlpha, 255 - style.fadalpha, 255);
+            palette[2 * i] = (palette[2 * i] & 0xffffffu) | (opacity << 24);
+        }
+    }
+    gradient.paint = std::move(sources);
+    bounds |= m_decorationMask->Draw(spd, clip, mask, x, y, palette, true, false, channel,
+        gradient, vectorClip, m_style.mod_blendMode, reverse, true, boundary);
+    return bounds;
+}
+#endif
+
 CWord::CWord(STSStyle& style, CStringW str, int ktype, int kstart, int kend, double scalex, double scaley)
     : m_style(style), m_str(str)
     , m_width(0), m_ascent(0), m_descent(0)
@@ -606,6 +1133,31 @@ void CWord::MeasureSelectedFont()
     m_descent = int(m_style.fontScaleY / 100 * ((metrics.tmDescent + 4) >> 3));
 }
 
+CWord::CWord(CWord& word)
+    : CWord(word.m_style, word.m_str, word.m_ktype, word.m_kstart, word.m_kend, word.m_scalex, word.m_scaley)
+{
+    m_width = word.m_width;
+    m_ascent = word.m_ascent;
+    m_descent = word.m_descent;
+    m_logicalLine = word.m_logicalLine;
+    m_fLineBreak = word.m_fLineBreak;
+    m_fWhiteSpaceChar = word.m_fWhiteSpaceChar;
+    isOpaqueBox = word.isOpaqueBox;
+#ifdef _VSMOD
+    if (word.m_distortionDomain)
+        m_distortionDomain = std::make_unique<CRect>(*word.m_distortionDomain);
+    if (word.m_layoutPlacement)
+        m_layoutPlacement = std::make_unique<LayoutPlacement>(*word.m_layoutPlacement);
+    m_wrapAfter = word.m_wrapAfter;
+    m_verticalWord = word.m_verticalWord;
+    m_isRubyReading = word.m_isRubyReading;
+    m_rubyGroup = word.m_rubyGroup;
+    m_scrollGroup = word.m_scrollGroup;
+    m_chatReceipt = word.m_chatReceipt;
+    m_columnCell = word.m_columnCell;
+#endif
+}
+
 CWord::~CWord()
 {
     if(m_pOpaqueBox) delete m_pOpaqueBox;
@@ -613,6 +1165,9 @@ CWord::~CWord()
 
 bool CWord::Append(CWord* w)
 {
+#ifdef _VSMOD
+    if (m_columnCell != w->m_columnCell || m_scrollGroup != w->m_scrollGroup) return false;
+#endif
     if(!(m_style == w->m_style)
        || m_fLineBreak || w->m_fLineBreak
        || w->m_kstart != w->m_kend || m_ktype != w->m_ktype) return(false);
@@ -640,23 +1195,62 @@ void CWord::Paint(CPoint p, CPoint org)
 
     if(!m_fDrawn)
     {
+#ifdef _VSMOD
+        const bool projected = m_projectedPath;
+        m_projectedPath = false;
+        if (!projected)
+        {
+#endif
+#ifdef _VSMOD
+        if (!m_rawPathReady && !CreatePath()) return;
+        m_rawPathReady = false;
+#else
         if(!CreatePath()) return;
+#endif
 
+        bool layoutWarped = false;
+#ifdef _VSMOD
+        layoutWarped = WarpBeforeLayout();
+        if (m_layoutPlacement && m_layoutPlacement->rotate)
+            RotateLayoutOutline();
+#endif
         CPoint morg = CPoint((org.x - p.x) * 8, (org.y - p.y) * 8);
 #if defined (_VSMOD) && defined(_LUA)
         if(m_style.LuaBeforeTransformHandler.GetLength() > 0) CustomTransform(morg, m_style.LuaBeforeTransformHandler, Layer);
         if(m_style.LuaCustomTransformHandler.GetLength() > 0)
             CustomTransform(morg, m_style.LuaCustomTransformHandler, Layer);
         else
-            Transform(morg);
+            Transform(morg, layoutWarped);
         if(m_style.LuaAfterTransformHandler.GetLength() > 0) CustomTransform(morg, m_style.LuaAfterTransformHandler, Layer);
 #else
-        Transform(CPoint((org.x - p.x) * 8, (org.y - p.y) * 8));
+        Transform(CPoint((org.x - p.x) * 8, (org.y - p.y) * 8), layoutWarped);
+#endif
+#ifdef _VSMOD
+        }
 #endif
 
+#ifdef _VSMOD
+        if(!ScanConvert(m_style.borderStyle == 3)) return;
+#else
         if(!ScanConvert()) return;
+#endif
 
-        if(m_style.borderStyle == 0 && (m_style.outlineWidthX + m_style.outlineWidthY > 0))
+#ifdef _VSMOD
+        m_nativeMasks.reset();
+        m_decorationMask.reset();
+        if (!projected)
+        {
+            m_undecoratedGlyphs.reset();
+            if (NeedsDecorationMask())
+                m_undecoratedGlyphs = CreateUndecoratedWord();
+        }
+        if (HasNativeOutline())
+        {
+            if (!CreateNativeOutline()) return;
+        }
+        else
+#endif
+        if(m_style.borderStyle != 1 && (m_style.outlineWidthX + m_style.outlineWidthY > 0))
         {
             if(!CreateWidenedRegion((int)(m_style.outlineWidthX + 0.5), (int)(m_style.outlineWidthY + 0.5))) return;
         }
@@ -665,13 +1259,18 @@ void CWord::Paint(CPoint p, CPoint org)
             if(!CreateOpaqueBox()) return;
         }
 
-        m_fDrawn = true;
-
         if(!Rasterize(p.x & 7, p.y & 7, m_style.fBlur, m_style.fGaussianBlurX, m_style.fGaussianBlurY)) return;
+#ifdef _VSMOD
+        if (!RasterizeNativeOutline(p) || !RasterizeDecorations(p, org)) return;
+#endif
+        m_fDrawn = true;
     }
     else if((m_p.x & 7) != (p.x & 7) || (m_p.y & 7) != (p.y & 7))
     {
         Rasterize(p.x & 7, p.y & 7, m_style.fBlur, m_style.fGaussianBlurX, m_style.fGaussianBlurY);
+#ifdef _VSMOD
+        if (!RasterizeNativeOutline(p) || !RasterizeDecorations(p, org)) return;
+#endif
     }
 
     m_p = p;
@@ -796,7 +1395,7 @@ void CWord::CustomTransform(CPoint org, CString F, int Layer)
 #endif
 #endif
 
-void CWord::Transform(CPoint org)
+void CWord::Transform(CPoint org, bool layoutWarped)
 {
     PROFILE_RENDER_STAGE(Transform);
     double scalex = isOpaqueBox ? 1 : m_style.fontScaleX / 100;
@@ -847,15 +1446,25 @@ void CWord::Transform(CPoint org)
         __m128 __minx = _mm_set_ps(INT_MAX, INT_MAX, 0, 0);
         __m128 __max = _mm_set_ps(-INT_MAX, -INT_MAX, 1, 1);
 
-        bool is_dist = m_style.mod_distort.enabled;
+        bool is_dist = m_style.mod_distort.enabled && !layoutWarped;
+        const bool additionalPin = m_style.mod_distort.x0 != 0 || m_style.mod_distort.y0 != 0;
+        const __m128 zeroPinX = _mm_set_ps1(float(m_style.mod_distort.x0));
+        const __m128 zeroPinY = _mm_set_ps1(float(m_style.mod_distort.y0));
         if(is_dist)
         {
-            for(int i = 0; i < mPathPoints; i++)
+            if (m_distortionDomain)
             {
-                __m128 __point = _mm_set_ps(mpPathPoints[i].x, mpPathPoints[i].y, 0, 0);
-                __minx = _mm_min_ps(__minx, __point);
-                __max = _mm_max_ps(__max, __point);
+                const auto& plane = *m_distortionDomain;
+                __minx = _mm_set_ps(float(plane.left), float(plane.top), 0, 0);
+                __max = _mm_set_ps(float(plane.right), float(plane.bottom), 0, 0);
             }
+            else
+                for(int i = 0; i < mPathPoints; i++)
+                {
+                    const auto point = _mm_set_ps(float(mpPathPoints[i].x), float(mpPathPoints[i].y), 0, 0);
+                    __minx = _mm_min_ps(__minx, point);
+                    __max = _mm_max_ps(__max, point);
+                }
 
             __m128 __zero = _mm_setzero_ps();
             __max = _mm_sub_ps(__max, __minx); // xsz, ysz, 1, 1
@@ -863,6 +1472,8 @@ void CWord::Transform(CPoint org)
 
             __xsz = _mm_shuffle_ps(__max, __max, _MM_SHUFFLE(3,3,3,3));
             __ysz = _mm_shuffle_ps(__max, __max, _MM_SHUFFLE(2,2,2,2));
+            if (m_style.mod_distort.extended && (_mm_cvtss_f32(__xsz) == 0 || _mm_cvtss_f32(__ysz) == 0))
+                is_dist = false;
 
             __miny = _mm_shuffle_ps(__minx, __minx, _MM_SHUFFLE(2,2,2,2));
             __minx = _mm_shuffle_ps(__minx, __minx, _MM_SHUFFLE(3,3,3,3));
@@ -932,6 +1543,12 @@ void CWord::Transform(CPoint org)
                 __m128 __1_ysz = _mm_rcp_ps(__ysz);
                 __u = _mm_mul_ps(__u, __1_xsz);
                 __v = _mm_mul_ps(__v, __1_ysz);
+                __m128 zeroWeight = _mm_setzero_ps();
+                if (additionalPin)
+                {
+                    const auto one = _mm_set_ps1(1);
+                    zeroWeight = _mm_mul_ps(_mm_sub_ps(one, __u), _mm_sub_ps(one, __v));
+                }
 
                 // x
                 __pointx = _mm_mul_ps(__dst213x, __u);
@@ -941,6 +1558,7 @@ void CWord::Transform(CPoint org)
                 __pointx = _mm_add_ps(__pointx, __tmpx);
                 __tmpx = _mm_mul_ps(__dst1x, __u);
                 __pointx = _mm_add_ps(__pointx, __tmpx);
+                if (additionalPin) __pointx = _mm_add_ps(__pointx, _mm_mul_ps(zeroPinX, zeroWeight));
 
                 __pointx = _mm_mul_ps(__pointx, __xsz);
                 __pointx = _mm_add_ps(__pointx, __minx);
@@ -951,6 +1569,7 @@ void CWord::Transform(CPoint org)
 
                 __m128 __tmpy = _mm_mul_ps(__dst3y, __v);
                 __pointy = _mm_add_ps(__pointy, __tmpy);
+                if (additionalPin) __pointy = _mm_add_ps(__pointy, _mm_mul_ps(zeroPinY, zeroWeight));
                 __tmpy = _mm_mul_ps(__dst1y, __u);
                 __pointy = _mm_add_ps(__pointy, __tmpy);
 
@@ -1094,16 +1713,25 @@ void CWord::Transform(CPoint org)
         double dst1x, dst1y, dst2x, dst2y, dst3x, dst3y;
         int minx = INT_MAX, miny = INT_MAX, maxx = -INT_MAX, maxy = -INT_MAX;
 
-        bool is_dist = m_style.mod_distort.enabled;
+        bool is_dist = m_style.mod_distort.enabled && !layoutWarped;
         if(is_dist)
         {
-            for(int i = 0; i < mPathPoints; i++)
+            if (m_distortionDomain)
             {
-                if(minx > mpPathPoints[i].x) minx = mpPathPoints[i].x;
-                if(miny > mpPathPoints[i].y) miny = mpPathPoints[i].y;
-                if(maxx < mpPathPoints[i].x) maxx = mpPathPoints[i].x;
-                if(maxy < mpPathPoints[i].y) maxy = mpPathPoints[i].y;
+                const auto& plane = *m_distortionDomain;
+                minx = plane.left;
+                miny = plane.top;
+                maxx = plane.right;
+                maxy = plane.bottom;
             }
+            else
+                for(int i = 0; i < mPathPoints; i++)
+                {
+                    if(minx > mpPathPoints[i].x) minx = mpPathPoints[i].x;
+                    if(miny > mpPathPoints[i].y) miny = mpPathPoints[i].y;
+                    if(maxx < mpPathPoints[i].x) maxx = mpPathPoints[i].x;
+                    if(maxy < mpPathPoints[i].y) maxy = mpPathPoints[i].y;
+                }
 
             xsz = max(maxx - minx, 0);
             ysz = max(maxy - miny, 0);
@@ -1135,6 +1763,12 @@ void CWord::Transform(CPoint org)
 
                 x = minx + (0 + (dst1x - 0) * u + (dst3x - 0) * v + (0 + dst2x - dst1x - dst3x) * u * v) * xsz;
                 y = miny + (0 + (dst1y - 0) * u + (dst3y - 0) * v + (0 + dst2y - dst1y - dst3y) * u * v) * ysz;
+                if (m_style.mod_distort.x0 != 0 || m_style.mod_distort.y0 != 0)
+                {
+                    const double zeroWeight = (1 - u) * (1 - v);
+                    x += xsz * zeroWeight * m_style.mod_distort.x0;
+                    y += ysz * zeroWeight * m_style.mod_distort.y0;
+                }
                 //P = P0 + (P1 - P0)u + (P3 - P0)v + (P0 + P2 - P1 - P3)uv
             }
 
@@ -1294,10 +1928,138 @@ CWord* CText::Copy()
     return T;
 }
 
+#ifdef _VSMOD
+std::unique_ptr<CWord> CText::CreateUndecoratedWord()
+{
+#ifdef _LUA
+    if (!LuaRendererHandler.IsEmpty() || !m_style.LuaBeforeTransformHandler.IsEmpty() ||
+        !m_style.LuaCustomTransformHandler.IsEmpty() || !m_style.LuaAfterTransformHandler.IsEmpty())
+        return {};
+#endif
+    auto copy = std::unique_ptr<CWord>(Copy());
+    auto& style = copy->m_style;
+    style.fUnderline = style.fStrikeOut = false;
+    style.borderStyle = 0;
+    style.outlineWidthX = style.outlineWidthY = 0;
+    style.shadowDepthX = style.shadowDepthY = 0;
+    style.nativeOutline.reset();
+    style.decoration.reset();
+    return copy;
+}
+#endif
+
 bool CText::Append(CWord* w)
 {
     return(dynamic_cast<CText*>(w) && CWord::Append(w));
 }
+
+#ifdef _VSMOD
+namespace
+{
+class ShapedWord : public CWord
+{
+    std::shared_ptr<const ShapedText::Run> run;
+    size_t cluster;
+    int selectedGlyph = -1, naturalAdvance = 0;
+    bool clusterContinues = false;
+
+    bool CreatePath() override
+    {
+        const auto& source = run->clusters[cluster];
+        std::vector<POINT> points;
+        std::vector<BYTE> types;
+        for (size_t i = 0; i < source.glyphs.size(); ++i)
+        {
+            if (selectedGlyph >= 0 && size_t(selectedGlyph) != i) continue;
+            const auto& glyph = source.glyphs[i];
+            points.insert(points.end(), glyph.points.begin(), glyph.points.end());
+            types.insert(types.end(), glyph.types.begin(), glyph.types.end());
+        }
+        if (!clusterContinues)
+        {
+            const auto addDecoration = [&](float position, float size) {
+                if (size <= 0 || source.advance <= 0) return;
+                const LONG x = LONG(std::lround(source.advance * 64));
+                const LONG top = LONG(std::lround(position * 64));
+                const LONG bottom = (std::max)(top + 1, LONG(std::lround((position + size) * 64)));
+                points.insert(points.end(), {{0, top}, {x, top}, {x, bottom}, {0, bottom}});
+                types.insert(types.end(), {PT_MOVETO, PT_LINETO, PT_LINETO, PT_LINETO | PT_CLOSEFIGURE});
+            };
+            if (m_style.fUnderline) addDecoration(source.underline, source.underlineThickness);
+            if (m_style.fStrikeOut) addDecoration(source.strike, source.strikeThickness);
+        }
+        return !points.empty() && CopyPath(points.data(), types.data(), points.size());
+    }
+    std::unique_ptr<CWord> CreateUndecoratedWord() override
+    {
+        auto word = std::make_unique<ShapedWord>(*this);
+        word->m_style.fUnderline = word->m_style.fStrikeOut = false;
+        return word;
+    }
+
+public:
+    ShapedWord(STSStyle& style, CStringW text, std::shared_ptr<const ShapedText::Run> source, size_t index,
+        int type, int start, int end, double sx, double sy)
+        : CWord(style, std::move(text), type, start, end, sx, sy), run(std::move(source)), cluster(index)
+    {
+        const auto& part = run->clusters[index];
+        m_fWhiteSpaceChar = part.whitespace;
+        m_wrapAfter = part.breakAfter;
+        m_width = int(std::lround((part.advance * 8 + style.fontSpacing / 8) * style.fontScaleX / 100));
+        naturalAdvance = m_width;
+        m_ascent = int(std::lround(run->ascent * 8 * style.fontScaleY / 100));
+        m_descent = int(std::lround(run->descent * 8 * style.fontScaleY / 100));
+    }
+
+    CWord* Copy() override { return new ShapedWord(*this); }
+    bool Append(CWord*) override { return false; }
+    const CStringW& Text() const { return m_str; }
+    int Advance() const { return naturalAdvance; }
+    bool SameClusterFollows() const { return clusterContinues; }
+    void SelectGlyph(size_t index)
+    {
+        selectedGlyph = int(index);
+        clusterContinues = index + 1 < run->clusters[cluster].glyphs.size();
+        if (clusterContinues)
+        {
+            m_width = 0;
+            m_wrapAfter = false;
+        }
+    }
+
+    template<class Visit>
+    void OutlinePoints(Visit visit) const
+    {
+        const double sx = m_style.fontScaleX / 100 / 8;
+        const double sy = m_style.fontScaleY / 100 / 8;
+        const auto& glyphs = run->clusters[cluster].glyphs;
+        for (size_t i = 0; i < glyphs.size(); ++i)
+            if (selectedGlyph < 0 || size_t(selectedGlyph) == i)
+            for (const auto& point : glyphs[i].points)
+                visit(RenderGeometry::Point{point.x * sx, point.y * sy});
+    }
+};
+
+std::vector<KfxPaint::CycleIndices> StartCycles(KfxPaint::Cycles* cycles, const ShapedText::Run& run)
+{
+    if (!cycles || !cycles->active) return {};
+    std::vector<size_t> order(run.clusters.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return run.clusters[a].start < run.clusters[b].start;
+    });
+    std::vector<KfxPaint::CycleIndices> first(order.size());
+    for (const auto index : order)
+    {
+        const auto& cluster = run.clusters[index];
+        first[index] = cycles->Take(cluster.glyphs.size(), cluster.whitespace);
+    }
+    return first;
+}
+
+void ApplyCycleColors(STSStyle& style, const KfxPaint::CycleIndices& colors);
+}
+#endif
 
 bool CText::CreatePath()
 {
@@ -1366,6 +2128,14 @@ CPolygon::CPolygon(STSStyle& style, CStringW str, int ktype, int kstart, int ken
     : CWord(style, str, ktype, kstart, kend, scalex, scaley)
     , m_scalex(scalex), m_scaley(scaley), m_baseline(baseline)
 {
+#ifdef _VSMOD
+    if (m_style.mod_grad.paint && m_style.mod_grad.paint->dots)
+    {
+        auto sources = std::make_shared<KfxPaint::Sources>(*m_style.mod_grad.paint);
+        sources->dots.reset();
+        m_style.mod_grad.paint = std::move(sources);
+    }
+#endif
     CMyFont font(m_style);
     HFONT oldFont = SelectFont(g_hDC, font);
     MeasureSelectedFont();
@@ -1926,7 +2696,7 @@ void CLine::Compact()
 }
 
 #ifdef _VSMOD // patch m006. moveable vector clip
-CRect CLine::PaintShadow(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoint p, CPoint org, int time, int alpha, MOD_MOVEVC& mod_vc, REFERENCE_TIME rt)
+CRect CLine::PaintShadow(SubPicDesc& spd, CRect& eventClip, BYTE* pAlphaMask, CPoint p, CPoint org, int time, int alpha, MOD_MOVEVC& mod_vc, REFERENCE_TIME rt)
 #else
 CRect CLine::PaintShadow(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoint p, CPoint org, int time, int alpha)
 #endif
@@ -1940,13 +2710,18 @@ CRect CLine::PaintShadow(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPo
 
         if(w->m_fLineBreak) return(bbox); // should not happen since this class is just a line of text without any breaks
 
-        if(w->m_style.shadowDepthX != 0 || w->m_style.shadowDepthY != 0)
+        if((w->m_style.shadowDepthX != 0 || w->m_style.shadowDepthY != 0) &&
+            (w->m_ktype != 3 || time >= w->m_kstart))
         {
 #ifdef _VSMOD
             // vpatch v002. Horizontal fontspacing
             int x = p.x - w->m_style.mod_horizontalSpace + (int)(w->m_style.shadowDepthX + 0.5);
             // patch m001. Vertical fontspacing
             int y = p.y - w->m_style.mod_verticalSpace + m_ascent - w->m_ascent + (int)(w->m_style.shadowDepthY + 0.5);
+            const auto placed = w->LayoutPosition(CPoint(x, y));
+            x = placed.x;
+            const int scrollY = ScrollOffset(*w);
+        y = placed.y + scrollY;
 #else
             int x = p.x + (int)(w->m_style.shadowDepthX + 0.5);
             int y = p.y + m_ascent - w->m_ascent + (int)(w->m_style.shadowDepthY + 0.5);
@@ -1960,23 +2735,36 @@ CRect CLine::PaintShadow(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPo
             CPoint mod_jitter = w->m_style.mod_jitter.getOffset(rt);
             x += mod_jitter.x;
             y += mod_jitter.y;
+            auto clipRect = w->RubyClip(eventClip, x, y);
             // patch m010. png background
             // subpixel positioning
             w->m_style.mod_grad.subpixx = x & 7;
             w->m_style.mod_grad.subpixy = y & 7;
             w->m_style.mod_grad.fadalpha = alpha;
+            w->m_style.mod_grad.paintOffsetY = scrollY;
+            w->m_style.mod_grad.paintGroup = w->m_scrollGroup;
 #endif
 #if defined (_VSMOD) && defined(_LUA)
-            w->Paint(CPoint(x, y), org, 4);
+            w->Paint(CPoint(x, y), CPoint(org.x, org.y + scrollY), 4);
+#else
+            #ifdef _VSMOD
+            w->Paint(CPoint(x, y), CPoint(org.x, org.y + scrollY));
 #else
             w->Paint(CPoint(x, y), org);
 #endif
-            if(w->m_style.borderStyle == 0)
+#endif
+            if(w->m_style.borderStyle == 0 || w->m_style.borderStyle == 3)
             {
 #ifdef _VSMOD // patch m004. gradient colors
+                if (w->HasNativeOutline() && !(w->m_ktype == 2 && time < w->m_kstart))
+                    bbox |= w->DrawNativeShadow(spd, clipRect, pAlphaMask, x, y, sw, mod_vc);
+                else
+                {
+                const auto& paint = w->m_style.mod_grad.paint;
                 bbox |= w->Draw(spd, clipRect, pAlphaMask, x, y, sw,
-                                w->m_ktype > 0 || w->m_style.alpha[0] < 0xff,
+                                w->m_ktype > 0 || w->m_style.alpha[0] < 0xff || (paint && paint->parts[1]),
                                 (w->m_style.outlineWidthX + w->m_style.outlineWidthY > 0) && !(w->m_ktype == 2 && time < w->m_kstart), 3, w->m_style.mod_grad, mod_vc, w->m_style.mod_blendMode);
+                }
 #else
                 bbox |= w->Draw(spd, clipRect, pAlphaMask, x, y, sw,
                                 w->m_ktype > 0 || w->m_style.alpha[0] < 0xff,
@@ -1986,7 +2774,8 @@ CRect CLine::PaintShadow(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPo
             else if(w->m_style.borderStyle == 1 && w->m_pOpaqueBox)
             {
 #ifdef _VSMOD // patch m004. gradient colors
-                bbox |= w->m_pOpaqueBox->Draw(spd, clipRect, pAlphaMask, x, y, sw, true, false, 3, w->m_style.mod_grad, mod_vc, w->m_style.mod_blendMode);
+                bbox |= w->m_pOpaqueBox->Draw(spd, clipRect, pAlphaMask, x, y, sw, true, false, 3,
+                    w->m_style.mod_grad, mod_vc, w->m_style.mod_blendMode, false, false);
 #else
                 bbox |= w->m_pOpaqueBox->Draw(spd, clipRect, pAlphaMask, x, y, sw, true, false);
 #endif
@@ -2000,7 +2789,7 @@ CRect CLine::PaintShadow(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPo
 }
 
 #ifdef _VSMOD // patch m006. moveable vector clip
-CRect CLine::PaintOutline(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoint p, CPoint org, int time, int alpha, MOD_MOVEVC& mod_vc, REFERENCE_TIME rt)
+CRect CLine::PaintOutline(SubPicDesc& spd, CRect& eventClip, BYTE* pAlphaMask, CPoint p, CPoint org, int time, int alpha, MOD_MOVEVC& mod_vc, REFERENCE_TIME rt)
 #else
 CRect CLine::PaintOutline(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoint p, CPoint org, int time, int alpha)
 #endif
@@ -2014,12 +2803,20 @@ CRect CLine::PaintOutline(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CP
 
         if(w->m_fLineBreak) return(bbox); // should not happen since this class is just a line of text without any breaks
 
-        if(w->m_style.outlineWidthX + w->m_style.outlineWidthY > 0 && !(w->m_ktype == 2 && time < w->m_kstart))
+        if((w->m_style.outlineWidthX + w->m_style.outlineWidthY > 0
+#ifdef _VSMOD
+            || w->HasNativeOutline()
+#endif
+            ) && !((w->m_ktype == 2 || w->m_ktype == 3) && time < w->m_kstart))
         {
 #ifdef _VSMOD // vpatch v002. Horizontal fontspacing
             int x = p.x - w->m_style.mod_horizontalSpace;
             // patch m001. Vertical fontspacing
             int y = p.y - w->m_style.mod_verticalSpace + m_ascent - w->m_ascent;
+            const auto placed = w->LayoutPosition(CPoint(x, y));
+            x = placed.x;
+            const int scrollY = ScrollOffset(*w);
+        y = placed.y + scrollY;
 #else
             int x = p.x;
             int y = p.y + m_ascent - w->m_ascent;
@@ -2033,23 +2830,38 @@ CRect CLine::PaintOutline(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CP
             CPoint mod_jitter = w->m_style.mod_jitter.getOffset(rt);
             x += mod_jitter.x;
             y += mod_jitter.y;
+            auto clipRect = w->RubyClip(eventClip, x, y);
             // patch m010. png background
             // subpixel positioning
             w->m_style.mod_grad.subpixx = x & 7;
             w->m_style.mod_grad.subpixy = y & 7;
             w->m_style.mod_grad.fadalpha = alpha;
+            w->m_style.mod_grad.paintOffsetY = scrollY;
+            w->m_style.mod_grad.paintGroup = w->m_scrollGroup;
 #endif
 
 #if defined (_VSMOD) && defined(_LUA)
-            w->Paint(CPoint(x, y), org, 3);
+            w->Paint(CPoint(x, y), CPoint(org.x, org.y + scrollY), 3);
+#else
+            #ifdef _VSMOD
+            w->Paint(CPoint(x, y), CPoint(org.x, org.y + scrollY));
 #else
             w->Paint(CPoint(x, y), org);
 #endif
+#endif
 
-            if(w->m_style.borderStyle == 0)
+            if(w->m_style.borderStyle != 1)
             {
 #ifdef _VSMOD // patch m004. gradient colors
-                bbox |= w->Draw(spd, clipRect, pAlphaMask, x, y, sw, !w->m_style.alpha[0] && !w->m_style.alpha[1] && !alpha && !w->m_style.mod_grad.bodyIsGradAlpha, true, 2, w->m_style.mod_grad, mod_vc, w->m_style.mod_blendMode);
+                if (w->HasNativeOutline())
+                    bbox |= w->DrawNativeOutline(spd, clipRect, pAlphaMask, x, y, time, alpha, mod_vc);
+                else
+                {
+                const auto& paint = w->m_style.mod_grad.paint;
+                const bool opaqueFill = !w->m_style.alpha[0] && !w->m_style.alpha[1] && !alpha &&
+                    !w->m_style.mod_grad.bodyIsGradAlpha && !(paint && (paint->parts[1] || paint->parts[3]));
+                bbox |= w->Draw(spd, clipRect, pAlphaMask, x, y, sw, opaqueFill, true, 2, w->m_style.mod_grad, mod_vc, w->m_style.mod_blendMode);
+                }
 #else
                 bbox |= w->Draw(spd, clipRect, pAlphaMask, x, y, sw, !w->m_style.alpha[0] && !w->m_style.alpha[1] && !alpha, true);
 #endif
@@ -2057,7 +2869,8 @@ CRect CLine::PaintOutline(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CP
             else if(w->m_style.borderStyle == 1 && w->m_pOpaqueBox)
             {
 #ifdef _VSMOD // patch m004. gradient colors
-                bbox |= w->m_pOpaqueBox->Draw(spd, clipRect, pAlphaMask, x, y, sw, true, false, 2, w->m_style.mod_grad, mod_vc, w->m_style.mod_blendMode);
+                bbox |= w->m_pOpaqueBox->Draw(spd, clipRect, pAlphaMask, x, y, sw, true, false, 2,
+                    w->m_style.mod_grad, mod_vc, w->m_style.mod_blendMode, false, false);
 #else
                 bbox |= w->m_pOpaqueBox->Draw(spd, clipRect, pAlphaMask, x, y, sw, true, false);
 #endif
@@ -2071,7 +2884,7 @@ CRect CLine::PaintOutline(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CP
 }
 
 #ifdef _VSMOD // patch m006. moveable vector clip
-CRect CLine::PaintBody(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoint p, CPoint org, int time, int alpha, MOD_MOVEVC& mod_vc, REFERENCE_TIME rt)
+CRect CLine::PaintBody(SubPicDesc& spd, CRect& eventClip, BYTE* pAlphaMask, CPoint p, CPoint org, int time, int alpha, MOD_MOVEVC& mod_vc, REFERENCE_TIME rt)
 #else
 CRect CLine::PaintBody(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoint p, CPoint org, int time, int alpha)
 #endif
@@ -2089,9 +2902,20 @@ CRect CLine::PaintBody(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoin
         int x = p.x - w->m_style.mod_horizontalSpace;
         // patch m001. Vertical fontspacing
         int y = p.y - w->m_style.mod_verticalSpace + m_ascent - w->m_ascent;
+        const auto placed = w->LayoutPosition(CPoint(x, y));
+        x = placed.x;
+        const int scrollY = ScrollOffset(*w);
+        y = placed.y + scrollY;
 #else
         int x = p.x;
         int y = p.y + m_ascent - w->m_ascent;
+#endif
+#ifdef _VSMOD
+        if (w->m_ktype == 3 && time < w->m_kstart)
+        {
+            p.x += w->m_width;
+            continue;
+        }
 #endif
         // colors
 
@@ -2104,12 +2928,13 @@ CRect CLine::PaintBody(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoin
         COLORREF secondary = revcolor(w->m_style.colors[1]) | ((0xff - asecondary) << 24);
 
         DWORD sw[6] = {primary, 0, secondary};
+        bool reversePaint = false;
 
         // karaoke
 
         double t;
 
-        if(w->m_ktype == 0 || w->m_ktype == 2)
+        if(w->m_ktype == 0 || w->m_ktype == 2 || w->m_ktype == 3)
         {
             t = time < w->m_kstart ? 0 : 1;
         }
@@ -2121,8 +2946,13 @@ CRect CLine::PaintBody(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoin
                 t = 1.0 * (time - w->m_kstart) / (w->m_kend - w->m_kstart);
 
                 double angle = fmod(w->m_style.fontAngleZ, 360.0);
-                if(angle > 90 && angle < 270)
+                if(
+#ifdef _VSMOD
+                    !w->m_verticalWord && !w->IsOnCurve() &&
+#endif
+                    angle > 90 && angle < 270)
                 {
+                    reversePaint = true;
                     t = 1 - t;
                     COLORREF tmp = sw[0];
                     sw[0] = sw[2];
@@ -2152,23 +2982,68 @@ CRect CLine::PaintBody(SubPicDesc& spd, CRect& clipRect, BYTE* pAlphaMask, CPoin
         CPoint mod_jitter = w->m_style.mod_jitter.getOffset(rt);
         x += mod_jitter.x;
         y += mod_jitter.y;
+        auto clipRect = w->RubyClip(eventClip, x, y);
         // patch m010. png background
         // subpixel positioning
         w->m_style.mod_grad.subpixx = x & 7;
         w->m_style.mod_grad.subpixy = y & 7;
         w->m_style.mod_grad.fadalpha = alpha;
+        w->m_style.mod_grad.paintOffsetY = scrollY;
+        w->m_style.mod_grad.paintGroup = w->m_scrollGroup;
 #endif
 
 #if defined (_VSMOD) && defined(_LUA)
-            w->Paint(CPoint(x, y), org, 1);
+            w->Paint(CPoint(x, y), CPoint(org.x, org.y + scrollY), 1);
+#else
+            #ifdef _VSMOD
+            w->Paint(CPoint(x, y), CPoint(org.x, org.y + scrollY));
 #else
             w->Paint(CPoint(x, y), org);
+#endif
 #endif
 
         sw[3] = (int)(w->m_style.outlineWidthX + t * w->getOverlayWidth() + t * bluradjust) >> 3;
 
 #ifdef _VSMOD // patch m004. gradient colors
-        bbox |= w->Draw(spd, clipRect, pAlphaMask, x, y, sw, true, false, 0, w->m_style.mod_grad, mod_vc, w->m_style.mod_blendMode);
+        if (w->IsOnCurve() && w->m_ktype == 1)
+        {
+            sw[1] = 0xffffffff;
+            if (t <= 0)
+            {
+                sw[0] = secondary;
+                bbox |= w->DrawBodyPaint(spd, clipRect, pAlphaMask, x, y, sw, mod_vc, false, 1);
+            }
+            else if (t >= 1)
+                bbox |= w->DrawBodyPaint(spd, clipRect, pAlphaMask, x, y, sw, mod_vc, false);
+            else
+            {
+                const auto boundary = w->CurvePaintBoundary(CPoint(x, y), CPoint(org.x, org.y + scrollY), t);
+                bbox |= w->DrawBodyPaint(spd, clipRect, pAlphaMask, x, y, sw, mod_vc, false, 0, &boundary);
+            }
+        }
+        else if (w->m_verticalWord && w->m_ktype == 1)
+        {
+            sw[1] = 0xffffffff;
+            const int split = w->VerticalPaintSplit(y, t);
+            if (t > 0)
+            {
+                auto top = clipRect;
+                if (t < 1) top.bottom = (std::min)(top.bottom, LONG(split));
+                bbox |= w->DrawBodyPaint(spd, top, pAlphaMask, x, y, sw, mod_vc, false);
+            }
+            if (t < 1)
+            {
+                auto bottom = clipRect;
+                if (t > 0) bottom.top = (std::max)(bottom.top, LONG(split));
+                sw[0] = secondary;
+                bbox |= w->DrawBodyPaint(spd, bottom, pAlphaMask, x, y, sw, mod_vc, false, 1);
+            }
+        }
+        else
+        {
+            sw[3] = DWORD(w->HorizontalRubyPaintSplit(int(sw[3]), t));
+            bbox |= w->DrawBodyPaint(spd, clipRect, pAlphaMask, x, y, sw, mod_vc, reversePaint);
+        }
 #else
         bbox |= w->Draw(spd, clipRect, pAlphaMask, x, y, sw, true, false);
 #endif
@@ -2278,6 +3153,19 @@ CLine* CSubtitle::GetNextLine(POSITION& pos, int maxwidth)
 
     CLine* ret = DNew CLine();
     if(!ret) return(NULL);
+#ifdef _VSMOD
+    if (m_words.GetAt(pos)->m_columnCell) maxwidth = INT_MAX;
+    if (!m_lineAlignment.empty())
+    {
+        const auto number = m_words.GetAt(pos)->m_logicalLine;
+        auto at = m_lineAlignment.upper_bound(number);
+        if (at != m_lineAlignment.begin())
+        {
+            --at;
+            ret->m_horizontalAnchor = at->first == number ? at->second.first : at->second.inherited;
+        }
+    }
+#endif
 
 #if defined(_VSMOD) && defined(_LUA)
 
@@ -2285,7 +3173,11 @@ CLine* CSubtitle::GetNextLine(POSITION& pos, int maxwidth)
 
     ret->m_width = ret->m_ascent = ret->m_descent = ret->m_borderX = ret->m_borderY = 0;
 
-    maxwidth = GetWrapWidth(pos, maxwidth);
+#ifdef _VSMOD
+    if (m_chat) maxwidth = m_chat->textWidth;
+    else
+#endif
+        maxwidth = GetWrapWidth(pos, maxwidth);
 
     bool fEmptyLine = true;
 
@@ -2318,13 +3210,26 @@ CLine* CSubtitle::GetNextLine(POSITION& pos, int maxwidth)
 
         int width = w->m_width;
         POSITION pos2 = pos;
-        while(pos2)
+        bool mayWrap = false;
+#ifdef _VSMOD
+        mayWrap = w->m_wrapAfter;
+#endif
+        while(pos2 && !mayWrap)
         {
-            if(m_words.GetAt(pos2)->m_fWhiteSpaceChar != fWSC
-               || m_words.GetAt(pos2)->m_fLineBreak) break;
+            const auto* following = m_words.GetAt(pos2);
+            if(following->m_fLineBreak) break;
+#ifdef _VSMOD
+            if (w->m_rubyGroup && w->m_rubyGroup != following->m_rubyGroup) break;
+            if (!w->m_rubyGroup && (following->m_fWhiteSpaceChar != fWSC || following->m_rubyGroup)) break;
+#else
+            if (following->m_fWhiteSpaceChar != fWSC) break;
+#endif
 
             CWord* w2 = m_words.GetNext(pos2);
             width += w2->m_width;
+#ifdef _VSMOD
+            mayWrap = w2->m_wrapAfter;
+#endif
         }
 
         if((ret->m_width += width) <= maxwidth || ret->IsEmpty())
@@ -2490,6 +3395,10 @@ void CSubtitle::MakeLines(CSize size, CRect marginRect)
 
     CLine* l = NULL;
 
+#ifdef _VSMOD
+    if (!m_vertical || !MakeVerticalLines(size.cy - marginRect.top - marginRect.bottom, spaceNeeded))
+#endif
+    {
     POSITION pos = m_words.GetHeadPosition();
     while(pos)
     {
@@ -2504,11 +3413,15 @@ void CSubtitle::MakeLines(CSize size, CRect marginRect)
 
         spaceNeeded.cx = max(l->m_width + l->m_borderX, spaceNeeded.cx);
         spaceNeeded.cy += l->m_ascent + l->m_descent;
+#ifdef _VSMOD
+        m_textWidth = (std::max)(m_textWidth, l->m_width);
+#endif
 
         AddTail(l);
     }
 
     if(l) m_bottomborder = l->m_borderY;
+    }
 
     m_rect = CRect(
                  CPoint((m_scrAlignment % 3) == 1 ? marginRect.left
@@ -2519,6 +3432,1508 @@ void CSubtitle::MakeLines(CSize size, CRect marginRect)
                         : marginRect.top),
                  spaceNeeded);
 }
+
+void CSubtitle::AppendWord(CWord* word)
+{
+#ifdef _VSMOD
+    word->m_scrollGroup = m_scrollGroup;
+    if (m_chat)
+    {
+        auto& chat = *m_chat;
+        if (chat.current && chat.previousWord && chat.previousWord != chat.current &&
+            !m_words.IsEmpty() && !m_words.GetTail()->m_fLineBreak)
+        {
+            auto lineBreak = std::make_unique<CText>(word->m_style, CStringW(), 0, 0, 0, m_scalex, m_scaley);
+            lineBreak->m_logicalLine = m_logicalLine++;
+            m_words.AddTail(lineBreak.get());
+            lineBreak.release();
+        }
+        chat.previousWord = chat.current;
+        word->m_scrollGroup = chat.current;
+    }
+    if (m_columns && !word->m_fLineBreak)
+        word->m_columnCell = (m_columns->number << 16) | m_columns->current;
+    word->m_logicalLine = m_logicalLine;
+    if (word->m_fLineBreak)
+        ++m_logicalLine;
+#endif
+    m_words.AddTail(word);
+}
+
+#ifdef _VSMOD
+void CSubtitle::MeasureScrollRows()
+{
+    if (m_scrollContexts.empty()) return;
+    std::vector<std::vector<std::pair<int,int>>> rows(m_scrollContexts.size());
+    int top = 0;
+    for (auto at = GetHeadPosition(); at;)
+    {
+        auto* line = GetNext(at);
+        const int bottom = top + line->m_ascent + line->m_descent;
+        for (auto pos = line->GetHeadPosition(); pos;)
+        {
+            const auto* word = line->GetNext(pos);
+            if (!word->m_scrollGroup || word->m_fWhiteSpaceChar) continue;
+            auto& group = rows[word->m_scrollGroup - 1];
+            if (group.empty() || group.back().first != top)
+                group.emplace_back(top, bottom);
+        }
+        top = bottom;
+    }
+    for (size_t i = 0; i < rows.size(); ++i) m_scrollContexts[i].Resolve(rows[i]);
+}
+
+std::vector<NativeScroll::Frame> CSubtitle::ScrollFrame(int time, int top) const
+{
+    if (m_chat) return m_chat->Frame(time, top);
+    std::vector<NativeScroll::Frame> frame;
+    frame.reserve(m_scrollContexts.size());
+    for (const auto& context : m_scrollContexts) frame.push_back(context.At(time, top));
+    return frame;
+}
+#endif
+
+int CSubtitle::LineLeft(const CLine& line, int anchor) const
+{
+    const auto offset = [](int width, int alignment) {
+        return alignment == 1 ? 0 : alignment == 2 ? width / 2 : width;
+    };
+    const int normal = m_scrAlignment % 3;
+#ifdef _VSMOD
+    if (m_verticalLaidOut) return anchor - offset(line.m_width, normal);
+    const int text = m_textAnchor < 0 ? normal : m_textAnchor;
+    if (line.m_horizontalAnchor >= 0)
+        return anchor - offset(m_textWidth, text) + offset(m_textWidth - line.m_width, line.m_horizontalAnchor);
+    return anchor - offset(line.m_width, text);
+#else
+    return anchor - offset(line.m_width, normal);
+#endif
+}
+
+#ifdef _VSMOD
+namespace
+{
+class EventBoxPath : public CWord
+{
+    std::vector<POINT> points;
+    std::vector<BYTE> types;
+
+    bool CreatePath() override
+    {
+        return CopyPath(points.data(), types.data(), points.size());
+    }
+
+public:
+    EventBoxPath(STSStyle& style, double sx, double sy, KfxPaint::Rect plane) : CWord(style, L".", 0, 0, 0, sx, sy)
+    {
+        isOpaqueBox = true;
+        m_style.outlineWidthX = m_style.outlineWidthY = 0;
+        m_style.shadowDepthX = m_style.shadowDepthY = 0;
+        m_style.borderStyle = 0;
+        m_style.nativeOutline.reset();
+        m_style.mod_rand.clear();
+        m_style.fBlur = 0;
+        m_style.fGaussianBlurX = m_style.fGaussianBlurY = 0;
+        if (m_style.mod_distort.enabled)
+            m_distortionDomain = std::make_unique<CRect>(LONG(std::lround(plane.left * 8)),
+                LONG(std::lround(plane.top * 8)), LONG(std::lround(plane.right * 8)), LONG(std::lround(plane.bottom * 8)));
+#ifdef _LUA
+        m_style.LuaBeforeTransformHandler.Empty();
+        m_style.LuaCustomTransformHandler.Empty();
+        m_style.LuaAfterTransformHandler.Empty();
+#endif
+    }
+
+    CWord* Copy() override { return new EventBoxPath(*this); }
+
+    void AddPolygon(std::initializer_list<RenderGeometry::Point> polygon)
+    {
+        const auto first = types.size();
+        for (const auto& point : polygon)
+        {
+            points.push_back({LONG(std::lround(point.x * 8)), LONG(std::lround(point.y * 8))});
+            types.push_back(PT_LINETO);
+        }
+        if (!polygon.size()) return;
+        types[first] = PT_MOVETO;
+        types.back() |= PT_CLOSEFIGURE;
+    }
+
+    void AddContour(KfxPaint::Rect rect, double rx, double ry, bool hole)
+    {
+        const auto start = points.size();
+        const auto push = [&](double x, double y) {
+            points.push_back({LONG(std::lround(x * 8)), LONG(std::lround(y * 8))});
+            types.push_back(PT_LINETO);
+        };
+        rx = (std::min)(rx, (rect.right - rect.left) / 2);
+        ry = (std::min)(ry, (rect.bottom - rect.top) / 2);
+        if (rx <= 0 || ry <= 0)
+        {
+            push(rect.left, rect.top);
+            push(rect.right, rect.top);
+            push(rect.right, rect.bottom);
+            push(rect.left, rect.bottom);
+        }
+        else
+        {
+            const double cx[] = {rect.right-rx, rect.right-rx, rect.left+rx, rect.left+rx};
+            const double cy[] = {rect.top+ry, rect.bottom-ry, rect.bottom-ry, rect.top+ry};
+            const int segments = (std::min)(32, 8 + int(std::sqrt((std::max)(rx, ry) / 8)));
+            constexpr double quarter = 1.57079632679489661923;
+            for (int corner = 0; corner < 4; ++corner)
+                for (int step = 0; step <= segments; ++step)
+                {
+                    const double angle = (corner - 1 + double(step) / segments) * quarter;
+                    push(cx[corner] + rx * std::cos(angle), cy[corner] + ry * std::sin(angle));
+                }
+        }
+        if (hole)
+            std::reverse(points.begin() + start, points.end());
+        types[start] = PT_MOVETO;
+    }
+};
+}
+
+void CSubtitle::CreateEventBox(int borderStyle, int time, bool scaledBorder)
+{
+    m_eventBox.clear();
+    if ((m_boxMode < 0 ? borderStyle != 2 : m_boxMode == 0) || IsEmpty())
+        return;
+
+    if (!m_scrollContexts.empty())
+    {
+        struct Section { CWord* word; double left, top, right, bottom; };
+        std::vector<Section> sections;
+        int y = 0;
+        for (auto lines = GetHeadPosition(); lines;)
+        {
+            auto* line = GetNext(lines);
+            int x = LineLeft(*line, 0);
+            const int height = line->m_ascent + line->m_descent;
+            for (auto words = line->GetHeadPosition(); words;)
+            {
+                auto* word = line->GetNext(words);
+                const int next = x + word->m_width;
+                if (!word->m_fWhiteSpaceChar && !word->m_fLineBreak && !word->m_isRubyReading &&
+                    (word->m_ktype != 3 || time >= word->m_kstart) && next > x)
+                {
+                    if (sections.empty() || sections.back().word->m_scrollGroup != word->m_scrollGroup)
+                        sections.push_back({word, double(x), double(y), double(next), double(y+height)});
+                    else
+                    {
+                        auto& section = sections.back();
+                        section.left = (std::min)(section.left, double(x));
+                        section.right = (std::max)(section.right, double(next));
+                        section.bottom = y + height;
+                    }
+                }
+                x = next;
+            }
+            y += height;
+        }
+        for (auto i = sections.rbegin(); i != sections.rend(); ++i)
+            AddBoxRegion(*i->word, i->left, i->top, i->right, i->bottom, scaledBorder);
+        return;
+    }
+
+    CWord* canonical = nullptr;
+    double left = 0, right = 0;
+    POSITION lines = GetHeadPosition();
+    while (lines)
+    {
+        auto* line = GetNext(lines);
+        const double x = LineLeft(*line, 0);
+        left = (std::min)(left, x);
+        right = (std::max)(right, x + line->m_width);
+        if (canonical) continue;
+        POSITION words = line->GetHeadPosition();
+        while (words && !canonical)
+        {
+            auto* word = line->GetNext(words);
+            if (!word->m_fWhiteSpaceChar && !word->m_fLineBreak && (word->m_ktype != 3 || time >= word->m_kstart))
+                canonical = word;
+        }
+    }
+    if (!canonical || right <= left || m_rect.Height() <= 0)
+        return;
+
+    AddBoxRegion(*canonical, left, 0, right, m_rect.Height(), scaledBorder);
+}
+
+void CSubtitle::AddBoxRegion(CWord& word, double left, double top, double right, double bottom, bool scaledBorder)
+{
+    auto& style = word.m_style;
+    const double soft = style.softScale > 0 ? style.softScale : 100;
+    const double sx = std::abs(style.fontScaleX) / soft * (scaledBorder ? m_scalex : 1) * 8;
+    const double sy = std::abs(style.fontScaleY) / soft * (scaledBorder ? m_scaley : 1) * 8;
+    const KfxPaint::BoxShape defaults;
+    const auto& box = style.boxShape ? *style.boxShape : defaults;
+    const auto bounded = [](double pixels) { return (std::min)(pixels, 8192.0); };
+    const double edgeX = (std::max)(0., style.shadowDepthX) + style.outlineWidthX;
+    const double edgeTop = (std::max)(0., style.shadowDepthY) + m_topborder;
+    const double edgeBottom = (std::max)(0., style.shadowDepthY) + m_bottomborder;
+    const KfxPaint::Rect rect{left - m_annotationLeft - edgeX - bounded(box.padding[0] * sx), top - edgeTop - bounded(box.padding[2] * sy),
+        right + m_annotationRight + edgeX + bounded(box.padding[1] * sx), bottom + edgeBottom + bounded(box.padding[3] * sy)};
+    const double radiusX = (std::min)(bounded(box.radius * sx), (rect.right - rect.left) / 2);
+    const double radiusY = (std::min)(bounded(box.radius * sy), (rect.bottom - rect.top) / 2);
+    const auto expand = [&](double x, double y) {
+        return KfxPaint::Rect{rect.left-x, rect.top-y, rect.right+x, rect.bottom+y};
+    };
+    auto fill = std::make_unique<EventBoxPath>(style, m_scalex, m_scaley, rect);
+    fill->m_scrollGroup = word.m_scrollGroup;
+    fill->AddContour(rect, radiusX, radiusY, false);
+    m_eventBox.push_back(std::move(fill));
+    double x = 0, y = 0;
+    if (style.boxRings)
+        for (const auto& layer : style.boxRings->layers)
+        {
+            if (layer.x <= 0) continue;
+            const double outerX = bounded(x + layer.x * sx);
+            const double outerY = bounded(y + layer.x * sy);
+            if (outerX == x && outerY == y) continue;
+            auto ring = std::make_unique<EventBoxPath>(style, m_scalex, m_scaley, rect);
+            ring->m_scrollGroup = word.m_scrollGroup;
+            ring->AddContour(expand(outerX, outerY), radiusX + outerX, radiusY + outerY, false);
+            ring->AddContour(expand(x, y), radiusX + x, radiusY + y, true);
+            auto& paint = ring->m_style;
+            paint.mod_grad.clear();
+            if (layer.color >= 0) paint.colors[3] = revcolor(layer.color);
+            if (layer.inverseAlpha >= 0) paint.alpha[3] = BYTE(layer.inverseAlpha);
+            if (layer.paint[0] || layer.paint[1])
+            {
+                auto sources = std::make_shared<KfxPaint::Sources>();
+                sources->parts[6] = layer.paint[0];
+                sources->parts[7] = layer.paint[1];
+                paint.mod_grad.paint = std::move(sources);
+            }
+            m_eventBox.push_back(std::move(ring));
+            x = outerX;
+            y = outerY;
+        }
+}
+
+void CSubtitle::ArrangeChat(STSStyle& style, int frameHeight)
+{
+    if (IsEmpty() || m_chat->messages.empty()) return;
+    auto& chat = *m_chat;
+    const int pad = chat.pad;
+    const int oldHeight = m_rect.Height(), oldWidth = m_rect.Width();
+    const int alignX = m_scrAlignment % 3;
+    const int left = alignX == 1 ? 0 : alignX == 2 ? -chat.width / 2 : -chat.width;
+    const int fontHeight = (std::max)(8, int(style.fontSize * m_scaley * 8));
+    chat.headerHeight = chat.title.IsEmpty() ? pad : fontHeight + pad * 2;
+    struct Row { CLine* line; int top; };
+    std::vector<std::vector<Row>> messageRows(chat.messages.size());
+    int originalY = 0;
+    for (auto at = GetHeadPosition(); at;)
+    {
+        auto* line = GetNext(at);
+        if (!line->IsEmpty())
+        {
+            const auto group = line->GetHead()->m_scrollGroup;
+            if (group && group <= messageRows.size())
+                messageRows[group - 1].push_back({line, originalY});
+        }
+        originalY += line->m_ascent + line->m_descent;
+    }
+    auto labels = std::make_unique<CLine>();
+    labels->m_width = chat.width;
+    labels->m_ascent = labels->m_descent = labels->m_borderX = labels->m_borderY = 0;
+    STSStyle shapes(style);
+    shapes.fontAngleX = shapes.fontAngleY = shapes.fontAngleZ = 0;
+    shapes.fontShiftX = shapes.fontShiftY = shapes.mod_z = 0;
+    shapes.mod_distort = MOD_DISTORT();
+    shapes.mod_grad.clear();
+    shapes.mod_jitter = MOD_JITTER();
+    const auto rect = [&](KfxPaint::Rect bounds, double rad, DWORD color, BYTE inverseAlpha, unsigned group,
+                          double thickness = 0., int receipt = 0) {
+        auto shape = std::make_unique<EventBoxPath>(shapes, m_scalex, m_scaley, bounds);
+        shape->m_style.colors[3] = color;
+        shape->m_style.alpha[3] = inverseAlpha;
+        shape->m_scrollGroup = group;
+        shape->m_chatReceipt = receipt;
+        shape->AddContour(bounds, rad, rad, false);
+        if (thickness > 0 && bounds.right - bounds.left > thickness * 2 && bounds.bottom - bounds.top > thickness * 2)
+            shape->AddContour({bounds.left + thickness, bounds.top + thickness,
+                bounds.right - thickness, bounds.bottom - thickness}, rad - thickness, rad - thickness, true);
+        m_eventBox.push_back(std::move(shape));
+    };
+    const auto label = [&](const CStringW& text, int x, int y, DWORD color, BYTE inverseAlpha, unsigned group) {
+        STSStyle face(shapes);
+        face.fontSize = fontHeight * 6.;
+        face.colors[0] = color;
+        face.alpha[0] = inverseAlpha;
+        face.outlineWidthX = face.outlineWidthY = face.shadowDepthX = face.shadowDepthY = 0;
+        face.borderStyle = 0;
+        auto word = std::make_unique<CText>(face, text, 0, 0, 0, m_scalex, m_scaley);
+        word->m_scrollGroup = group;
+        word->PlaceLayout(CPoint(x, y - originalY + word->m_ascent), 1, 0, 0, 0);
+        word->m_width = 0;
+        labels->AddTail(word.get());
+        word.release();
+    };
+    int y = chat.headerHeight + pad;
+    for (size_t i = 0; i < messageRows.size(); ++i)
+    {
+        auto& message = chat.messages[i];
+        message.start = chat.AppearanceTime(i);
+        message.top = y;
+        if (messageRows[i].empty()) { message.bottom = y; continue; }
+        int width = 0;
+        for (const auto& row : messageRows[i]) width = (std::max)(width, row.line->m_width);
+        const auto& skin = message.skin;
+        const int border = (std::min)(pad * 2, int(skin.border * m_scalex * 8));
+        const int bubbleWidth = (std::min)(chat.width - pad * 2, width + (pad + border) * 2);
+        const int x = message.right ? chat.width - pad - bubbleWidth : pad;
+        y += pad + border;
+        if (message.showName && !message.name.IsEmpty())
+        {
+            label(message.name, x + pad + border, y, message.colors[1], message.alpha[1], unsigned(i + 1));
+            y += fontHeight;
+        }
+        for (const auto& row : messageRows[i])
+        {
+            for (auto words = row.line->GetHeadPosition(); words;)
+                row.line->GetNext(words)->OffsetLayout(CPoint(x + pad + border, y - row.top));
+            row.line->m_width = chat.width;
+            row.line->m_horizontalAnchor = -1;
+            y += row.line->m_ascent + row.line->m_descent;
+        }
+        y += pad + border;
+        message.bottom = y;
+        const KfxPaint::Rect bubble{double(left + x), double(message.top), double(left + x + bubbleWidth), double(y)};
+        if (message.right && message.receipt > 0)
+        {
+            // Small paired strokes live in the bubble's padding.
+            const int right = int(bubble.right) - pad / 2;
+            const int bottom = y - pad / 3;
+            const auto check = [&](int dx, int stage) {
+                const int length = (std::max)(8, pad / 3);
+                const int weight = (std::max)(6, pad / 10);
+                const int px = right - dx;
+                auto draw = std::make_unique<EventBoxPath>(shapes, m_scalex, m_scaley, bubble);
+                draw->AddPolygon({{double(px-2*length),double(bottom-length)}, {double(px-length),double(bottom)},
+                    {double(px),double(bottom-2*length)}, {double(px-weight),double(bottom-2*length-weight)},
+                    {double(px-length),double(bottom-weight)}, {double(px-2*length+weight),double(bottom-length-weight)}});
+                draw->m_style.colors[3] = message.colors[0];
+                draw->m_style.alpha[3] = message.alpha[0];
+                draw->m_scrollGroup = unsigned(i + 1);
+                draw->m_chatReceipt = stage;
+                m_eventBox.push_back(std::move(draw));
+            };
+            if (message.receipt == 2) check(pad / 4, 2);
+            check(0, 1);
+        }
+        if (border)
+            rect(bubble, pad, skin.borderColor >= 0 ? revcolor(skin.borderColor) : 0,
+                BYTE(skin.borderAlpha >= 0 ? skin.borderAlpha : 0), unsigned(i + 1), border);
+        rect(bubble, pad, message.colors[2], message.alpha[2], unsigned(i + 1));
+        y += pad;
+    }
+    chat.viewport = (std::max)(pad * 2, (std::min)(int(frameHeight * .68), y - chat.headerHeight));
+    const int height = chat.headerHeight + chat.viewport;
+    const DWORD panel = style.colors[3] & 0xffffff;
+    const bool dark = ((panel & 255) + ((panel >> 8) & 255) + ((panel >> 16) & 255)) < 384;
+    if (!chat.title.IsEmpty())
+    {
+        label(chat.title, pad * 2, pad, chat.headerColor >= 0 ? revcolor(chat.headerColor) :
+            dark ? 0xffffff : 0, 0, 0);
+        rect({double(left), 0, double(left + chat.width), double(chat.headerHeight)}, pad,
+            chat.headerBackground >= 0 ? revcolor(chat.headerBackground) : dark ? 0 : 0xffffff, 0, 0);
+    }
+    rect({double(left), 0, double(left + chat.width), double(height)}, pad, panel, style.alpha[3], 0);
+    if (!labels->IsEmpty()) { AddTail(labels.get()); labels.release(); }
+    const int dx = chat.width - oldWidth, dy = height - oldHeight;
+    const int xShift = alignX == 1 ? 0 : alignX == 2 ? dx / 2 : dx;
+    const int yShift = m_scrAlignment <= 3 ? dy : m_scrAlignment <= 6 ? dy / 2 : 0;
+    m_rect.left -= xShift;
+    m_rect.right += dx - xShift;
+    m_rect.top -= yShift;
+    m_rect.bottom += dy - yShift;
+    m_textWidth = chat.width;
+}
+
+namespace
+{
+unsigned FirstScalar(const CStringW& text)
+{
+    int index = 0;
+    if (text.IsEmpty()) return 0;
+    const unsigned first = text[index++];
+    if (first >= 0xd800 && first <= 0xdbff && index < text.GetLength())
+    {
+        const unsigned second = text[index];
+        if (second >= 0xdc00 && second <= 0xdfff)
+            return 0x10000 + ((first - 0xd800) << 10) + second - 0xdc00;
+    }
+    return first;
+}
+
+bool CoreCjk(unsigned c)
+{
+    return (c >= 0x3040 && c <= 0x30ff) || (c >= 0x31f0 && c <= 0x31ff) ||
+        (c >= 0x3400 && c <= 0x9fff) || (c >= 0xf900 && c <= 0xfaff) ||
+        (c >= 0x1100 && c <= 0x11ff) || (c >= 0x3130 && c <= 0x318f) ||
+        (c >= 0xac00 && c <= 0xd7af) || (c >= 0x20000 && c <= 0x323af);
+}
+
+bool Myanmar(unsigned c)
+{
+    return (c >= 0x1000 && c <= 0x109f) || (c >= 0xa9e0 && c <= 0xa9ff) ||
+        (c >= 0xaa60 && c <= 0xaa7f);
+}
+
+bool CjkVerticalForm(unsigned c)
+{
+    return CoreCjk(c) || (c >= 0x3000 && c <= 0x303f) ||
+        (c >= 0xfe10 && c <= 0xfe4f) || (c >= 0xff01 && c <= 0xff65);
+}
+
+enum class MyanmarPart { Other, Base, Mark, Asat, Stack, Join };
+
+MyanmarPart MyanmarClass(unsigned c)
+{
+    if (c == 0x103a) return MyanmarPart::Asat;
+    if (c == 0x1039) return MyanmarPart::Stack;
+    if (c == 0x200c || c == 0x200d) return MyanmarPart::Join;
+    if ((c >= 0x1000 && c <= 0x1021) || (c >= 0x1023 && c <= 0x1027) ||
+        c == 0x1029 || c == 0x102a || c == 0x103f || c == 0x104e)
+        return MyanmarPart::Base;
+    if ((c >= 0x102b && c <= 0x103e) || (c >= 0x1056 && c <= 0x1059) ||
+        (c >= 0x1060 && c <= 0x109d) || (c >= 0xaa7b && c <= 0xaa7d))
+        return MyanmarPart::Mark;
+    return MyanmarPart::Other;
+}
+
+bool MyanmarContinuation(const std::vector<ShapedWord*>& words, size_t at)
+{
+    const auto& current = words[at]->Text();
+    const auto& previous = words[at - 1]->Text();
+    const auto next = MyanmarClass(FirstScalar(current));
+    if (next == MyanmarPart::Other) return false;
+    if (next != MyanmarPart::Base) return true;
+    const auto last = MyanmarClass(previous[previous.GetLength() - 1]);
+    if (last == MyanmarPart::Stack || last == MyanmarPart::Join) return true;
+    if (last == MyanmarPart::Other) return false;
+    // An asat can follow tone marks on a final consonant in a later cluster.
+    for (size_t i = at; i < words.size() && words[i]; ++i)
+    {
+        const auto& text = words[i]->Text();
+        for (int j = i == at ? 1 : 0; j < text.GetLength(); ++j)
+        {
+            const auto part = MyanmarClass(text[j]);
+            if (part == MyanmarPart::Asat) return true;
+            if (part != MyanmarPart::Mark && part != MyanmarPart::Join) return false;
+        }
+    }
+    return false;
+}
+
+struct InkBox
+{
+    double left = 0, top = 0, right = 0, bottom = 0;
+    bool valid = false;
+    void Add(double x, double y)
+    {
+        if (!valid) { left = right = x; top = bottom = y; valid = true; }
+        else
+        {
+            left = (std::min)(left, x);
+            right = (std::max)(right, x);
+            top = (std::min)(top, y);
+            bottom = (std::max)(bottom, y);
+        }
+    }
+    void Add(const InkBox& b, double x = 0, double y = 0)
+    {
+        if (!b.valid) return;
+        Add(b.left + x, b.top + y);
+        Add(b.right + x, b.bottom + y);
+    }
+    void Move(double x, double y) { left += x; right += x; top += y; bottom += y; }
+};
+
+InkBox WordInk(const CWord& word, bool includeStroke)
+{
+    InkBox box;
+    if (word.m_fWhiteSpaceChar) return box;
+    if (const auto* shaped = dynamic_cast<const ShapedWord*>(&word))
+        shaped->OutlinePoints([&](RenderGeometry::Point p) { box.Add(p.x, p.y); });
+    else
+    {
+        box.Add(0, 0);
+        box.Add(word.m_width, word.m_ascent + word.m_descent);
+    }
+    if (includeStroke && box.valid)
+    {
+        const auto& style = word.m_style;
+        double x = style.outlineWidthX + 4, y = style.outlineWidthY + 4;
+        if (style.nativeOutline)
+            for (const auto& layer : style.nativeOutline->layers)
+                if (layer.number) { x += layer.x; y += layer.y; }
+        box.left -= x + (std::max)(0., -style.shadowDepthX);
+        box.right += x + (std::max)(0., style.shadowDepthX);
+        box.top -= y + (std::max)(0., -style.shadowDepthY);
+        box.bottom += y + (std::max)(0., style.shadowDepthY);
+    }
+    return box;
+}
+
+struct VerticalUnit
+{
+    size_t first, last;
+    double left, top, width, height, gap;
+    bool sideways, canBreak;
+};
+
+VerticalUnit MeasureVerticalUnit(const std::vector<ShapedWord*>& words, size_t start, int preferred, double spacing)
+{
+    const auto c = FirstScalar(words[start]->Text());
+    const int profile = preferred ? preferred : CjkVerticalForm(c) ? 1 : Myanmar(c) ? 3 : 2;
+    const bool sideways = profile == 1 && c >= 0x21 && c != 0xa0 && !CjkVerticalForm(c) && !Myanmar(c);
+    size_t end = start + 1;
+    while (end < words.size() && words[end] && words[end - 1]->SameClusterFollows()) ++end;
+    if (Myanmar(c))
+        while (end < words.size() && words[end] && words[end]->m_rubyGroup == words[start]->m_rubyGroup &&
+                (words[end - 1]->SameClusterFollows() || MyanmarContinuation(words, end)))
+            ++end;
+    InkBox ink;
+    double emX = 1, emY = 1, pen = 0;
+    for (size_t i = start; i < end; ++i)
+    {
+        const auto& word = *words[i];
+        emX = (std::max)(emX, word.m_style.fontSize / 8 * word.m_style.fontScaleX / 100);
+        emY = (std::max)(emY, word.m_style.fontSize / 8 * word.m_style.fontScaleY / 100);
+        word.OutlinePoints([&](RenderGeometry::Point p) {
+            p.x += pen;
+            if (sideways) p = {-p.y, p.x};
+            ink.Add(p.x, p.y);
+        });
+        pen += word.m_width;
+    }
+    const double width = (std::max)(ink.right - ink.left, emX * (profile == 1 ? 1. : profile == 2 ? .4 : .65));
+    double height = (std::max)(ink.bottom - ink.top, emY * (profile == 1 ? 1. : profile == 2 ? .36 : .55));
+    if (!ink.valid && profile != 1) height = (std::max)(height, (std::min)(pen, emY * .6));
+    const double gap = (std::max)(-.9 * height, spacing + emY * (profile == 1 ? 0. : profile == 2 ? .14 : .18));
+    return {start, end, (ink.left + ink.right - width) / 2, (ink.top + ink.bottom - height) / 2,
+        width, height, gap, sideways, profile != 2 || words[end - 1]->m_wrapAfter};
+}
+
+struct VerticalGlyph
+{
+    CWord* word;
+    double x, y;
+    bool sideways;
+    double scaleY = 1;
+};
+
+InkBox VerticalInk(const VerticalGlyph& glyph)
+{
+    auto bounds = WordInk(*glyph.word, true);
+    if (glyph.sideways)
+        bounds = {-bounds.bottom, bounds.left, -bounds.top, bounds.right, bounds.valid};
+    bounds.top *= glyph.scaleY;
+    bounds.bottom *= glyph.scaleY;
+    bounds.Move(glyph.x, glyph.y);
+    return bounds;
+}
+}
+
+void CSubtitle::PlaceHorizontalRuby()
+{
+    PROFILE_RENDER_STAGE(NativeLayout);
+    struct Line
+    {
+        CLine* words;
+        int y;
+        bool strict = false, reserve = false;
+        std::vector<InkBox> occupied;
+    };
+    std::vector<Line> lines;
+    int lineY = 0;
+    const int alignX = m_scrAlignment % 3;
+    const int alignY = m_scrAlignment <= 3 ? 2 : m_scrAlignment <= 6 ? 1 : 0;
+    const int oldWidth = m_textWidth;
+    for (auto next = GetHeadPosition(); next;)
+    {
+        auto* line = GetNext(next);
+        lines.push_back({line, lineY, false, false, {}});
+        lineY += line->m_ascent + line->m_descent;
+    }
+    for (size_t row = 0; row < lines.size(); ++row)
+    {
+        auto& info = lines[row];
+        auto& line = *info.words;
+        struct RubyPaint { std::vector<std::unique_ptr<CWord>>* words; InkBox bounds; double x, y; };
+        std::vector<RubyPaint> readings;
+        InkBox lastSide[2];
+        double pen = 0, shift = 0;
+        for (auto next = line.GetHeadPosition(); next;)
+        {
+            const auto first = next;
+            auto* word = line.GetNext(next);
+            if (!word->m_rubyGroup)
+            {
+                if (shift) word->PlaceLayout(CPoint(LONG(std::lround(shift)), 0), 1, 0, 0, 0);
+                auto area = WordInk(*word, true);
+                area.Move(pen + shift, line.m_ascent - word->m_ascent);
+                if (area.valid) info.occupied.push_back(area);
+                pen += word->m_width;
+                continue;
+            }
+            auto& group = m_rubyGroups[word->m_rubyGroup - 1];
+            const auto& options = group.options;
+            info.strict |= options.placement == 2;
+            info.reserve |= options.placement == 1;
+            struct Slot { POSITION position; CWord* word; double x; };
+            std::vector<Slot> base{{first, word, 0}};
+            double baseWidth = word->m_width;
+            for (; next && line.GetAt(next)->m_rubyGroup == word->m_rubyGroup;)
+            {
+                const auto position = next;
+                auto* glyph = line.GetNext(next);
+                base.push_back({position, glyph, baseWidth});
+                baseWidth += glyph->m_width;
+            }
+            InkBox baseInk, baseBand;
+            for (const auto& glyph : base)
+            {
+                const double y = line.m_ascent - glyph.word->m_ascent;
+                baseInk.Add(WordInk(*glyph.word, false), glyph.x, y);
+                baseBand.Add(WordInk(*glyph.word, true), glyph.x, y);
+            }
+            const double em = word->m_style.fontSize * word->m_style.fontScaleY / 800;
+            const double gap = (std::max)(8., em * .04) + (!options.manual && options.autoGap ? em * .04 : 0);
+            const double manualX = options.manual ? options.offsetX * m_scalex * 8 : 0;
+            const double manualY = options.manual ? -options.offsetY * m_scaley * 8 : 0;
+            const bool lower = options.outward && lines.size() == 2 ? row != 0 :
+                options.manual && manualY > (baseBand.bottom - baseBand.top) * .5;
+            std::vector<RubyPaint> pending;
+            double room = 0;
+            for (size_t reading = 0; reading < group.annotations.size(); ++reading)
+            {
+                auto& glyphs = group.annotations[reading];
+                if (glyphs.empty() || !baseInk.valid) continue;
+                auto measure = [&](bool stroke) {
+                    InkBox bounds;
+                    double width = 0;
+                    for (const auto& glyph : glyphs)
+                    {
+                        bounds.Add(WordInk(*glyph, stroke), width, -glyph->m_ascent);
+                        width += glyph->m_width;
+                    }
+                    return bounds;
+                };
+                auto ink = measure(false);
+                const double available = baseInk.right - baseInk.left;
+                if (options.style == 2 && available > 0 && ink.right - ink.left > available)
+                {
+                    const double fit = available / (ink.right - ink.left);
+                    for (auto& glyph : glyphs)
+                    {
+                        glyph->m_style.fontScaleX *= fit;
+                        glyph->m_width = int(std::lround(glyph->m_width * fit));
+                    }
+                    ink = measure(false);
+                }
+                auto band = measure(true);
+                if (!band.valid) continue;
+                const size_t side = lower ^ (reading != 0);
+                const double x = pen + shift + (baseInk.left + baseInk.right - ink.left - ink.right) / 2 + manualX;
+                const double attach = side ? baseBand.bottom + gap - band.top : baseBand.top - gap - band.bottom;
+                const double y = side ? (std::max)(attach, attach + manualY) : (std::min)(attach, attach + manualY);
+                band.Move(x, y);
+                if (lastSide[side].valid)
+                    room = (std::max)(room, lastSide[side].right + (std::max)(8., em * .04) - band.left);
+                pending.push_back({&glyphs, band, x, y});
+                lastSide[side] = band;
+            }
+            shift += room;
+            for (auto& reading : pending)
+            {
+                reading.x += room;
+                reading.bounds.Move(room, 0);
+                const size_t side = reading.bounds.bottom > baseBand.bottom;
+                lastSide[side] = reading.bounds;
+                info.occupied.push_back(reading.bounds);
+                readings.push_back(reading);
+            }
+            baseBand.Move(pen + shift, 0);
+            if (baseBand.valid) info.occupied.push_back(baseBand);
+            double durationWidth = 0;
+            for (const auto& timing : group.baseTiming) durationWidth += timing.width;
+            for (const auto& glyph : base)
+            {
+                auto& current = *glyph.word;
+                current.PlaceLayout(CPoint(LONG(std::lround(shift)), 0), 1, 0, 0, 0);
+                const int advance = current.m_width;
+                if (durationWidth <= 0 || advance <= 0) continue;
+                double begin = 0;
+                for (size_t index = 0; index < group.baseTiming.size(); ++index)
+                {
+                    const auto& timing = group.baseTiming[index];
+                    const double end = begin + timing.width * baseWidth / durationWidth;
+                    const double startInWord = begin - glyph.x, endInWord = end - glyph.x;
+                    begin = end;
+                    if (endInWord <= 0 || startInWord >= advance) continue;
+                    const bool last = endInWord >= advance - .01;
+                    std::unique_ptr<CWord> copy(last ? nullptr : current.Copy());
+                    auto& slice = copy ? *copy : current;
+                    slice.m_ktype = timing.type;
+                    slice.m_kstart = timing.start;
+                    slice.m_kend = timing.end;
+                    slice.ClipRubyCoverage(startInWord <= 0 ? INT_MIN : int(std::lround(startInWord)),
+                        last ? INT_MAX : int(std::lround(endInWord)));
+                    if (copy)
+                    {
+                        slice.m_width = 0;
+                        line.InsertBefore(glyph.position, copy.get());
+                        copy.release();
+                    }
+                }
+            }
+            pen += baseWidth;
+        }
+        line.m_width = int(std::lround(pen + shift));
+        for (const auto& reading : readings)
+        {
+            double x = reading.x;
+            for (const auto& source : *reading.words)
+            {
+                auto glyph = std::unique_ptr<CWord>(source->Copy());
+                glyph->PlaceLayout(CPoint(LONG(std::lround(x - pen)),
+                    LONG(std::lround(reading.y - line.m_ascent))), 1, 0, 0, 0);
+                x += glyph->m_width;
+                glyph->m_width = 0;
+                line.AddTail(glyph.get());
+                glyph.release();
+            }
+        }
+    }
+    m_textWidth = 0;
+    for (const auto& line : lines) m_textWidth = (std::max)(m_textWidth, line.words->m_width);
+    const int widthAdded = m_textWidth - oldWidth;
+    const int widthShift = alignX == 1 ? 0 : alignX == 2 ? widthAdded / 2 : widthAdded;
+    m_rect.left -= widthShift;
+    m_rect.right += widthAdded - widthShift;
+    InkBox previous, all, reserved;
+    int added = 0;
+    for (size_t index = 0; index < lines.size(); ++index)
+    {
+        auto& line = lines[index];
+        const int x = LineLeft(*line.words, 0);
+        for (auto& box : line.occupied) box.Move(x, line.y + added);
+        double separation = 0;
+        if (index > 0)
+        {
+            const bool strict = line.strict || lines[index - 1].strict || line.reserve || lines[index - 1].reserve;
+            for (const auto& box : line.occupied)
+            {
+                if (strict && previous.valid)
+                    separation = (std::max)(separation, previous.bottom - box.top + 8);
+                else if (!strict)
+                    for (const auto& before : lines[index - 1].occupied)
+                        if (before.right > box.left && before.left < box.right)
+                            separation = (std::max)(separation, before.bottom - box.top + 8);
+            }
+        }
+        previous = {};
+        const int step = int(std::ceil(separation));
+        if (step > 0)
+        {
+            lines[index - 1].words->m_descent += step;
+            added += step;
+        }
+        for (auto& box : line.occupied)
+        {
+            box.Move(0, step);
+            previous.Add(box);
+            all.Add(box);
+            if (line.reserve) reserved.Add(box);
+        }
+    }
+    const int top = int(std::ceil((std::max)(0., -reserved.top)));
+    const int bottom = int(std::ceil((std::max)(0., reserved.bottom - (lineY + added))));
+    if (lines.empty()) return;
+    lines.front().words->m_ascent += top;
+    lines.back().words->m_descent += bottom;
+    added += top + bottom;
+    const int heightShift = alignY == 2 ? added : alignY == 1 ? added / 2 : 0;
+    m_rect.top -= heightShift;
+    m_rect.bottom += added - heightShift;
+    if (all.valid)
+    {
+        const int baseLeft = alignX == 1 ? 0 : alignX == 2 ? -m_rect.Width() / 2 : -m_rect.Width();
+        m_annotationLeft = int(std::ceil((std::max)(0., baseLeft - all.left)));
+        m_annotationRight = int(std::ceil((std::max)(0., all.right - (baseLeft + m_rect.Width()))));
+        m_topborder = (std::max)(m_topborder, int(std::ceil(-all.top - top)));
+        m_bottomborder = (std::max)(m_bottomborder, int(std::ceil(all.bottom + top - (lineY + added))));
+    }
+}
+
+void CSubtitle::ArrangeColumns()
+{
+    PROFILE_RENDER_STAGE(NativeLayout);
+    struct Cell
+    {
+        size_t first, last;
+        unsigned block, column;
+        double start, end, left, right;
+    };
+    struct Row
+    {
+        CLine* line;
+        std::vector<CWord*> words;
+        std::vector<Cell> cells;
+        double width = 0;
+    };
+    struct Table
+    {
+        std::vector<double> widths, offsets;
+        double left = 1e9, width = 0;
+    };
+    std::vector<Table> tables(m_columnBlocks.size());
+    for (size_t i = 0; i < tables.size(); ++i) tables[i].widths.resize(m_columnBlocks[i]->columns.size());
+    std::vector<Row> rows;
+    for (auto next = GetHeadPosition(); next;)
+    {
+        auto* line = GetNext(next);
+        rows.push_back({line, {}, {}});
+        auto& row = rows.back();
+        for (auto pos = line->GetHeadPosition(); pos;)
+            row.words.push_back(line->GetNext(pos));
+        for (size_t i = 0; i < row.words.size();)
+        {
+            const auto id = row.words[i]->m_columnCell;
+            if (!id)
+            {
+                row.width += row.words[i++]->m_width;
+                continue;
+            }
+            Cell cell{i, i, (id >> 16) - 1, id & 0xffff, row.width, row.width, row.width, row.width};
+            for (; i < row.words.size() && row.words[i]->m_columnCell == id; ++i)
+            {
+                const auto& word = *row.words[i];
+                const auto ink = WordInk(word, false);
+                if (ink.valid)
+                {
+                    cell.left = (std::min)(cell.left, row.width + ink.left);
+                    cell.right = (std::max)(cell.right, row.width + ink.right);
+                }
+                row.width += word.m_width;
+            }
+            cell.last = i;
+            cell.end = row.width;
+            cell.right = (std::max)(cell.right, row.width);
+            auto& table = tables[cell.block];
+            table.left = (std::min)(table.left, cell.start);
+            table.widths[cell.column] = (std::max)(table.widths[cell.column], cell.right - cell.left);
+            row.cells.push_back(cell);
+        }
+    }
+    for (size_t i = 0; i < tables.size(); ++i)
+    {
+        auto& table = tables[i];
+        const auto& columns = m_columnBlocks[i]->columns;
+        for (size_t column = 0; column < columns.size(); ++column)
+        {
+            table.offsets.push_back(table.width);
+            table.width += table.widths[column];
+            if (column + 1 < columns.size()) table.width += columns[column].spacing * m_scalex * 8;
+        }
+    }
+    const int oldWidth = m_textWidth;
+    m_textWidth = 0;
+    for (auto& row : rows)
+    {
+        double shift = 0, room = 0;
+        size_t i = 0;
+        const auto move = [&](size_t through, double offset) {
+            const auto x = LONG(std::lround(offset));
+            for (; i < through; ++i)
+                if (x) row.words[i]->PlaceLayout(CPoint(x, 0), 1, 0, 0, 0);
+        };
+        for (size_t j = 0; j < row.cells.size(); ++j)
+        {
+            const auto& cell = row.cells[j];
+            const auto& table = tables[cell.block];
+            const auto& column = m_columnBlocks[cell.block]->columns[cell.column];
+            const double fraction = column.alignment == 1 ? 0. : column.alignment == 2 ? .5 : 1.;
+            const double alignment = (table.widths[cell.column] - (cell.right - cell.left)) * fraction;
+            move(cell.first, shift);
+            move(cell.last, table.left + table.offsets[cell.column] + alignment - cell.left);
+            if (j + 1 == row.cells.size() || row.cells[j + 1].block != cell.block)
+            {
+                room = (std::max)(room, table.left + table.width);
+                shift = table.left + table.width - cell.end;
+            }
+        }
+        move(row.words.size(), shift);
+        row.line->m_width = int(std::ceil((std::max)(room, row.width + shift)));
+        m_textWidth = (std::max)(m_textWidth, row.line->m_width);
+    }
+    const int added = m_textWidth - oldWidth;
+    const int align = m_scrAlignment % 3;
+    const int shift = align == 1 ? 0 : align == 2 ? added / 2 : added;
+    m_rect.left -= shift;
+    m_rect.right += added - shift;
+}
+
+bool CSubtitle::MakeVerticalLines(int maxHeight, CSize& bounds)
+{
+    if (m_curveShapeFailed || m_words.IsEmpty()) return false;
+    PROFILE_RENDER_STAGE(NativeLayout);
+    std::vector<ShapedWord*> words;
+    int directionScore = 0, firstDirection = 0;
+    for (auto pos = m_words.GetHeadPosition(); pos;)
+    {
+        auto* word = m_words.GetNext(pos);
+        auto* shaped = dynamic_cast<ShapedWord*>(word);
+        if (!word->m_fLineBreak && !shaped) return false;
+        words.push_back(shaped);
+        if (!shaped) continue;
+        const unsigned c = FirstScalar(shaped->Text());
+        const bool latin = (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z') ||
+            (c >= 0xc0 && c <= 0x2af);
+        const int strength = CoreCjk(c) ? 1 : Myanmar(c) || latin ? -1 : 0;
+        directionScore += strength;
+        if (!firstDirection) firstDirection = strength;
+    }
+    if (words.size() > 8192) return false;
+    const bool leftward = m_verticalDirection ? m_verticalDirection == 1 :
+        directionScore > 0 || (!directionScore && firstDirection > 0);
+
+    struct Column { size_t first, last; double width, height; int anchor; };
+    std::vector<VerticalUnit> units;
+    std::vector<Column> columns;
+    const auto boundSpacing = [](double value) {
+        return (std::max)(-65536., (std::min)(65536., value));
+    };
+    const auto extra = boundSpacing(m_verticalSpacing * m_scaley * m_curveScale * 8);
+    const auto columnGap = boundSpacing(m_verticalColumnGap * m_scalex * m_curveScale * 8);
+    const auto gapAfter = [&](size_t at) { return (std::max)(units[at].gap, units[at + 1].gap); };
+    for (size_t start = 0; start < words.size();)
+    {
+        if (!words[start]) { ++start; continue; }
+        const size_t begin = units.size();
+        const auto logical = words[start]->m_logicalLine;
+        const auto selected = m_lineAlignment.find(logical);
+        const int alignment = selected != m_lineAlignment.end() ? selected->second.full :
+            m_verticalAnchor ? m_verticalAnchor : m_scrAlignment;
+        for (; start < words.size() && words[start];)
+        {
+            units.push_back(MeasureVerticalUnit(words, start, m_verticalProfile, extra));
+            start = units.back().last;
+        }
+
+        size_t first = begin;
+        while (first < units.size())
+        {
+            size_t last = first, legal = first;
+            double width = 0, height = 0;
+            for (; last < units.size(); ++last)
+            {
+                const auto candidate = height + units[last].height + (last == first ? 0 : gapAfter(last - 1));
+                const auto group = words[units[last].first]->m_rubyGroup;
+                if (last > first && m_wrapStyle != 2 &&
+                    (!group || words[units[last - 1].first]->m_rubyGroup != group))
+                {
+                    double occupied = candidate;
+                    if (group)
+                        for (size_t i = last + 1; i < units.size() && words[units[i].first]->m_rubyGroup == group; ++i)
+                            occupied += gapAfter(i - 1) + units[i].height;
+                    if (occupied > maxHeight) break;
+                }
+                height = candidate;
+                width = (std::max)(width, units[last].width);
+                if ((units[last].canBreak || group) &&
+                    (!group || last + 1 == units.size() || words[units[last + 1].first]->m_rubyGroup != group))
+                    legal = last + 1;
+            }
+            if (last < units.size() && legal > first && legal < last)
+            {
+                last = legal;
+                width = height = 0;
+                for (size_t i = first; i < last; ++i)
+                {
+                    height += units[i].height + (i == first ? 0 : gapAfter(i - 1));
+                    width = (std::max)(width, units[i].width);
+                }
+            }
+            columns.push_back({first, last, width, height, alignment});
+            first = last;
+        }
+    }
+    if (columns.empty()) return false;
+    const auto advanceColumn = [&](double width) { return (std::max)(width * .1, width + columnGap); };
+    double width = 0, height = 0;
+    for (size_t i = 0; i < columns.size(); ++i)
+    {
+        width += i + 1 == columns.size() ? columns[i].width : advanceColumn(columns[i].width);
+        height = (std::max)(height, columns[i].height);
+    }
+    if (width > 4000000 || height > 4000000) return false;
+    struct ColumnPlan
+    {
+        std::vector<VerticalGlyph> glyphs;
+        InkBox band;
+        bool strict = false;
+    };
+    std::vector<ColumnPlan> plans;
+    double columnStart = 0;
+    for (const auto& column : columns)
+    {
+        plans.emplace_back();
+        auto& plan = plans.back();
+        const int horizontal = column.anchor % 3;
+        const double fx = horizontal == 1 ? 0 : horizontal == 2 ? .5 : 1;
+        const double fy = column.anchor <= 3 ? 1 : column.anchor <= 6 ? .5 : 0;
+        const double columnX = leftward ? width - columnStart - column.width : columnStart;
+        double y = fy * (height - column.height);
+        for (size_t i = column.first; i < column.last; ++i)
+        {
+            const auto& unit = units[i];
+            const double x = columnX + fx * (column.width - unit.width) - unit.left;
+            double pen = 0;
+            for (size_t j = unit.first; j < unit.last; ++j)
+            {
+                plan.glyphs.push_back({words[j], x + (unit.sideways ? 0 : pen),
+                    y - unit.top + (unit.sideways ? pen : 0), unit.sideways});
+                pen += words[j]->m_width;
+            }
+            y += unit.height + (i + 1 == column.last ? 0 : gapAfter(i));
+        }
+        columnStart += advanceColumn(column.width);
+    }
+    double columnShift = 0;
+    InkBox block, previous;
+    bool reserve = false, previousStrict = false;
+    if (!m_rubyGroups.empty())
+        for (auto& plan : plans)
+        {
+            InkBox lastRead[2];
+            const size_t baseCount = plan.glyphs.size();
+            for (size_t start = 0; start < baseCount;)
+            {
+                const auto groupId = plan.glyphs[start].word->m_rubyGroup;
+                size_t end = start + 1;
+                if (groupId)
+                    while (end < baseCount && plan.glyphs[end].word->m_rubyGroup == groupId) ++end;
+                InkBox base;
+                for (size_t i = start; i < end; ++i) base.Add(VerticalInk(plan.glyphs[i]));
+                plan.band.Add(base);
+                const auto* baseWord = plan.glyphs[start].word;
+                start = end;
+                if (!groupId || !base.valid) continue;
+                auto& group = m_rubyGroups[groupId - 1];
+                const auto& options = group.options;
+                reserve |= options.placement == 1;
+                plan.strict |= options.placement == 1 || options.placement == 2;
+                const double em = baseWord->m_style.fontSize * baseWord->m_style.fontScaleX / 800;
+                const double gap = (std::max)(8., em * .04) + (!options.manual && options.autoGap ? em * .04 : 0);
+                const double offsetX = options.manual ? options.offsetX * m_scalex * 8 : 0;
+                const double offsetY = options.manual ? -options.offsetY * m_scaley * 8 : 0;
+                for (size_t side = 0; side < group.annotations.size(); ++side)
+                {
+                    const auto& reading = group.annotations[side];
+                    if (reading.empty()) continue;
+                    std::vector<ShapedWord*> shaped;
+                    for (const auto& source : reading) shaped.push_back(static_cast<ShapedWord*>(source.get()));
+                    const auto readingStart = plan.glyphs.size();
+                    double y = 0, nextGap = 0;
+                    InkBox band;
+                    for (size_t i = 0; i < shaped.size();)
+                    {
+                        const auto unit = MeasureVerticalUnit(shaped, i, m_verticalProfile,
+                            options.spacing * m_scaley * m_curveScale * 8 * options.scaleY / 100);
+                        if (i) y += (std::max)(nextGap, unit.gap);
+                        double pen = 0;
+                        for (; i < unit.last; ++i)
+                        {
+                            VerticalGlyph glyph{shaped[i], -unit.width / 2 - unit.left + (unit.sideways ? 0 : pen),
+                                y - unit.top + (unit.sideways ? pen : 0), unit.sideways};
+                            band.Add(VerticalInk(glyph));
+                            plan.glyphs.push_back(glyph);
+                            pen += shaped[i]->m_width;
+                        }
+                        y += unit.height;
+                        nextGap = unit.gap;
+                    }
+                    if (!band.valid) continue;
+                    const double span = band.bottom - band.top;
+                    const double fit = options.style == 2 && span > 0 ?
+                        (std::min)(1., (base.bottom - base.top) / span) : 1.;
+                    band.top *= fit;
+                    band.bottom *= fit;
+                    const double edgeX = side ? base.left - gap - band.right : base.right + gap - band.left;
+                    const double x = side ? edgeX + (std::min)(0., offsetX) : edgeX + (std::max)(0., offsetX);
+                    y = (base.top + base.bottom - band.top - band.bottom) / 2 + offsetY;
+                    if (lastRead[side].valid) y = (std::max)(y, lastRead[side].bottom + 8 - band.top);
+                    for (size_t i = readingStart; i < plan.glyphs.size(); ++i)
+                    {
+                        auto& glyph = plan.glyphs[i];
+                        glyph.x += x;
+                        glyph.y = glyph.y * fit + y;
+                        glyph.scaleY = fit;
+                    }
+                    band.Move(x, y);
+                    plan.band.Add(band);
+                    lastRead[side] = band;
+                }
+            }
+            if (plan.band.valid)
+            {
+                double extra = 0;
+                if (previous.valid && (plan.strict || previousStrict ||
+                    (plan.band.top < previous.bottom && plan.band.bottom > previous.top)))
+                    extra = leftward ? (std::max)(0., plan.band.right - columnShift - previous.left + 8) :
+                        (std::max)(0., previous.right - plan.band.left - columnShift + 8);
+                columnShift += extra;
+                const double delta = leftward ? -columnShift : columnShift;
+                for (auto& glyph : plan.glyphs) glyph.x += delta;
+                plan.band.Move(delta, 0);
+                previous = plan.band;
+                previousStrict = plan.strict;
+                block.Add(plan.band);
+            }
+        }
+    double xOffset = 0;
+    double yOffset = 0;
+    if (reserve && block.valid)
+    {
+        if (leftward) xOffset = columnShift;
+        width += columnShift;
+        const double left = (std::min)(0., block.left + xOffset);
+        width = (std::max)(width, block.right + xOffset) - left;
+        xOffset -= left;
+        yOffset = (std::max)(0., -block.top);
+        height = (std::max)(height, block.bottom) + yOffset;
+    }
+    else if (block.valid)
+    {
+        m_annotationLeft = int(std::ceil((std::max)(0., -block.left)));
+        m_annotationRight = int(std::ceil((std::max)(0., block.right - width)));
+        m_topborder = int(std::ceil((std::max)(0., -block.top)));
+        m_bottomborder = int(std::ceil((std::max)(0., block.bottom - height)));
+    }
+    if (width > 4000000 || height > 4000000) return false;
+    auto line = std::make_unique<CLine>();
+    line->m_width = int(std::ceil(width));
+    line->m_descent = 0;
+    line->m_ascent = int(std::ceil(height));
+    line->m_borderX = line->m_borderY = 0;
+    for (const auto& plan : plans)
+    {
+        std::map<unsigned, InkBox> baseBands;
+        for (const auto& glyph : plan.glyphs)
+            if (glyph.word->m_rubyGroup && !m_rubyGroups[glyph.word->m_rubyGroup - 1].baseTiming.empty())
+                baseBands[glyph.word->m_rubyGroup].Add(VerticalInk(glyph));
+        for (const auto& glyph : plan.glyphs)
+        {
+            auto word = std::unique_ptr<CWord>(glyph.word->Copy());
+            if (glyph.sideways) word->m_style.fontScaleX *= glyph.scaleY;
+            else word->m_style.fontScaleY *= glyph.scaleY;
+            word->PlaceLayout(CPoint(LONG(std::lround(glyph.x + xOffset)),
+                LONG(std::lround(glyph.y + yOffset - line->m_ascent + word->m_ascent))),
+                glyph.sideways ? 0 : 1, glyph.sideways ? 1 : 0, 0, 0);
+            word->m_width = 0;
+            word->m_verticalWord = true;
+            const auto band = baseBands.find(glyph.word->m_rubyGroup);
+            if (band != baseBands.end() && band->second.bottom > band->second.top)
+            {
+                const auto& timing = m_rubyGroups[band->first - 1].baseTiming;
+                const auto ink = VerticalInk(glyph);
+                double total = 0;
+                for (const auto& part : timing) total += part.width;
+                double top = band->second.top;
+                for (size_t i = 0; i < timing.size(); ++i)
+                {
+                    const auto& part = timing[i];
+                    const double bottom = top + (band->second.bottom - band->second.top) * part.width / total;
+                    if (ink.valid && bottom > ink.top && top < ink.bottom)
+                    {
+                        auto slice = std::unique_ptr<CWord>(word->Copy());
+                        slice->m_ktype = part.type;
+                        slice->m_kstart = part.start;
+                        slice->m_kend = part.end;
+                        slice->ClipRubyCoverage(i == 0 ? INT_MIN : int(std::lround(top - glyph.y)),
+                            i + 1 == timing.size() ? INT_MAX : int(std::lround(bottom - glyph.y)));
+                        line->AddTail(slice.get());
+                        slice.release();
+                    }
+                    top = bottom;
+                }
+                continue;
+            }
+            line->AddTail(word.get());
+            word.release();
+        }
+    }
+    bounds = CSize(line->m_width, line->m_ascent);
+    m_textWidth = line->m_width;
+    AddTail(line.get());
+    line.release();
+    m_verticalLaidOut = true;
+    return true;
+}
+
+void CSubtitle::CurveLines()
+{
+    if (m_vertical || !m_curve || m_curveShapeFailed || IsEmpty()) return;
+    PROFILE_RENDER_STAGE(NativeLayout);
+    using namespace RenderGeometry;
+    const auto fraction = [](int align) { return align == 1 ? 0. : align == 2 ? .5 : 1.; };
+    const int attach = m_curveAnchor ? m_curveAnchor : m_scrAlignment;
+    const double fx = fraction(attach % 3);
+    const double fy = attach <= 3 ? 1. : attach <= 6 ? .5 : 0.;
+    const double sx = m_scalex * m_curveScale * 8, sy = m_scaley * m_curveScale * 8;
+    if (sx <= 0 || sy <= 0) return;
+    const double at = fx * m_curve->ArcLength() + m_curveX;
+    const auto sample = [&](double distance) {
+        const auto raw = m_curve->At(distance);
+        const Point direction{raw.tangent.x * sx, raw.tangent.y * sy};
+        return Curve::Sample{{raw.point.x * sx, raw.point.y * sy}, direction * (1. / Length(direction))};
+    };
+    const auto anchor = sample(at);
+    const auto normal = Normal(anchor.tangent);
+    struct Placement { ShapedWord* word; Point position, tangent, flat; double center; };
+    std::vector<Placement> placed;
+    double lowX = 1e30, lowY = 1e30, highX = -1e30, highY = -1e30;
+    const int top = m_scrAlignment <= 3 ? -m_rect.Height() : m_scrAlignment <= 6 ? -m_rect.Height() / 2 : 0;
+    int baseline = GetHead()->m_ascent;
+    int y = 0;
+    POSITION lines = GetHeadPosition();
+    while (lines)
+    {
+        auto* line = GetNext(lines);
+        const int align = line->m_horizontalAnchor >= 0 ? line->m_horizontalAnchor :
+            m_textAnchor >= 0 ? m_textAnchor : m_scrAlignment % 3;
+        const double left = fraction(align) * (m_textWidth - line->m_width) - fx * m_textWidth;
+        const double rise = y + line->m_ascent - baseline + m_curveY * sy;
+        int x = 0;
+        POSITION words = line->GetHeadPosition();
+        while (words)
+        {
+            auto* word = dynamic_cast<ShapedWord*>(line->GetNext(words));
+            if (!word) return;
+            const double center = word->Advance() * .5;
+            const auto point = sample(at + (left + x + center) / sx);
+            const auto localNormal = Normal(point.tangent);
+            const auto position = point.point + localNormal * rise;
+            placed.push_back({word, position, point.tangent,
+                {double(LineLeft(*line, 0) + x), double(top + y + line->m_ascent - word->m_ascent)}, center});
+            word->OutlinePoints([&](Point raw) {
+                const auto mapped = position + point.tangent * (raw.x - center) + localNormal * (raw.y - word->m_ascent);
+                const auto u = Dot(mapped, anchor.tangent), v = Dot(mapped, normal);
+                lowX = (std::min)(lowX, u); highX = (std::max)(highX, u);
+                lowY = (std::min)(lowY, v); highY = (std::max)(highY, v);
+            });
+            x += word->m_width;
+        }
+        y += line->m_ascent + line->m_descent;
+    }
+    if (lowX > highX || lowY > highY) return;
+    const Point shift = anchor.point + normal * (m_curveY * sy) -
+        (anchor.tangent * (lowX + (highX - lowX) * fx) + normal * (lowY + (highY - lowY) * fy));
+    for (const auto& place : placed)
+    {
+        const auto offset = place.position + shift - place.flat;
+        if (!std::isfinite(offset.x) || !std::isfinite(offset.y) || std::abs(offset.x) > 1000000 ||
+            std::abs(offset.y) > 1000000)
+            return;
+    }
+    for (const auto& place : placed)
+    {
+        const auto offset = place.position + shift - place.flat;
+        place.word->PlaceLayout(CPoint(LONG(std::lround(offset.x)), LONG(std::lround(offset.y))),
+            place.tangent.x, place.tangent.y, place.center * 8, place.word->m_ascent * 8.);
+        place.word->MarkCurve();
+    }
+}
+
+void CSubtitle::ConfigurePerspective()
+{
+    if (!m_perspectivePins || *m_perspectivePins == RenderGeometry::IdentityPins() ||
+        m_effects[EF_SCROLL] || m_effects[EF_BANNER])
+        return;
+    int left = 0, right = 0;
+    for (auto line = GetHeadPosition(); line;)
+    {
+        const auto* words = GetNext(line);
+        const int x = LineLeft(*words, 0);
+        left = (std::min)(left, x);
+        right = (std::max)(right, x + words->m_width);
+        for (auto position = words->GetHeadPosition(); position;)
+        {
+            const auto& style = words->GetNext(position)->m_style;
+            if (style.mod_rand.X || style.mod_rand.Y || style.mod_rand.Z)
+                return;
+#ifdef _LUA
+            if (!style.LuaBeforeTransformHandler.IsEmpty() || !style.LuaCustomTransformHandler.IsEmpty() ||
+                !style.LuaAfterTransformHandler.IsEmpty() || !style.LuaRendererHandler.IsEmpty())
+                return;
+#endif
+            m_perspectiveJitter |= style.mod_jitter.enabled;
+        }
+    }
+    auto projection = std::make_unique<RenderGeometry::Perspective>();
+    if (projection->Set(*m_perspectivePins, (right - left) * 8., m_rect.Height() * 8.))
+    {
+        m_perspectiveLeft = left;
+        m_perspective = std::move(projection);
+    }
+}
+
+void CSubtitle::ConfigureDistortion()
+{
+    if (!m_hasExtendedWarp && !m_warpedAnchor && !(m_hasDistortion && (m_curve || m_verticalLaidOut))) return;
+    struct Glyph
+    {
+        CWord* word;
+        CRect path;
+        CPoint position;
+        double sx, sy;
+        bool text;
+    };
+    const int eventTop = m_scrAlignment <= 3 ? -m_rect.Height() :
+        m_scrAlignment <= 6 ? -m_rect.Height() / 2 : 0;
+    std::vector<Glyph> glyphs;
+    int y = eventTop;
+    bool warpedText = false, extendedText = false;
+    for (auto next = GetHeadPosition(); next;)
+    {
+        auto* line = GetNext(next);
+        int x = LineLeft(*line, 0);
+        for (auto pos = line->GetHeadPosition(); pos;)
+        {
+            auto* word = line->GetNext(pos);
+            const auto& style = word->m_style;
+            const CPoint flat(x - style.mod_horizontalSpace,
+                y + line->m_ascent - word->m_ascent - style.mod_verticalSpace);
+            x += word->m_width;
+            if (word->m_fWhiteSpaceChar || word->m_fLineBreak) continue;
+            const bool text = !dynamic_cast<CPolygon*>(word);
+            const double sx = style.fontScaleX / 100, sy = style.fontScaleY / 100;
+            CRect box;
+            if (sx <= 0 || sy <= 0 || !word->RawOutlineBounds(box)) continue;
+            glyphs.push_back({word, box, word->LayoutPosition(flat), sx, sy, text});
+            warpedText |= text && style.mod_distort.enabled;
+            extendedText |= text && (style.mod_distort.extended || style.mod_distort.x0 != 0 || style.mod_distort.y0 != 0);
+        }
+        y += line->m_ascent + line->m_descent;
+    }
+    bool firstUnit = true;
+    for (size_t start = 0; start < glyphs.size();)
+    {
+        const auto& first = glyphs[start];
+        const auto& warp = first.word->m_style.mod_distort;
+        const auto begin = start++;
+        if (!first.text || !warp.enabled) continue;
+        if (!warp.extended)
+        {
+            first.word->SetDistortionDomain(first.path);
+            continue;
+        }
+        while (start < glyphs.size() && glyphs[start].text &&
+            (glyphs[start].word->m_isRubyReading || glyphs[start].word->m_style == first.word->m_style))
+            ++start;
+        InkBox band;
+        for (size_t i = begin; i < start; ++i)
+        {
+            const auto& glyph = glyphs[i];
+            if (glyph.word->m_isRubyReading) continue;
+            band.Add(glyph.position.x * 8 + glyph.path.left * glyph.sx, glyph.position.y * 8 + glyph.path.top * glyph.sy);
+            band.Add(glyph.position.x * 8 + glyph.path.right * glyph.sx, glyph.position.y * 8 + glyph.path.bottom * glyph.sy);
+        }
+        if (!band.valid) continue;
+        const auto local = [&](CPoint position, double sx, double sy) {
+            return CRect(LONG(std::lround((band.left - position.x * 8.) / sx)),
+                LONG(std::lround((band.top - position.y * 8.) / sy)),
+                LONG(std::lround((band.right - position.x * 8.) / sx)),
+                LONG(std::lround((band.bottom - position.y * 8.) / sy)));
+        };
+        for (size_t i = begin; i < start; ++i)
+        {
+            const auto& glyph = glyphs[i];
+            if (!glyph.word->m_isRubyReading)
+                glyph.word->SetDistortionDomain(local(glyph.position, glyph.sx, glyph.sy));
+        }
+        if (firstUnit)
+            for (auto& box : m_eventBox)
+                if (box->m_style.mod_distort.enabled && box->m_style.mod_distort.extended)
+                    box->SetDistortionDomain(local(CPoint(0, eventTop), 1, 1));
+        firstUnit = false;
+    }
+    if (!warpedText || (!extendedText && !m_warpedAnchor)) return;
+    RenderGeometry::Point low{1e20, 1e20}, high{-1e20, -1e20};
+    for (const auto& glyph : glyphs)
+        if (glyph.text)
+            glyph.word->AddWarpedBounds(glyph.position, low, high);
+    if (low.x > high.x || low.y > high.y) return;
+    const int align = m_warpedAnchor ? m_warpedAnchor : m_scrAlignment;
+    const double x = align % 3 == 1 ? low.x : align % 3 == 2 ? (low.x + high.x) / 2 : high.x;
+    const double yAnchor = align <= 3 ? high.y : align <= 6 ? (low.y + high.y) / 2 : low.y;
+    if (std::abs(x) > 2097152 || std::abs(yAnchor) > 2097152) return;
+    m_warpedShift = CPoint(LONG(std::lround(-x)), LONG(std::lround(-yAnchor)));
+    for (auto next = GetHeadPosition(); next;)
+    {
+        auto* line = GetNext(next);
+        for (auto pos = line->GetHeadPosition(); pos;)
+            line->GetNext(pos)->OffsetLayout(m_warpedShift);
+    }
+}
+
+void CSubtitle::PreparePerspective(CPoint anchor, CPoint origin, const CRect& bounds, REFERENCE_TIME timestamp)
+{
+    if (!m_perspective) return;
+    const int left = anchor.x + m_perspectiveLeft;
+    const CPoint relativeOrigin(origin.x - left, origin.y - bounds.top);
+    if (m_perspectiveOrigin == relativeOrigin && (!m_perspectiveJitter || m_perspectiveTime == timestamp))
+        return;
+    PROFILE_RENDER_STAGE(NativeProjection);
+    m_perspectiveOrigin = relativeOrigin;
+    m_perspectiveTime = timestamp;
+    int64_t area = 32 * 1024 * 1024;
+    const auto project = [&](CWord& word, CPoint position) {
+        if (word.m_fWhiteSpaceChar || word.m_fLineBreak) return true;
+        return word.PrepareProjectedPath(*m_perspective,
+            CPoint(origin.x - position.x, origin.y - position.y),
+            CPoint(position.x - left, position.y - bounds.top), area);
+    };
+    bool valid = true;
+    for (auto& box : m_eventBox)
+        if (!(valid = project(*box, CPoint(anchor.x, bounds.top) + m_warpedShift))) break;
+    int y = bounds.top;
+    for (auto line = GetHeadPosition(); valid && line;)
+    {
+        auto* words = GetNext(line);
+        int x = LineLeft(*words, anchor.x);
+        for (auto position = words->GetHeadPosition(); position;)
+        {
+            auto& word = *words->GetNext(position);
+            const auto& style = word.m_style;
+            const auto flat = CPoint(x - style.mod_horizontalSpace,
+                y + words->m_ascent - word.m_ascent - style.mod_verticalSpace);
+            if (!(valid = project(word, word.LayoutPosition(flat) + word.m_style.mod_jitter.getOffset(timestamp))))
+                break;
+            x += word.m_width;
+        }
+        y += words->m_ascent + words->m_descent;
+    }
+    if (!valid)
+    {
+        // Some words may still hold projected masks from the previous origin.
+        for (auto& box : m_eventBox) box->ResetProjectedPath();
+        for (auto line = GetHeadPosition(); line;)
+        {
+            auto* words = GetNext(line);
+            for (auto position = words->GetHeadPosition(); position;)
+                words->GetNext(position)->ResetProjectedPath();
+        }
+    }
+}
+#endif
 
 // CScreenLayoutAllocator
 
@@ -2560,17 +4975,22 @@ CRect CScreenLayoutAllocator::AllocRect(CSubtitle* s, int segment, int entry, in
     PROFILE_RENDER_STAGE(Collision);
     // TODO: handle collisions == 1 (reversed collisions)
 
+#ifdef _VSMOD
+    const CRect padding(s->m_annotationLeft, s->m_topborder, s->m_annotationRight, s->m_bottomborder);
+#else
+    const CRect padding(0, s->m_topborder, 0, s->m_bottomborder);
+#endif
     POSITION pos = m_subrects.GetHeadPosition();
     while(pos)
     {
         SubRect& sr = m_subrects.GetNext(pos);
         if(sr.segment == segment && sr.entry == entry)
         {
-            return(sr.r + CRect(0, -s->m_topborder, 0, -s->m_bottomborder));
+            return sr.r - padding;
         }
     }
 
-    CRect r = s->m_rect + CRect(0, s->m_topborder, 0, s->m_bottomborder);
+    CRect r = s->m_rect + padding;
 
     bool fSearchDown = s->m_scrAlignment > 3;
 
@@ -2611,16 +5031,32 @@ CRect CScreenLayoutAllocator::AllocRect(CSubtitle* s, int segment, int entry, in
     sr.layer = layer;
     m_subrects.AddTail(sr);
 
-    return(sr.r + CRect(0, -s->m_topborder, 0, -s->m_bottomborder));
+    return sr.r - padding;
 }
 
 // CRenderedTextSubtitle
+
+enum class ExtensionTag : unsigned char { None, Box, Outline, Gradient, Decoration, Pattern, Layout };
+
+struct PatternTag
+{
+    enum Kind : unsigned char { None, Cycle, DotColor, DotDiameter, DotSpacing, Propagate };
+    Kind kind = None;
+    unsigned target = 0;
+    int prefix = 0;
+};
 
 struct OverrideTag {
     CStringW rawCommand;
     CStringW command;
     std::vector<CStringW> parameters;
     int rawCount;
+    bool parenthesized = false;
+    ExtensionTag extension = ExtensionTag::None;
+    bool unicodeNumber = false;
+    bool extendedScalar = false;
+    bool extendedArguments = false;
+    PatternTag pattern;
 };
 
 using OverrideTags = std::vector<OverrideTag>;
@@ -2630,6 +5066,33 @@ struct OverrideTagCache {
     size_t characters = 0;
 
     std::shared_ptr<const OverrideTags> Get(const CStringW& text);
+#ifdef _VSMOD
+    std::array<std::map<CStringW, AssNumeric::Program>, 2> programs;
+    std::map<int, AssNumeric::Context> layout;
+    std::map<CStringW, std::shared_ptr<const RenderGeometry::Curve>> curves;
+    std::map<CString, OverrideTags> styleMetadata, actorMetadata;
+    std::vector<CString> actorStyles;
+    bool metadataReady = false;
+
+    std::shared_ptr<const RenderGeometry::Curve> Curve(const CStringW& path)
+    {
+        const auto found = curves.find(path);
+        if (found != curves.end()) return found->second;
+        auto curve = std::make_shared<RenderGeometry::Curve>();
+        if (!curve->Parse(path)) curve.reset();
+        if (curves.size() >= 128) curves.clear();
+        return curves.emplace(path, std::move(curve)).first->second;
+    }
+
+    const AssNumeric::Program& Expression(const CStringW& source, bool timing)
+    {
+        auto& cache = programs[timing];
+        const auto existing = cache.find(source);
+        if (existing != cache.end()) return existing->second;
+        if (cache.size() >= 256) cache.clear();
+        return cache.emplace(source, AssNumeric::Program::Compile(source, timing)).first->second;
+    }
+#endif
 #if defined(_VSMOD) && defined(_LUA)
     bool defaultFunctionsKnown = false;
     std::set<CStringW> defaultFunctions;
@@ -2697,6 +5160,14 @@ void CRenderedTextSubtitle::OnChanged()
     __super::OnChanged();
     if (m_textGeometry)
         m_textGeometry->Clear();
+#ifdef _VSMOD
+    m_shaper.reset();
+    if (m_overrideTags)
+    {
+        m_overrideTags->layout.clear();
+        m_overrideTags->metadataReady = false;
+    }
+#endif
 
     POSITION pos = m_subtitleCache.GetStartPosition();
     while(pos)
@@ -2729,6 +5200,9 @@ void CRenderedTextSubtitle::Deinit()
     m_overrideTags.reset();
     m_textGeometry.reset();
     m_textDC.reset();
+#ifdef _VSMOD
+    m_shaper.reset();
+#endif
     POSITION pos = m_subtitleCache.GetStartPosition();
     while(pos)
     {
@@ -2803,6 +5277,16 @@ void CRenderedTextSubtitle::ParseString(CSubtitle* sub, CStringW str, STSStyle& 
 {
     PROFILE_RENDER_STAGE(Layout);
     if(!sub) return;
+#ifdef _VSMOD
+    if ((sub->m_curve || sub->m_vertical || sub->m_columns || sub->m_chat || (sub->m_cycles && sub->m_cycles->active)) &&
+        !sub->m_curveShapeFailed)
+    {
+        if (sub->m_words.IsEmpty()) sub->m_curveScale = style.objectScale / 100;
+        if (ParseShapedString(sub, str, style, sub->m_vertical && sub->m_verticalProfile <= 1))
+            return;
+        sub->m_curveShapeFailed = true;
+    }
+#endif
 
     str.Replace(L"\\N", L"\n");
     str.Replace(L"\\n", (sub->m_wrapStyle < 2 || sub->m_wrapStyle == 3) ? L" " : L"\n");
@@ -2825,8 +5309,11 @@ void CRenderedTextSubtitle::ParseString(CSubtitle* sub, CStringW str, STSStyle& 
                 w->m_entry = m_entry;
                 w->LuaRendererHandler = style.LuaRendererHandler;
 #endif
-                sub->m_words.AddTail(w);
-                m_kstart = m_kend;
+                sub->AppendWord(w);
+#ifdef _VSMOD
+                if (!sub->m_keepRubyKaraoke && !sub->m_columns)
+#endif
+                    m_kstart = m_kend;
             }
         }
 
@@ -2840,7 +5327,7 @@ void CRenderedTextSubtitle::ParseString(CSubtitle* sub, CStringW str, STSStyle& 
                 w->m_entry = m_entry;
                 w->LuaRendererHandler = style.LuaRendererHandler;
 #endif
-                sub->m_words.AddTail(w);
+                sub->AppendWord(w);
                 m_kstart = m_kend;
             }
         }
@@ -2854,7 +5341,7 @@ void CRenderedTextSubtitle::ParseString(CSubtitle* sub, CStringW str, STSStyle& 
                 w->m_entry = m_entry;
                 w->LuaRendererHandler = style.LuaRendererHandler;
 #endif
-                sub->m_words.AddTail(w);
+                sub->AppendWord(w);
                 m_kstart = m_kend;
             }
         }
@@ -2864,6 +5351,237 @@ void CRenderedTextSubtitle::ParseString(CSubtitle* sub, CStringW str, STSStyle& 
 
     return;
 }
+
+#ifdef _VSMOD
+bool CRenderedTextSubtitle::ParseShapedString(CSubtitle* sub, const CStringW& text, STSStyle& style, bool vertical)
+{
+    if (!m_shaper) m_shaper = std::make_unique<ShapedText::Context>(m_attachedFonts);
+    CStringW str = text;
+    str.Replace(L"\\N", L"\n");
+    str.Replace(L"\\n", (sub->m_wrapStyle < 2 || sub->m_wrapStyle == 3) ? L" " : L"\n");
+    str.Replace(L"\\h", L"\x00A0");
+    std::vector<std::pair<CStringW, std::shared_ptr<const ShapedText::Run>>> lines;
+    int start = 0;
+    do
+    {
+        int end = str.Find(L'\n', start);
+        if (end < 0) end = str.GetLength();
+        CStringW line = str.Mid(start, end - start);
+        if (!line.IsEmpty())
+        {
+            auto shaped = m_shaper->Shape(line, line.GetLength(), style.fontName, float(style.fontSize / 64),
+                style.fontWeight, style.fItalic, vertical);
+            if (!shaped) return false;
+            lines.emplace_back(std::move(line), std::move(shaped));
+        }
+        if (end == str.GetLength()) break;
+        lines.emplace_back(CStringW(), nullptr);
+        start = end + 1;
+    } while (start <= str.GetLength());
+    for (const auto& line : lines)
+    {
+        if (!line.second)
+        {
+            sub->AppendWord(new CText(style, CStringW(), m_ktype, m_kstart, m_kend, sub->m_scalex, sub->m_scaley));
+            continue;
+        }
+        const int karaokeStart = m_kstart;
+        auto* cycles = sub->m_cycles.get();
+        const auto indices = StartCycles(cycles, *line.second);
+        const bool splitGlyphs = cycles && cycles->PerGlyph();
+        for (size_t i = 0; i < line.second->clusters.size(); ++i)
+        {
+            const auto& c = line.second->clusters[i];
+            const auto startTime = m_ktype == 1 ? karaokeStart + int((m_kend-karaokeStart) *
+                c.left / (std::max)(.001f, line.second->width)) : karaokeStart;
+            const auto endTime = m_ktype == 1 ? karaokeStart + int((m_kend-karaokeStart) *
+                (c.left+c.advance) / (std::max)(.001f, line.second->width)) : m_kend;
+            const auto append = [&](STSStyle& selected, size_t glyph, bool split) {
+                auto word = std::make_unique<ShapedWord>(selected, line.first.Mid(c.start, c.length), line.second, i,
+                    sub->m_columns ? 0 : m_ktype, sub->m_columns ? 0 : startTime,
+                    sub->m_columns ? 0 : endTime, sub->m_scalex, sub->m_scaley);
+                if (split) word->SelectGlyph(glyph);
+#if defined(_LUA)
+                word->L = L;
+                word->LuaLog = LuaLog;
+                word->m_entry = m_entry;
+                word->LuaRendererHandler = selected.LuaRendererHandler;
+#endif
+                sub->AppendWord(word.get());
+                word.release();
+            };
+            if (indices.empty() || c.whitespace)
+                append(style, 0, false);
+            else
+            {
+                const bool split = splitGlyphs && c.glyphs.size() > 1;
+                for (size_t glyph = 0; glyph < (split ? c.glyphs.size() : 1); ++glyph)
+                {
+                    STSStyle selected(style);
+                    ApplyCycleColors(selected, cycles->Colors(indices[i], glyph));
+                    append(selected, glyph, split);
+                }
+            }
+        }
+        if (!sub->m_keepRubyKaraoke && !sub->m_columns) m_kstart = m_kend;
+    }
+    return true;
+}
+
+bool CRenderedTextSubtitle::ParseFurigana(CSubtitle* sub, Furigana::Fields& fields, STSStyle& style)
+{
+    if (!m_shaper) m_shaper = std::make_unique<ShapedText::Context>(m_attachedFonts);
+    if (!m_overrideTags) m_overrideTags = std::make_unique<OverrideTagCache>();
+    CSubtitle::RubyGroup group;
+    group.options = sub->m_rubyOptions;
+    const unsigned owner = Furigana::HasText(fields.text[1]) ? 1 : 2;
+    const unsigned id = unsigned(sub->m_rubyGroups.size() + 1);
+    const bool verticalVariants = sub->m_vertical && sub->m_verticalProfile <= 1;
+    struct Timing { int offset, type, start, end; bool explicitTag; };
+    Timing current{0, m_ktype, m_kstart, m_kend, false};
+    bool changedKaraoke = false;
+    auto cycles = sub->m_cycles && sub->m_cycles->active ?
+        std::make_unique<KfxPaint::Cycles>(*sub->m_cycles) : nullptr;
+    KfxPaint::CycleIndices inherited;
+    inherited.fill(-1);
+    std::array<std::vector<std::unique_ptr<CWord>>, 3> output;
+    for (unsigned side = 0; side < fields.text.size(); ++side)
+    {
+        CStringW plain;
+        std::vector<Timing> timing{current};
+        timing.back().offset = 0;
+        auto& field = fields.text[side];
+        for (int i = 0; i < field.GetLength(); ++i)
+        {
+            if (field[i] != L'{')
+            {
+                if (field[i] == L'\\' && field[i + 1] == L'h')
+                {
+                    plain.AppendChar(L'\x00a0');
+                    ++i;
+                }
+                else plain.AppendChar(field[i]);
+                continue;
+            }
+            const int close = field.Find(L'}', i + 1);
+            if (close == -1) return false;
+            const auto tags = side ? m_overrideTags->Get(field.Mid(i + 1, close - i - 1)) : nullptr;
+            if (tags)
+                for (const auto& tag : *tags)
+                {
+                    const auto& command = tag.command;
+                    const int type = command == L"k" ? 0 : command == L"kf" || command == L"K" ? 1 :
+                        command == L"ko" ? 2 : command == L"kO" ? 3 : -1;
+                    if (type == -1 && command != L"kt") continue;
+                    const CStringW number = tag.parameters.empty() ? CStringW() : tag.parameters[0];
+                    const int value = int((std::max)(0L, (std::min)(1000000L,
+                        number.IsEmpty() ? 100L : std::wcstol(number, nullptr, 10)))) * 10;
+                    current.offset = plain.GetLength();
+                    current.explicitTag = true;
+                    if (command == L"kt")
+                        current.start = current.end = value;
+                    else
+                    {
+                        current.type = type;
+                        current.start = current.end;
+                        current.end = (std::min)(1000000000, current.end + value);
+                    }
+                    changedKaraoke = true;
+                    if (timing.size() < 256) timing.push_back(current);
+                }
+            i = close;
+        }
+        if (plain.IsEmpty()) continue;
+        auto run = m_shaper->Shape(plain, plain.GetLength(), style.fontName, float(style.fontSize / 64),
+            style.fontWeight, style.fItalic, verticalVariants);
+        if (!run) return false;
+        STSStyle glyphStyle = style;
+        const auto indices = side == 0 ? StartCycles(cycles.get(), *run) : std::vector<KfxPaint::CycleIndices>{};
+        if (!indices.empty())
+        {
+            unsigned first = unsigned(plain.GetLength());
+            for (size_t i = 0; i < run->clusters.size(); ++i)
+                if (!run->clusters[i].whitespace && run->clusters[i].start < first)
+                {
+                    first = run->clusters[i].start;
+                    inherited = cycles->Colors(indices[i], 0);
+                }
+        }
+        if (side)
+        {
+            glyphStyle.fontScaleX *= group.options.scaleX / 100;
+            glyphStyle.fontScaleY *= group.options.scaleY / 100;
+            glyphStyle.fontSpacing = sub->m_vertical ? 0 : group.options.spacing * sub->m_scalex * 64;
+            glyphStyle.mod_distort = MOD_DISTORT();
+            if (cycles) ApplyCycleColors(glyphStyle, inherited);
+            if (glyphStyle.mod_grad.paint && glyphStyle.mod_grad.paint->dots &&
+                !glyphStyle.mod_grad.paint->dots->propagate)
+            {
+                auto sources = std::make_shared<KfxPaint::Sources>(*glyphStyle.mod_grad.paint);
+                sources->dots.reset();
+                glyphStyle.mod_grad.paint = std::move(sources);
+            }
+        }
+        for (size_t i = 0; i < run->clusters.size(); ++i)
+        {
+            const auto& cluster = run->clusters[i];
+            auto segment = std::upper_bound(timing.begin(), timing.end(), int(cluster.start),
+                [](int offset, const Timing& value) { return offset < value.offset; });
+            if (segment != timing.begin()) --segment;
+            STSStyle selected(glyphStyle);
+            if (!indices.empty()) ApplyCycleColors(selected, cycles->Colors(indices[i], 0));
+            auto word = std::make_unique<ShapedWord>(selected, plain.Mid(cluster.start, cluster.length), run, i,
+                segment->type, segment->start, segment->end, sub->m_scalex, sub->m_scaley);
+            word->m_isRubyReading = side != 0;
+            word->m_scrollGroup = sub->m_chat ? sub->m_chat->current : sub->m_scrollGroup;
+            const double width = word->m_fWhiteSpaceChar ? 0 : (std::max)(1, word->m_width);
+            if (side == owner && width && (segment->explicitTag || timing.size() > 1))
+            {
+                auto& base = group.baseTiming;
+                if (!base.empty() && base.back().type == segment->type &&
+                    base.back().start == segment->start && base.back().end == segment->end)
+                    base.back().width += width;
+                else
+                    base.push_back({segment->type, segment->start, segment->end, width});
+            }
+            if (!side)
+            {
+                word->m_rubyGroup = id;
+                word->m_wrapAfter = i + 1 == run->clusters.size();
+            }
+#ifdef _LUA
+            word->L = L;
+            word->LuaLog = LuaLog;
+            word->m_entry = m_entry;
+            word->LuaRendererHandler = style.LuaRendererHandler;
+#endif
+            if (!side || (group.options.scaleX > 0 && group.options.scaleY > 0))
+                output[side].push_back(std::move(word));
+        }
+    }
+    if (output[0].empty()) return false;
+    group.annotations[0] = std::move(output[1]);
+    group.annotations[1] = std::move(output[2]);
+    sub->m_rubyGroups.push_back(std::move(group));
+    if (cycles) sub->m_cycles = std::move(cycles);
+    for (auto& word : output[0])
+    {
+        sub->AppendWord(word.get());
+        word.release();
+    }
+    if (changedKaraoke)
+    {
+        m_ktype = current.type;
+        m_kstart = current.start;
+        m_kend = current.end;
+        sub->m_keepRubyKaraoke = true;
+        sub->m_revealKaraoke |= current.type == 3;
+    }
+    else if (!sub->m_keepRubyKaraoke)
+        m_kstart = m_kend;
+    return true;
+}
+#endif
 
 void CRenderedTextSubtitle::ParsePolygon(CSubtitle* sub, CStringW str, STSStyle& style)
 {
@@ -2878,7 +5596,7 @@ void CRenderedTextSubtitle::ParsePolygon(CSubtitle* sub, CStringW str, STSStyle&
         w->m_entry = m_entry;
         w->LuaRendererHandler = style.LuaRendererHandler;
 #endif
-        sub->m_words.AddTail(w);
+        sub->AppendWord(w);
         m_kstart = m_kend;
     }
 }
@@ -3054,17 +5772,610 @@ void CRenderedTextSubtitle::ParseLuaTable(CSubtitle* sub, STSStyle& style)
 }
 #endif
 
-static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& str)
+#ifdef _VSMOD
+namespace
 {
+struct PaintTag
+{
+    int part;
+    bool slide;
+    bool positioned;
+    bool positionedAlpha;
+    bool decoration;
+    CStringW argument;
+};
+
+enum class OutlineProperty { Width, WidthX, WidthY, Color, Alpha, Blur, EdgeBlur, Corners,
+    AlphaCorners, Gradient, AlphaGradient, Positioned, Slide, AlphaSlide, Waiting,
+    WaitingCorners, WaitingGradient, WaitingSlide };
+
+struct OutlineTag
+{
+    unsigned layer = 0;
+    bool box = false;
+    OutlineProperty property = OutlineProperty::Width;
+    CStringW argument;
+};
+
+using AssNumeric::ReadDecimalDigit;
+
+PatternTag ReadPatternTag(const CStringW& name)
+{
+    const wchar_t* begin = name;
+    const wchar_t* p = begin;
+    unsigned target = 0, number = 0;
+    if (!(p[0] >= L'1' && p[0] <= L'9') && p[0] != L'c' && p[0] != L's' &&
+        p[0] != L'p' && p[0] != L'z')
+        return {};
+    if (p[0] >= L'1' && p[0] <= L'9')
+    {
+        number = unsigned(*p++ - L'0');
+        if (number == 1 && *p == L'0') { number = 10; ++p; }
+    }
+    const bool ring = number && *p == L'b';
+    if (ring)
+    {
+        target = number + 1;
+        ++p;
+    }
+    else if (number <= 3) target = number ? number - 1 : 0;
+    else return {};
+    const int prefix = int(p - begin);
+    using P = PatternTag;
+    if (!wcscmp(p, L"cyc")) return {P::Cycle, target, prefix + 3};
+    if (!number && !wcscmp(p, L"scyc")) return {P::Cycle, 1, 4};
+    if (!number && !wcsncmp(p, L"zpol", 4)) return {P::Propagate, 0, 4};
+    if (ring)
+    {
+        if (!wcsncmp(p, L"pc", 2)) return {P::DotColor, target, prefix + 2};
+        if (!wcsncmp(p, L"ps", 2)) return {P::DotDiameter, target, prefix + 2};
+        if (!wcsncmp(p, L"sp", 2)) return {P::DotSpacing, target, prefix + 2};
+    }
+    else if (!wcsncmp(p, L"pol", 3))
+    {
+        p += 3;
+        if (*p == L'c') return {P::DotColor, target, prefix + 4};
+        if (*p == L's') return p[1] == L'p' ? PatternTag{P::DotSpacing, target, prefix + 5} :
+            PatternTag{P::DotDiameter, target, prefix + 4};
+    }
+    return {};
+}
+
+bool NativeLayoutTag(const CStringW& name)
+{
+    switch (name[0])
+    {
+    case L'c': return name == L"ct" || name == L"ctan" || name == L"ctx" || name == L"cty" ||
+                    name == L"col" || name == L"colan" || name == L"colsp" || name == L"chatmode";
+    case L'f': return !name.Find(L"furi");
+    case L'm': return name == L"mpersp";
+    case L's': return name == L"scroll" || name == L"scrollt" ||
+                     name == L"scrollsl" || name == L"scroll0";
+    case L'v': return name == L"vert" || name == L"vtype" || name == L"vdir" ||
+                    name == L"vsp" || name == L"vcolsp";
+    case L'w': return name == L"wtan";
+    default: return false;
+    }
+}
+
+bool ReadPaintTag(const CStringW& name, PaintTag& tag)
+{
+    const wchar_t* p = name;
+    int channel = *p >= L'1' && *p <= L'5' ? *p++ - L'0' : 0;
+    if (*p >= 128 && channel == 0)
+    {
+        const auto* next = p;
+        const int digit = ReadDecimalDigit(next);
+        if (digit >= 1 && digit <= 5)
+        {
+            channel = digit;
+            p = next;
+        }
+    }
+    if (*p != L'g' && *p != L'v' && *p != L'p') return false;
+    tag.positioned = !wcsncmp(p, L"pgrd", 4);
+    tag.decoration = channel == 5;
+    tag.positionedAlpha = tag.positioned && !channel && !wcsncmp(p + 4, L"alpha", 5);
+    if (tag.positionedAlpha)
+    {
+        p += 9;
+        tag.slide = *p == L's';
+        if (tag.slide) ++p;
+        tag.part = KfxPaint::PositionedAlphaSlidePart;
+        tag.argument = p;
+        tag.argument.Trim();
+        return true;
+    }
+    const bool color = !wcsncmp(p, L"grd", 3) || tag.positioned;
+    const bool alpha = !wcsncmp(p, L"gra", 3);
+    if (color || (alpha && channel))
+    {
+        p += tag.positioned ? 4 : 3;
+        tag.slide = *p == L's';
+        if (tag.slide) ++p;
+        tag.part = !channel && tag.slide && !tag.positioned ? -1 : ((channel ? channel : 1) - 1) * 2 + int(alpha);
+        if (tag.decoration) tag.part = KfxPaint::DecorationSlideStart + int(alpha);
+    }
+    else if (!wcsncmp(p, L"vcs", 3) || !wcsncmp(p, L"vas", 3))
+    {
+        if (tag.decoration) return false;
+        tag.slide = true;
+        tag.part = ((channel ? channel : 1) - 1) * 2 + int(p[1] == L'a');
+        p += 3;
+    }
+    else return false;
+    tag.argument = p;
+    tag.argument.Trim();
+    return true;
+}
+
+bool ReadDecorationScalar(const CStringW& name, bool& inverse, CStringW& argument)
+{
+    const wchar_t* p = name;
+    if ((*p != L'5' && *p < 128) || ReadDecimalDigit(p) != 5 || (*p != L'c' && *p != L'a'))
+        return false;
+    inverse = *p++ == L'a';
+    argument = p;
+    argument.Trim();
+    return true;
+}
+
+bool ReadOutlineTag(const CStringW& name, OutlineTag& tag)
+{
+    const wchar_t* p = name;
+    int number = 1;
+    const bool numbered = wcsncmp(p, L"bb", 2) != 0;
+    if (numbered)
+    {
+        if ((*p < L'1' || *p > L'9') && *p < 128)
+            return false;
+        const int first = ReadDecimalDigit(p);
+        if (first < 1 || first > 9)
+            return false;
+        number = first;
+        const auto* next = p;
+        if (first == 1 && ReadDecimalDigit(next) == 0)
+        {
+            number = 10;
+            p = next;
+        }
+    }
+    using P = OutlineProperty;
+    if (number == 3 && *p == L's')
+    {
+        tag.layer = 0;
+        if (!wcsncmp(p, L"sgrds", 5) || !wcsncmp(p, L"svcs", 4))
+        {
+            tag.property = P::WaitingSlide;
+            p += p[1] == L'g' ? 5 : 4;
+        }
+        else if (!wcsncmp(p, L"sgrd", 4))
+        {
+            tag.property = P::WaitingGradient;
+            p += 4;
+        }
+        else if (!wcsncmp(p, L"svc", 3))
+        {
+            tag.property = P::WaitingCorners;
+            p += 3;
+        }
+        else if (!wcsncmp(p, L"sc", 2))
+        {
+            tag.property = P::Waiting;
+            p += 2;
+        }
+        else return false;
+        tag.argument = p;
+        tag.argument.Trim();
+        return true;
+    }
+    if (*p++ != L'b')
+        return false;
+    // Native bblur and bbe start with the same two letters as box rings.
+    const bool filter = numbered && (!wcsncmp(p, L"blur", 4) || !wcsncmp(p, L"be", 2));
+    tag.box = *p == L'b' && !filter;
+    if (tag.box) ++p;
+    static constexpr struct { const wchar_t* name; P property; } names[] = {
+        {L"pgrds", P::Slide}, {L"grds", P::Slide}, {L"gas", P::AlphaSlide}, {L"vcs", P::Slide}, {L"vas", P::AlphaSlide},
+        {L"pgrd", P::Positioned},
+        {L"grd", P::Gradient}, {L"ga", P::AlphaGradient}, {L"blur", P::Blur},
+        {L"be", P::EdgeBlur}, {L"vc", P::Corners}, {L"va", P::AlphaCorners}, {L"sc", P::Waiting},
+        {L"sx", P::WidthX}, {L"sy", P::WidthY}, {L"s", P::Width}, {L"c", P::Color}, {L"a", P::Alpha},
+    };
+    for (const auto& entry : names)
+    {
+        const auto length = wcslen(entry.name);
+        if (wcsncmp(p, entry.name, length))
+            continue;
+        const auto* argument = p + length;
+        if (*argument >= L'a' && *argument <= L'z' && wcscmp(argument, L"off"))
+            return false;
+        if (tag.box && (entry.property == P::WidthX || entry.property == P::WidthY ||
+            entry.property == P::Blur || entry.property == P::EdgeBlur || entry.property == P::Waiting ||
+            *entry.name == L'p'))
+            return false;
+        tag.layer = number - 1;
+        tag.property = entry.property;
+        tag.argument = argument;
+        tag.argument.Trim();
+        return true;
+    }
+    return false;
+}
+
+bool EventBoxTag(const CStringW& name)
+{
+    const wchar_t* p = name;
+    return !wcsncmp(p, L"box", 3) || !wcsncmp(p, L"bs", 2);
+}
+
+std::vector<CStringW> PaintArguments(const CStringW& text)
+{
+    std::vector<CStringW> args;
+    if (text.IsEmpty())
+        return args;
+    int start = 0;
+    do
+    {
+        int end = text.Find(L',', start);
+        if (end < 0) end = text.GetLength();
+        args.push_back(text.Mid(start, end - start).Trim());
+        start = end + 1;
+    } while (start <= text.GetLength() && args.size() <= 2 * KfxPaint::MaxStops + 3);
+    return args;
+}
+
+bool ReadPaintNumber(const CStringW& text, double& value)
+{
+    if (text.IsEmpty() || text.FindOneOf(L"xXpP") >= 0)
+        return false;
+    wchar_t* end;
+    value = wcstod(text, &end);
+    return end == text.GetString() + text.GetLength() && std::isfinite(value);
+}
+
+bool ExtendedNumber(const CStringW& text)
+{
+    const wchar_t* p = text;
+    if (*p == L'~' || *p == L'(' || wcspbrk(p, L"$*/%"))
+        return true;
+    for (const wchar_t* start = p; *p; ++p)
+        if (*p >= 128 || (p > start && (*p == L'+' || *p == L'-') && p[-1] != L'e' && p[-1] != L'E'))
+            return true;
+    return false;
+}
+
+CStringW NormalizeNumericDigits(const CStringW& input)
+{
+    return CStringW(AssNumeric::NormalizeDigits(input).c_str());
+}
+
+bool HasOverrideAnnotations(const CStringW& text)
+{
+    return text.Find(L'[') >= 0 || text.Find(L"\\N") >= 0;
+}
+
+CStringW NormalizeOverrideBlock(const CStringW& text)
+{
+    if (!HasOverrideAnnotations(text))
+        return text;
+    CStringW result;
+    const int length = text.GetLength();
+    auto* output = result.GetBuffer(length);
+    int written = 0;
+    for (int i = 0; i < length;)
+    {
+        const wchar_t c = text[i++];
+        if (c == L'[')
+        {
+            const int end = text.Find(L']', i);
+            if (end < 0) break;
+            i = end + 1;
+        }
+        else if (c == L'\\' && i < length && text[i] == L'N')
+            ++i;
+        else
+            output[written++] = c;
+    }
+    result.ReleaseBufferSetLength(written);
+    return result;
+}
+
+bool NeedsLayoutVariables(const CStringW& event)
+{
+    int position = 0;
+    while ((position = event.Find(L'{', position)) >= 0)
+    {
+        const int stop = event.Find(L'}', ++position);
+        if (stop < 0) return false;
+        const auto block = NormalizeOverrideBlock(event.Mid(position, stop - position));
+        int offset = 0;
+        while ((offset = block.Find(L'$', offset)) >= 0)
+        {
+            const wchar_t* name = block.GetString() + ++offset;
+            for (const auto* variable : {L"width", L"height", L"left", L"right", L"center", L"top", L"bottom", L"middle"})
+                if (!wcsncmp(name, variable, wcslen(variable)))
+                    return true;
+        }
+        position = stop + 1;
+    }
+    return false;
+}
+
+bool ReadPaintValue(const CStringW& text, bool alpha, KfxPaint::Value& result)
+{
+    if (!alpha)
+    {
+        if (!text.CompareNoCase(L"$white") || !text.CompareNoCase(L"$shiro") ||
+            !text.CompareNoCase(L"$siro"))
+        {
+            result = 0xFFFFFF;
+            return true;
+        }
+        if (!text.CompareNoCase(L"$black") || !text.CompareNoCase(L"$kuro"))
+        {
+            result = 0;
+            return true;
+        }
+    }
+    const wchar_t* p = text;
+    const bool decimal = alpha && *p == L'$';
+    if (decimal) ++p;
+    else
+    {
+        while (*p == L'&' || *p == L'H' || *p == L'h') ++p;
+    }
+    const auto* first = p;
+    unsigned value = 0;
+    const unsigned limit = alpha ? 255 : 0xFFFFFF;
+    while (*p && *p != L'&')
+    {
+        unsigned digit;
+        if (decimal)
+        {
+            const int decoded = ReadDecimalDigit(p);
+            if (decoded < 0) return false;
+            digit = decoded;
+        }
+        else
+        {
+            const auto c = *p++;
+            if (c >= L'0' && c <= L'9') digit = c - L'0';
+            else if (c >= L'A' && c <= L'F') digit = 10 + c - L'A';
+            else if (c >= L'a' && c <= L'f') digit = 10 + c - L'a';
+            else return false;
+        }
+        value = value * (decimal ? 10 : 16) + digit;
+        if (value > limit) return false;
+    }
+    if (p == first || (*p && (decimal || p[1])))
+        return false;
+    result = alpha ? value : KfxPaint::Value(revcolor(value));
+    return true;
+}
+
+template<class ReadNumber>
+bool ReadPaintField(const std::vector<CStringW>& args, bool alpha, KfxPaint::Paint& paint, size_t offset,
+    ReadNumber read)
+{
+    if (args.size() < offset + 3 || !(args.size() % 2) ||
+        args.size() > offset + 2 * KfxPaint::MaxStops - 1 || !read(args[offset], paint.angle))
+        return false;
+    paint.angle = std::fmod(paint.angle, 360.0);
+    paint.kind = KfxPaint::Paint::Kind::Field;
+    double position = 0;
+    for (size_t i = offset + 1; i + 1 < args.size(); i += 2)
+    {
+        KfxPaint::Value value;
+        if (!ReadPaintValue(args[i], alpha, value)) return false;
+        paint.stops.push_back({position, value});
+        if (i + 2 == args.size()) break;
+        CStringW percent = args[i + 1];
+        double next;
+        if (percent.IsEmpty() || percent[percent.GetLength() - 1] != L'%' ||
+            !read(percent.Left(percent.GetLength() - 1).Trim(), next) ||
+            next < 0 || next > 100 || next / 100 < position)
+            return false;
+        position = next / 100;
+    }
+    KfxPaint::Value last;
+    if (!ReadPaintValue(args.back(), alpha, last)) return false;
+    paint.stops.push_back({1, last});
+    return true;
+}
+
+KfxPaint::Paint PaintCorners(const STSStyle& style, int channel, bool alpha)
+{
+    KfxPaint::Paint paint;
+    paint.kind = KfxPaint::Paint::Kind::Corners;
+    for (int i = 0; i < 4; ++i)
+        paint.stops.push_back({0, alpha ? KfxPaint::Value(style.mod_grad.alpha[channel][i]) :
+                                        KfxPaint::Value(style.mod_grad.color[channel][i])});
+    return paint;
+}
+
+void SetPaintPart(STSStyle& style, int part, KfxPaint::Source source)
+{
+    auto state = style.mod_grad.paint ? std::make_shared<KfxPaint::Sources>(*style.mod_grad.paint) :
+                                       std::make_shared<KfxPaint::Sources>();
+    state->parts[part] = std::move(source);
+    style.mod_grad.paint = std::move(state);
+}
+
+KfxPaint::Source ResolvePaintSource(CSubtitle& subtitle, KfxPaint::Source old, KfxPaint::Paint target,
+    KfxPaint::Value solid, bool alpha, double progress, double width, bool keepCorners = false,
+    bool animate = false)
+{
+    using namespace KfxPaint;
+    if (progress <= 0)
+        return old;
+    const Paint* endpoint = old && old->kind == Paint::Kind::Slide ? old->to.get() : old.get();
+    if (animate && endpoint && endpoint->kind == Paint::Kind::Field && target.kind == Paint::Kind::Field &&
+        endpoint->positioned != target.positioned)
+        return old;
+    if (target.positioned) target.outside = solid;
+
+    if (progress < 1 && width >= 0)
+    {
+        if (!old)
+        {
+            Paint fallback;
+            fallback.solid = solid;
+            old = std::make_shared<const Paint>(std::move(fallback));
+        }
+        if (old->depth == MaxSlides) return old;
+        Paint slide;
+        slide.kind = Paint::Kind::Slide;
+        slide.angle = target.kind == Paint::Kind::Field ? target.angle : old->angle;
+        slide.width = width;
+        slide.progress = progress;
+        slide.positioned = target.positioned || old->positioned;
+        if (slide.positioned)
+            slide.rect = target.positioned && old->positioned ? Unite(target.rect, old->rect) :
+                target.positioned ? target.rect : old->rect;
+        slide.depth = old->depth + 1;
+        slide.from = old;
+        slide.to = std::make_shared<const Paint>(std::move(target));
+        target = std::move(slide);
+    }
+    else if (progress < 1)
+    {
+        if (old && old->kind == Paint::Kind::Slide)
+            old = old->to;
+        const Paint* field = old && old->kind == Paint::Kind::Field ? old.get() : nullptr;
+        if (target.kind == Paint::Kind::Field)
+            target = Interpolate(field, target, solid, progress, alpha);
+        else if (target.kind == Paint::Kind::Solid && field)
+        {
+            const auto value = target.solid;
+            target = *field;
+            target.outside = Mix(field->outside, value, progress, alpha, false);
+            for (auto& stop : target.stops)
+                stop.value = Mix(stop.value, value, progress, alpha, false);
+        }
+    }
+
+    if (target.kind == Paint::Kind::Solid || (target.kind == Paint::Kind::Corners && !keepCorners))
+        return {};
+    target.segment = target.kind == Paint::Kind::Field && old && old->segment &&
+        progress < 1 ? old->segment : ++subtitle.m_paintSegments;
+    return std::make_shared<const Paint>(std::move(target));
+}
+
+void ApplyPaintPart(CSubtitle& subtitle, STSStyle& style, int part, KfxPaint::Paint target,
+                    double progress, double width, bool animate = false)
+{
+    using namespace KfxPaint;
+    if (progress <= 0)
+        return;
+    const bool alpha = (part & 1) != 0;
+    const int channel = part / 2;
+    Source old = style.mod_grad.paint ? style.mod_grad.paint->parts[part] : Source{};
+    const Value solid = alpha ? Value(style.alpha[channel]) : Value(revcolor(style.colors[channel]));
+    if (!old && progress < 1 && width >= 0 && (style.mod_grad.legacyParts & (1u << part)))
+        old = std::make_shared<const Paint>(PaintCorners(style, channel, alpha));
+    SetPaintPart(style, part, ResolvePaintSource(subtitle, std::move(old), std::move(target),
+        solid, alpha, progress, width, false, animate));
+}
+
+KfxPaint::OutlineLayer& EditOutlineLayer(KfxPaint::OutlineStyle& state, unsigned number)
+{
+    const auto pos = std::lower_bound(state.layers.begin(), state.layers.end(), number,
+        [](const KfxPaint::OutlineLayer& layer, unsigned n) { return layer.number < n; });
+    if (pos != state.layers.end() && pos->number == number)
+        return *pos;
+    KfxPaint::OutlineLayer layer;
+    layer.number = number;
+    return *state.layers.insert(pos, std::move(layer));
+}
+
+void ApplyCycleColors(STSStyle& style, const KfxPaint::CycleIndices& colors)
+{
+    for (unsigned i = 0; i < 3; ++i)
+        if (colors[i] >= 0)
+            style.colors[i] = revcolor(colors[i]);
+    std::shared_ptr<KfxPaint::OutlineStyle> rings;
+    for (unsigned i = 3; i < colors.size(); ++i)
+        if (colors[i] >= 0 && style.nativeOutline)
+        {
+            const auto& layers = style.nativeOutline->layers;
+            const auto found = std::find_if(layers.begin(), layers.end(),
+                [&](const KfxPaint::OutlineLayer& layer) { return layer.number == i - 2; });
+            if (found == layers.end()) continue;
+            if (!rings) rings = std::make_shared<KfxPaint::OutlineStyle>(*style.nativeOutline);
+            rings->layers[found - layers.begin()].color = colors[i];
+        }
+    if (rings) style.nativeOutline = std::move(rings);
+}
+}
+#endif
+
+static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& text)
+{
+#ifdef _VSMOD
+    CStringW str = NormalizeOverrideBlock(text);
+    if (str.Find(L"\\~") >= 0)
+        str.Replace(L"\\~", L"~");
+#else
+    CStringW str = text;
+#endif
     auto result = std::make_shared<OverrideTags>();
+    const auto append = [&](OverrideTag tag) {
+#ifdef _VSMOD
+        const auto& cmd = tag.command;
+        PaintTag paint{};
+        OutlineTag outline;
+        bool inverse;
+        CStringW argument;
+        if (tag.pattern.kind != PatternTag::None)
+            tag.extension = ExtensionTag::Pattern;
+        else if (NativeLayoutTag(cmd))
+            tag.extension = ExtensionTag::Layout;
+        else if (EventBoxTag(cmd))
+            tag.extension = ExtensionTag::Box;
+        else if (ReadOutlineTag(cmd, outline))
+            tag.extension = ExtensionTag::Outline;
+        else if (ReadPaintTag(cmd, paint))
+            tag.extension = ExtensionTag::Gradient;
+        else if (ReadDecorationScalar(cmd, inverse, argument))
+            tag.extension = ExtensionTag::Decoration;
+        if (!tag.parameters.empty())
+        {
+            const auto& p = tag.parameters.front();
+            const wchar_t first = p.IsEmpty() ? 0 : p[0];
+            tag.unicodeNumber = (first >= 128 || first == L'+' || first == L'-' ||
+                (first >= L'0' && first <= L'9')) && AssNumeric::HasNonAscii(p);
+            tag.extendedScalar = first == L'~' || tag.unicodeNumber ||
+                (first && tag.parenthesized && ExtendedNumber(p));
+            if (cmd == L"t")
+                tag.extendedArguments = std::any_of(tag.parameters.begin(), tag.parameters.end() - 1, ExtendedNumber);
+            else if (cmd == L"clip" || cmd == L"iclip" || cmd == L"pos" || cmd == L"move" ||
+                cmd == L"org" || cmd == L"distort")
+                tag.extendedArguments = std::any_of(tag.parameters.begin(), tag.parameters.end(), ExtendedNumber);
+        }
+#endif
+        result->push_back(std::move(tag));
+    };
     for(int i = 0, j; (j = str.Find('\\', i)) >= 0; i = j)
     {
         CStringW cmd;
         for(WCHAR c = str[++j]; c && c != '(' && c != '\\'; cmd += c, c = str[++j]);
         cmd.Trim();
         if(cmd.IsEmpty()) continue;
+#ifdef _VSMOD
+        if (cmd[0] >= 128)
+        {
+            const wchar_t* start = cmd;
+            const auto* next = start;
+            const int number = ReadDecimalDigit(next);
+            if (number >= 0)
+                cmd = CStringW(wchar_t(L'0' + number)) + CStringW(next);
+        }
+        const auto pattern = ReadPatternTag(cmd);
+#endif
 
         std::vector<CStringW> params;
+        bool parenthesized = false;
 
         if(str[j] == '(')
         {
@@ -3078,7 +6389,40 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
                 if(br == 0) break;
             }
             param.Trim();
+            parenthesized = str[j] == L')';
 
+#ifdef _VSMOD
+            if (pattern.kind != PatternTag::None)
+            {
+                if (parenthesized)
+                {
+                    auto fields = PaintArguments(param);
+                    const int count = int(fields.size());
+                    OverrideTag tag{cmd, cmd, std::move(fields), count, true};
+                    tag.pattern = pattern;
+                    append(std::move(tag));
+                }
+                continue;
+            }
+            PaintTag paint{};
+            OutlineTag outline;
+            if (ReadPaintTag(cmd, paint) || ReadOutlineTag(cmd, outline) || EventBoxTag(cmd) ||
+                cmd == L"fad" || cmd == L"distort" || cmd == L"mpersp" || cmd == L"scroll")
+            {
+                auto fields = PaintArguments(param);
+                if (cmd == L"fad" && fields.size() != 4)
+                    fields.clear();
+                else
+                {
+                    if (str[j] == L')')
+                    {
+                        const int count = int(fields.size());
+                        append({cmd, cmd, std::move(fields), count, true});
+                    }
+                    continue;
+                }
+            }
+#endif
             while(!param.IsEmpty())
             {
                 int i = param.Find(','), j = param.Find('\\');
@@ -3100,6 +6444,39 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
 
         const CStringW rawCommand = cmd;
         const int rawCount = static_cast<int>(params.size());
+#ifdef _VSMOD
+        if (pattern.kind != PatternTag::None)
+        {
+            OverrideTag tag{cmd, cmd, std::move(params), rawCount};
+            tag.pattern = pattern;
+            append(std::move(tag));
+            continue;
+        }
+        OutlineTag outline;
+        PaintTag paint{};
+        if (EventBoxTag(cmd) || ReadOutlineTag(cmd, outline) ||
+            (ReadPaintTag(cmd, paint) && paint.positioned))
+        {
+            append({cmd, cmd, std::move(params), rawCount});
+            continue;
+        }
+        const std::pair<const wchar_t*, int> chatScalars[] = {
+            {L"chatmode", 8}, {L"msgtitlegbc", 11}, {L"msgtitlec", 9}, {L"msgshowname", 11},
+            {L"readmark", 8}, {L"readtime", 8}, {L"bubbc", 5}, {L"bubba", 5}, {L"bubbs", 5},
+            {L"bubc", 4}, {L"buba", 4}, {L"bc", 2}, {L"ba", 2}
+        };
+        bool chatScalar = false;
+        if (cmd[0] == L'm' || cmd[0] == L'c' || cmd[0] == L'r' || cmd[0] == L'b')
+            for (const auto& item : chatScalars)
+                if (!cmd.Find(item.first))
+                {
+                    params.push_back(cmd.Mid(item.second));
+                    append({cmd, cmd.Left(item.second), std::move(params), rawCount, parenthesized});
+                    chatScalar = true;
+                    break;
+                }
+        if (chatScalar) continue;
+#endif
         if(!cmd.Find(L"1c") || !cmd.Find(L"2c") || !cmd.Find(L"3c") || !cmd.Find(L"4c"))
             params.push_back(cmd.Mid(2).Trim(L"&H")), cmd = cmd.Left(2);
         else if(!cmd.Find(L"1a") || !cmd.Find(L"2a") || !cmd.Find(L"3a") || !cmd.Find(L"4a"))
@@ -3132,8 +6509,28 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
 #endif
         else if(!cmd.Find(L"b"))
             params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+#ifdef _VSMOD
+        else if(cmd == L"clippos")
+        {
+            // Translation uses the arguments already read from the tuple.
+        }
+#endif
         else if(!cmd.Find(L"clip"))
             ;
+#ifdef _VSMOD
+        else if(!cmd.Find(L"ctan"))
+            params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
+        else if(!cmd.Find(L"ctx") || !cmd.Find(L"cty"))
+            params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+        else if (!cmd.Find(L"colan") || !cmd.Find(L"colsp"))
+            params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
+        else if (!cmd.Find(L"col"))
+            params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+        else if(cmd == L"ct")
+        {
+            // The event-wide path has been selected before the text pass.
+        }
+#endif
         else if(!cmd.Find(L"c"))
             params.push_back(cmd.Mid(1).Trim(L"&H")), cmd = cmd.Left(1);
 #ifdef _VSMOD // patch m008. distort
@@ -3146,6 +6543,24 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
             params.push_back(cmd.Mid(2)), cmd = cmd.Left(2);
         else if(!cmd.Find(L"fn"))
             params.push_back(cmd.Mid(2)), cmd = cmd.Left(2);
+#ifdef _VSMOD
+        else if (cmd == L"furipos")
+            ;
+        else if (!cmd.Find(L"furichangepos"))
+            params.push_back(cmd.Mid(13)), cmd = cmd.Left(13);
+        else if (!cmd.Find(L"furiplaceauto"))
+            params.push_back(cmd.Mid(13)), cmd = cmd.Left(13);
+        else if (!cmd.Find(L"furistyle"))
+            params.push_back(cmd.Mid(9)), cmd = cmd.Left(9);
+        else if (!cmd.Find(L"furifsp"))
+            params.push_back(cmd.Mid(7)), cmd = cmd.Left(7);
+        else if (!cmd.Find(L"furisx") || !cmd.Find(L"furisy") || !cmd.Find(L"furiap"))
+            params.push_back(cmd.Mid(6)), cmd = cmd.Left(6);
+        else if (!cmd.Find(L"furis"))
+            params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
+        else if (!cmd.Find(L"furi"))
+            params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
+#endif
         else if(!cmd.Find(L"frx") || !cmd.Find(L"fry") || !cmd.Find(L"frz"))
             params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
 #ifdef _VSMOD // patch m007. symbol rotating
@@ -3178,7 +6593,11 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
         else if(!cmd.Find(L"jitter"))
             ;
 #endif
-        else if(!cmd.Find(L"kt") || !cmd.Find(L"kf") || !cmd.Find(L"ko"))
+        else if(!cmd.Find(L"kt") || !cmd.Find(L"kf") || !cmd.Find(L"ko")
+#ifdef _VSMOD
+                || !cmd.Find(L"kO")
+#endif
+                )
             params.push_back(cmd.Mid(2)), cmd = cmd.Left(2);
         else if(!cmd.Find(L"k") || !cmd.Find(L"K"))
             params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
@@ -3196,6 +6615,8 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
 #endif
 #ifdef _VSMOD // patch m006. moveable vector clip
         else if(!cmd.Find(L"movevc"))
+            ;
+        else if (cmd == L"mpersp")
             ;
 #endif
         else if(!cmd.Find(L"move"))
@@ -3220,12 +6641,40 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
             params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
         else if(!cmd.Find(L"shad"))
             params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
+#ifdef _VSMOD
+        else if (!cmd.Find(L"scrollsl"))
+            params.push_back(cmd.Mid(8)), cmd = cmd.Left(8);
+        else if (!cmd.Find(L"scrollt"))
+            params.push_back(cmd.Mid(7)), cmd = cmd.Left(7);
+        else if (cmd == L"scroll0" || cmd == L"scroll")
+            ;
+        else if(!cmd.Find(L"scale"))
+            params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
+#endif
         else if(!cmd.Find(L"s"))
             params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+#ifdef _VSMOD
+        else if(!cmd.Find(L"tan"))
+            params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+        else if(!cmd.Find(L"ta"))
+            params.push_back(cmd.Mid(2)), cmd = cmd.Left(2);
+#endif
         else if(!cmd.Find(L"t"))
             ;
         else if(!cmd.Find(L"u"))
             params.push_back(cmd.Mid(1)), cmd = cmd.Left(1);
+#ifdef _VSMOD
+        else if (!cmd.Find(L"vert") || !cmd.Find(L"vdir"))
+            params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
+        else if (!cmd.Find(L"vtype"))
+            params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
+        else if (!cmd.Find(L"vcolsp"))
+            params.push_back(cmd.Mid(6)), cmd = cmd.Left(6);
+        else if (!cmd.Find(L"vsp"))
+            params.push_back(cmd.Mid(3)), cmd = cmd.Left(3);
+        else if (!cmd.Find(L"wtan"))
+            params.push_back(cmd.Mid(4)), cmd = cmd.Left(4);
+#endif
         else if(!cmd.Find(L"xbord"))
             params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
         else if(!cmd.Find(L"xshad"))
@@ -3244,7 +6693,7 @@ static std::shared_ptr<const OverrideTags> TokenizeOverrideTags(const CStringW& 
         else if(!cmd.Find(L"ortho")) // vpatch v001. ortho
             params.push_back(cmd.Mid(5)), cmd = cmd.Left(5);
 #endif
-        result->push_back({rawCommand, cmd, std::move(params), rawCount});
+        append({rawCommand, cmd, std::move(params), rawCount, parenthesized});
     }
     return result;
 }
@@ -3270,7 +6719,331 @@ std::shared_ptr<const OverrideTags> OverrideTagCache::Get(const CStringW& text)
     return tags;
 }
 
-bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org, bool fAnimate)
+#ifdef _VSMOD
+namespace
+{
+void BeginChatMessage(NativeChat::Scene& chat, const NativeChat::Boundary& next, STSStyle& style)
+{
+    if (chat.messages.size() >= 128) return;
+    if (chat.beforePreset)
+    {
+        std::copy_n(chat.beforePreset->colors, 4, style.colors);
+        std::copy_n(chat.beforePreset->alpha, 4, style.alpha);
+        chat.skin = chat.beforeSkin;
+        chat.beforePreset.reset();
+    }
+    const bool right = next.side > 0 || (!next.side && !chat.main.IsEmpty() && next.name == chat.main);
+    const auto& preset = chat.presets[unsigned(right)];
+    if (preset)
+    {
+        chat.beforePreset = std::make_unique<STSStyle>(style);
+        chat.beforeSkin = chat.skin;
+        const auto& p = *preset;
+        for (int i = 0; i < 3; ++i)
+        {
+            style.colors[i] = revcolor(DWORD(p[2*i]));
+            style.alpha[i] = BYTE(p[2*i+1]);
+        }
+        chat.skin.borderColor = int(p[6]);
+        chat.skin.borderAlpha = int(p[7]);
+        chat.skin.border = p[8];
+        chat.skin.outlineColor = int(p[9]);
+        chat.skin.outlineAlpha = int(p[10]);
+        chat.skin.outline = p[11];
+    }
+    chat.messages.emplace_back();
+    auto& message = chat.messages.back();
+    message.name = next.name;
+    message.right = right;
+    chat.current = unsigned(chat.messages.size());
+}
+
+bool ApplyChatTag(NativeChat::Scene& chat, const OverrideTag& tag, STSStyle& style, bool animate)
+{
+    const auto& cmd = tag.command;
+    const auto& params = tag.parameters;
+    const CStringW argument = params.empty() ? CStringW{} : params[0];
+    if (cmd == L"chatmode") return true;
+    if (cmd == L"msg" || cmd == L"msgmarker")
+    {
+        if (animate) return true;
+        if (cmd == L"msgmarker" && chat.mode != 1 && chat.nextBoundary < chat.boundaries.size())
+            BeginChatMessage(chat, chat.boundaries[chat.nextBoundary++], style);
+        else if (cmd == L"msg" && chat.mode == 1 && !argument.IsEmpty() && params.size() <= 2)
+        {
+            const int side = params.size() == 1 ? 0 : params[1] == L"right" ? 1 : params[1] == L"left" ? -1 : 2;
+            if (side != 2) BeginChatMessage(chat, {argument, side}, style);
+        }
+        return true;
+    }
+    if (cmd == L"msgm" || cmd == L"msgtitle" || cmd == L"msgshowname" ||
+        cmd == L"msgstartcount" || cmd == L"msganim" || cmd == L"readmark" || cmd == L"readtime")
+    {
+        if (animate) return true;
+        int value;
+        if (cmd == L"msgm") chat.main = argument;
+        else if (cmd == L"msgtitle" && !chat.gotTitle) { chat.gotTitle = true; chat.title = argument; }
+        else if (NativeScroll::Integer(argument, value) && value >= 0)
+        {
+            if (cmd == L"msgshowname" && value <= 1) chat.showNames = value != 0;
+            if (cmd == L"msgstartcount") chat.initial = value;
+            if (cmd == L"msganim") chat.slide = value;
+            if (cmd == L"readmark" && value <= 2) { chat.receipt = value; chat.receiptConfigured = true; }
+            if (cmd == L"readtime")
+            {
+                chat.readDelay = value;
+                if (!chat.receiptConfigured) chat.receipt = 2;
+                chat.receiptConfigured = true;
+            }
+        }
+        return true;
+    }
+    if (cmd == L"msgtime")
+    {
+        if (animate || params.size() > 128) return true;
+        std::vector<int> times;
+        int previous = 0;
+        for (const auto& param : params)
+        {
+            int time;
+            if (!NativeScroll::Integer(param, time)) return true;
+            time = (std::max)(previous, time);
+            times.push_back(time);
+            previous = time;
+        }
+        chat.hasTimes = true;
+        chat.times = std::move(times);
+        return true;
+    }
+    if (cmd == L"msgleft" || cmd == L"msgright")
+    {
+        if (animate || !tag.parenthesized) return true;
+        auto& state = chat.presets[cmd == L"msgright"];
+        if (params.empty()) state.reset();
+        else if (params.size() == 12)
+        {
+            auto preset = std::make_unique<std::array<double,12>>();
+            for (size_t i = 0; i < preset->size(); ++i)
+            {
+                if (i == 8 || i == 11)
+                {
+                    wchar_t* end;
+                    const wchar_t* start = params[i];
+                    const double size = std::wcstod(start, &end);
+                    if (start == end || *end || !std::isfinite(size) || size < 0 || size > 512) return true;
+                    (*preset)[i] = size;
+                }
+                else
+                {
+                    KfxPaint::Value rgb;
+                    if (!ReadPaintValue(params[i], i == 10 || (i < 8 && i % 2), rgb)) return true;
+                    (*preset)[i] = rgb;
+                }
+            }
+            state = std::move(preset);
+        }
+        return true;
+    }
+    auto& skin = chat.skin;
+    if (cmd == L"msgtitlec" || cmd == L"msgtitlegbc" || cmd == L"bubc" || cmd == L"buba" ||
+        cmd == L"bubbc" || cmd == L"bubba" || cmd == L"bc" || cmd == L"ba")
+    {
+        const bool alpha = cmd[cmd.GetLength()-1] == L'a';
+        KfxPaint::Value value;
+        if (animate || !ReadPaintValue(argument, alpha, value)) return true;
+        if (cmd == L"msgtitlec") chat.headerColor = value;
+        if (cmd == L"msgtitlegbc") chat.headerBackground = value;
+        if (cmd == L"bubc") style.colors[2] = revcolor(value);
+        if (cmd == L"buba") style.alpha[2] = BYTE(value);
+        if (cmd == L"bubbc") skin.borderColor = value;
+        if (cmd == L"bubba") skin.borderAlpha = value;
+        if (cmd == L"bc") skin.outlineColor = value;
+        if (cmd == L"ba") skin.outlineAlpha = value;
+        return true;
+    }
+    if (cmd == L"bubbs" || (!cmd.Find(L"bs") && cmd.GetLength() > 2))
+    {
+        const CStringW number = cmd == L"bubbs" ? argument : cmd.Mid(2);
+        const wchar_t* start = number;
+        wchar_t* end;
+        const double value = std::wcstod(start, &end);
+        if (!animate && start != end && !*end && std::isfinite(value))
+            (cmd == L"bubbs" ? skin.border : skin.outline) = (std::max)(0., (std::min)(512., value));
+        return true;
+    }
+    if (cmd == L"2c" && !argument.IsEmpty())
+    {
+        KfxPaint::Value rgb;
+        if (ReadPaintValue(argument, false, rgb)) chat.headerColor = rgb;
+    }
+    if (cmd == L"r" && !animate)
+    {
+        chat.skin = {};
+        chat.receipt = chat.readDelay = 0;
+        chat.receiptConfigured = false;
+    }
+    return false;
+}
+
+bool MetadataTag(const OverrideTag& tag, bool actor)
+{
+    const auto& cmd = tag.command;
+    if (tag.extension == ExtensionTag::Gradient)
+    {
+        PaintTag paint{};
+        ReadPaintTag(cmd, paint);
+        return !actor || (!paint.positioned && !paint.slide);
+    }
+    if (tag.extension == ExtensionTag::Outline)
+    {
+        OutlineTag outline;
+        ReadOutlineTag(cmd, outline);
+        using P = OutlineProperty;
+        return !actor || (!outline.box && outline.property != P::Positioned &&
+            outline.property != P::Blur && outline.property != P::EdgeBlur &&
+            outline.property != P::Slide && outline.property != P::AlphaSlide &&
+            outline.property != P::Waiting && outline.property != P::WaitingCorners &&
+            outline.property != P::WaitingGradient && outline.property != P::WaitingSlide);
+    }
+    if (tag.extension == ExtensionTag::Layout)
+        return !actor && (!cmd.Find(L"furi") || cmd == L"vert" || cmd == L"vtype" ||
+            cmd == L"vdir" || cmd == L"vsp" || cmd == L"vcolsp");
+    if (!actor && (cmd == L"q" || cmd == L"ta" || cmd == L"fshp" || cmd == L"ortho" ||
+        !cmd.Find(L"box")))
+        return true;
+    const int size = cmd.GetLength();
+    if ((size == 3 && cmd[0] >= L'1' && cmd[0] <= L'4' && cmd[1] == L'v' &&
+            (cmd[2] == L'c' || cmd[2] == L'a')) || cmd == L"vc" || cmd == L"va")
+        return tag.parameters.size() == 4;
+    return actor && (SemanticColumns::DefaultFields(cmd) || tag.extension == ExtensionTag::Decoration ||
+        cmd == L"msgleft" || cmd == L"msgright" || cmd == L"readmark" || cmd == L"readtime");
+}
+
+int MetadataPaintSlot(const OverrideTag& tag)
+{
+    if (tag.extension == ExtensionTag::Gradient)
+    {
+        PaintTag paint{};
+        ReadPaintTag(tag.command, paint);
+        return paint.slide ? -1 : paint.part;
+    }
+    if (tag.extension == ExtensionTag::Outline)
+    {
+        OutlineTag border;
+        ReadOutlineTag(tag.command, border);
+        using P = OutlineProperty;
+        const int base = border.box ? KfxPaint::BoxSlideStart + 2 * border.layer :
+            border.layer ? KfxPaint::NativeSlideStart + 2 * (border.layer - 1) : 4;
+        if (border.property == P::WaitingGradient || border.property == P::WaitingCorners)
+            return KfxPaint::WaitingSlidePart;
+        if (border.property == P::Gradient || border.property == P::Corners || border.property == P::Positioned)
+            return base;
+        if (border.property == P::AlphaGradient || border.property == P::AlphaCorners)
+            return base + 1;
+    }
+    const auto& cmd = tag.command;
+    if (cmd.GetLength() == 3 && cmd[0] >= L'1' && cmd[0] <= L'4' && cmd[1] == L'v' &&
+        (cmd[2] == L'c' || cmd[2] == L'a'))
+        return 2 * (cmd[0] - L'1') + (cmd[2] == L'a');
+    return -1;
+}
+}
+
+void CRenderedTextSubtitle::ApplyMetadata(CSubtitle& sub, const CString& styleName, STSStyle& style, bool initial, bool named)
+{
+    if (!m_overrideTags) m_overrideTags = std::make_unique<OverrideTagCache>();
+    auto& cache = *m_overrideTags;
+    if (!cache.metadataReady)
+    {
+        cache.styleMetadata.clear();
+        cache.actorMetadata.clear();
+        cache.actorStyles.clear();
+        for (const auto& carrier : m_metadataCarriers)
+        {
+            const bool actor = carrier.effect == L"oborodzuki-colorcoding";
+            const bool whitelist = actor && carrier.actor == L"oborodzuki-colorcode-applied-styles";
+            OverrideTags tags;
+            std::vector<CString> styles;
+            const auto& source = carrier.str;
+            for (int i = 0; (i = source.Find(L'{', i)) >= 0;)
+            {
+                const int end = source.Find(L'}', i + 1);
+                if (end < 0) break;
+                const auto block = source.Mid(i + 1, end - i - 1);
+                if (whitelist)
+                {
+                    if (!block.IsEmpty()) styles.emplace_back(block);
+                }
+                else
+                {
+                    const auto parsed = cache.Get(block);
+                    for (auto tag : *parsed)
+                        if (MetadataTag(tag, actor))
+                        {
+                            if (tag.command == L"vc" || tag.command == L"va")
+                                tag.command = L"1" + tag.command;
+                            tags.push_back(std::move(tag));
+                        }
+                }
+                i = end + 1;
+            }
+            if (whitelist)
+                cache.actorStyles = std::move(styles);
+            else if (!tags.empty())
+            {
+                if (actor && !carrier.actor.IsEmpty()) cache.actorMetadata[carrier.actor] = std::move(tags);
+                else if (!actor)
+                {
+                    auto& target = cache.styleMetadata[carrier.style];
+                    target.insert(target.end(), std::make_move_iterator(tags.begin()), std::make_move_iterator(tags.end()));
+                }
+            }
+        }
+        cache.metadataReady = true;
+    }
+    STSStyle base(style);
+    const auto select = cache.styleMetadata.find(styleName);
+    if (select != cache.styleMetadata.end())
+    {
+        std::array<bool, KfxPaint::DecorationSlideStart + 2> chosen{};
+        OverrideTags one;
+        for (const auto& tag : select->second)
+        {
+            const auto& name = tag.command;
+            if (!initial && (name == L"q" || name == L"ta" || name == L"vert" ||
+                name == L"vtype" || name == L"vdir" || name == L"vsp" || name == L"vcolsp"))
+                continue;
+            const int slot = MetadataPaintSlot(tag);
+            if (slot >= 0 && (chosen[slot] || tag.parameters.empty())) continue;
+            const auto before = style.mod_grad.paint;
+            const auto opacity = style.mod_grad.positionedOpacity;
+            const auto outline = style.nativeOutline;
+            const auto box = style.boxRings;
+            const auto decor = style.decoration;
+            const unsigned bits = style.mod_grad.legacyParts;
+            one.assign(1, tag);
+            ParseSSATag(&sub, {}, style, base, false, nullptr, &one);
+            if (slot >= 0)
+                chosen[slot] = before != style.mod_grad.paint || opacity != style.mod_grad.positionedOpacity ||
+                    outline != style.nativeOutline || box != style.boxRings || decor != style.decoration ||
+                    bits != style.mod_grad.legacyParts;
+        }
+    }
+    if (cache.actorStyles.empty() ? !named :
+        std::find(cache.actorStyles.begin(), cache.actorStyles.end(), styleName) != cache.actorStyles.end())
+    {
+        const auto actor = cache.actorMetadata.find(sub.m_inherited->actor);
+        if (actor != cache.actorMetadata.end())
+        {
+            STSStyle inherited(style);
+            ParseSSATag(&sub, {}, style, inherited, false, nullptr, &actor->second);
+        }
+    }
+}
+#endif
+
+bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org, bool fAnimate,
+    const KfxPaint::SlideSettings* inheritedSlides, const std::vector<OverrideTag>* compiled)
 {
     PROFILE_RENDER_STAGE(Overrides);
     if (!sub)
@@ -3279,14 +7052,121 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
     if (!m_overrideTags)
         m_overrideTags = std::make_unique<OverrideTagCache>();
     // A nested transform can rotate the cache while this block is being applied.
-    const auto tags = m_overrideTags->Get(str);
-    for (const auto& tag : *tags)
+    const auto tags = compiled ? std::shared_ptr<const OverrideTags>{} : m_overrideTags->Get(str);
+#ifdef _VSMOD
+    std::unique_ptr<KfxPaint::SlideSettings> localSlides;
+    const auto slides = [&]() {
+        return fAnimate ? (localSlides ? localSlides.get() : inheritedSlides) : sub->m_slideSettings.get();
+    };
+    const auto editSlides = [&]() -> KfxPaint::SlideSettings& {
+        auto& owner = fAnimate ? localSlides : sub->m_slideSettings;
+        if (!owner)
+        {
+            const auto* previous = slides();
+            owner = previous ? std::make_unique<KfxPaint::SlideSettings>(*previous) :
+                std::make_unique<KfxPaint::SlideSettings>();
+        }
+        return *owner;
+    };
+    const auto paintProgress = [&]() { return fAnimate ? KfxPaint::Unit(CalcAnimation(1, 0, true)) : 1.0; };
+    const auto stopCycle = [&](unsigned target) {
+        if (sub->m_cycles && target < KfxPaint::PatternTargets &&
+            (sub->m_cycles->active & (1u << target)) && paintProgress() > 0)
+            sub->m_cycles->Set(target, 0, {});
+    };
+    const auto readOperand = [&](CStringW input, bool signedRelative, bool timing, AssNumeric::Operand& operand) {
+        input.Trim();
+        if (input.IsEmpty()) return false;
+        bool negate = false;
+        if (input[0] == L'~')
+        {
+            if (input.GetLength() < 3 || (input[1] != L'+' && input[1] != L'-'))
+                return false;
+            operand.relative = true;
+            negate = input[1] == L'-';
+            input = input.Mid(2).Trim();
+        }
+        else operand.relative = signedRelative && (input[0] == L'+' || input[0] == L'-');
+        if (ExtendedNumber(input))
+        {
+            const auto normalized = NormalizeNumericDigits(input);
+            if (!ReadPaintNumber(normalized, operand.value))
+            {
+                if (sub->m_measuringLayout || normalized.GetLength() > 256)
+                    return false;
+                AssNumeric::Context context{};
+                if (sub->m_layoutVariables)
+                    context = *sub->m_layoutVariables;
+                else
+                    std::fill(context.begin() + AssNumeric::Width, context.end(),
+                        std::numeric_limits<double>::quiet_NaN());
+                context[AssNumeric::End] = context[AssNumeric::Duration] = m_delay;
+                context[AssNumeric::Mid] = m_delay / 2.0;
+                if (!m_overrideTags->Expression(normalized, timing).Evaluate(context, operand.value))
+                    return false;
+            }
+        }
+        else if (!ReadPaintNumber(input, operand.value))
+            return false;
+        if (negate) operand.value = -operand.value;
+        return std::abs(operand.value) <= (timing ? double(INT_MAX) + 1 : 1000000.0);
+    };
+    const auto readNumber = [&](const CStringW& text, double& result) {
+        AssNumeric::Operand value;
+        if (!readOperand(text, false, false, value) || value.relative)
+            return false;
+        result = value.value;
+        return true;
+    };
+    const auto readField = [&](const std::vector<CStringW>& args, bool inverse, bool positioned, KfxPaint::Paint& field) {
+        if (!ReadPaintField(args, inverse, field, positioned ? 4 : 0, readNumber))
+            return false;
+        if (positioned)
+        {
+            double coordinates[4];
+            for (int i = 0; i < 4; ++i)
+                if (!readNumber(args[i], coordinates[i]))
+                    return false;
+            const double left = sub->m_relativeTo == 1 ? m_vidrect.left / 8.0 : 0;
+            const double top = sub->m_relativeTo == 1 ? m_vidrect.top / 8.0 : 0;
+            field.positioned = true;
+            field.rect = {coordinates[0] * sub->m_scalex + left, coordinates[1] * sub->m_scaley + top,
+                coordinates[2] * sub->m_scalex + left, coordinates[3] * sub->m_scaley + top};
+        }
+        return true;
+    };
+    const auto copyOutline = [&](const std::shared_ptr<const KfxPaint::OutlineStyle>& source) {
+        auto state = source ? std::make_shared<KfxPaint::OutlineStyle>(*source) :
+            std::make_shared<KfxPaint::OutlineStyle>();
+        state->scaleX = (m_fScaledBAS ? sub->m_scalex : 1) * 8;
+        state->scaleY = (m_fScaledBAS ? sub->m_scaley : 1) * 8;
+        return state;
+    };
+    const auto editOutlineAlpha = [&](unsigned alpha, double progress) {
+        if (!style.nativeOutline || progress <= 0)
+            return;
+        auto state = copyOutline(style.nativeOutline);
+        for (auto& layer : state->layers)
+        {
+            if (!layer.number) continue;
+            const auto from = layer.inverseAlpha >= 0 ? unsigned(layer.inverseAlpha) : unsigned(style.alpha[2]);
+            KfxPaint::Paint solid;
+            solid.solid = alpha;
+            const int part = KfxPaint::NativeSlideStart + int(layer.number - 1) * 2 + 1;
+            layer.paint[1] = ResolvePaintSource(*sub, layer.paint[1], std::move(solid), from,
+                true, progress, fAnimate && slides() && layer.paint[1] ? slides()->Width(part) : -1, true);
+            layer.inverseAlpha = KfxPaint::Mix(from, alpha, progress, true, false);
+        }
+        style.nativeOutline = std::move(state);
+    };
+#endif
+    for (const auto& tag : compiled ? *compiled : *tags)
     {
         const auto& cmd = tag.command;
         const auto& params = tag.parameters;
 #ifdef _LUA
         // Direct function call!
-        if(m_overrideTags->IsLuaFunction(*this, tag.rawCommand))
+        if(!compiled && !sub->m_measuringLayout && m_overrideTags->IsLuaFunction(*this, tag.rawCommand))
         {
             hasExternalLua = true;
             // Find function =D
@@ -3344,9 +7224,825 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #endif
         CStringW p = params.size() > 0 ? params[0] : L"";
 
+#ifdef _VSMOD
+        if (sub->m_chat && ApplyChatTag(*sub->m_chat, tag, style, fAnimate)) continue;
+        if (tag.extension == ExtensionTag::Pattern)
+        {
+            using P = PatternTag;
+            using namespace KfxPaint;
+            const auto& pattern = tag.pattern;
+            const auto suffix = cmd.Mid(pattern.prefix).Trim();
+            const auto& value = tag.parenthesized ? p : suffix;
+            if ((tag.parenthesized && !suffix.IsEmpty()) ||
+                (pattern.kind != P::Cycle && params.size() > 1))
+                continue;
+            if (pattern.kind == P::Cycle)
+            {
+                if (fAnimate || !tag.parenthesized || params.size() < 2 || params.size() > 33) continue;
+                const wchar_t* modeValue = p;
+                const int mode = ReadDecimalDigit(modeValue);
+                if ((mode != 1 && mode != 2) || *modeValue) continue;
+                std::vector<Value> palette;
+                for (size_t i = 1; i < params.size(); ++i)
+                {
+                    Value rgb;
+                    if (!ReadPaintValue(params[i], false, rgb)) break;
+                    palette.push_back(rgb);
+                }
+                if (palette.size() + 1 != params.size()) continue;
+                if (!sub->m_cycles) sub->m_cycles = std::make_unique<Cycles>();
+                sub->m_cycles->Set(pattern.target, mode, std::move(palette));
+                if (pattern.target < 3)
+                {
+                    const unsigned part = pattern.target * 2;
+                    if (style.mod_grad.paint || style.mod_grad.mode[pattern.target] == 1)
+                        SetPaintPart(style, part, {});
+                    style.mod_grad.legacyParts &= ~(1u << part);
+                    if (style.mod_grad.mode[pattern.target] == 2) style.mod_grad.mode[pattern.target] = 0;
+                }
+                else if (style.nativeOutline)
+                {
+                    auto rings = copyOutline(style.nativeOutline);
+                    EditOutlineLayer(*rings, pattern.target - 2).paint[0].reset();
+                    style.nativeOutline = std::move(rings);
+                }
+                continue;
+            }
+            auto shade = style.mod_grad.paint ? std::make_shared<Sources>(*style.mod_grad.paint) :
+                std::make_shared<Sources>();
+            auto dots = shade->dots ? std::make_shared<DotState>(*shade->dots) : std::make_shared<DotState>();
+            auto& layer = dots->layers[pattern.target];
+            if (pattern.kind == P::Propagate)
+            {
+                if (fAnimate || (!value.IsEmpty() && value != L"0" && value != L"1")) continue;
+                dots->propagate = value != L"0";
+            }
+            else if (pattern.kind == P::DotColor)
+            {
+                Value rgb;
+                if (!ReadPaintValue(value, false, rgb)) continue;
+                layer.color = layer.color < 0 ? int(rgb) :
+                    int(Mix(Value(layer.color), rgb, paintProgress(), false, false));
+            }
+            else
+            {
+                AssNumeric::Operand number;
+                if (!readOperand(value, false, false, number)) continue;
+                auto& dimension = pattern.kind == P::DotDiameter ? layer.diameter : layer.spacing;
+                const auto current = (std::max)(0., dimension);
+                const auto target = number.Resolve(current);
+                if (!std::isfinite(target) || target > 10000) continue;
+                dimension = CalcAnimation((std::max)(0., target), current, fAnimate);
+            }
+            shade->dots = std::move(dots);
+            style.mod_grad.paint = std::move(shade);
+            continue;
+        }
+        const bool layout = tag.extension == ExtensionTag::Layout;
+        if (layout && !cmd.Find(L"scroll"))
+        {
+            if (fAnimate || sub->m_measuringLayout || sub->m_chat) continue;
+            if (cmd == L"scroll0" && params.empty())
+                sub->m_scrollGroup = 0;
+            else if (cmd == L"scroll" && tag.parenthesized && sub->m_scrollContexts.size() < 64)
+            {
+                NativeScroll::Context context;
+                context.visibleRows = sub->m_scrollRows;
+                if (context.Parse(params, sub->m_scrollDuration))
+                {
+                    sub->m_scrollContexts.push_back(std::move(context));
+                    sub->m_scrollGroup = unsigned(sub->m_scrollContexts.size());
+                    sub->m_curve.reset();
+                }
+            }
+            else if (params.size() == 1)
+            {
+                int value;
+                if (NativeScroll::Integer(p, value))
+                {
+                    if (cmd == L"scrollt" && value >= 0) sub->m_scrollDuration = value;
+                    if (cmd == L"scrollsl" && value > 0)
+                    {
+                        sub->m_scrollRows = value;
+                        if (sub->m_scrollGroup)
+                            sub->m_scrollContexts[sub->m_scrollGroup - 1].visibleRows = value;
+                    }
+                }
+            }
+            continue;
+        }
+        if (layout && cmd == L"wtan")
+        {
+            const wchar_t* value = p;
+            const int digit = ReadDecimalDigit(value);
+            if (!fAnimate && !sub->m_warpedAnchor && digit >= 1 && digit <= 9 && !*value)
+                sub->m_warpedAnchor = digit;
+            continue;
+        }
+        if (layout && (cmd == L"col" || cmd == L"colan" || cmd == L"colsp"))
+        {
+            if (fAnimate || sub->m_vertical) continue;
+            if (cmd == L"col")
+            {
+                if (p == L"1" && !sub->m_columns && sub->m_columnBlocks.size() < 64)
+                {
+                    auto block = std::make_unique<SemanticColumns::Block>(style, unsigned(sub->m_columnBlocks.size() + 1));
+                    sub->m_columns = block.get();
+                    sub->m_columnBlocks.push_back(std::move(block));
+                    sub->m_curve.reset();
+                }
+                else if (p == L"0" && sub->m_columns)
+                {
+                    sub->m_columns->EndCell();
+                    SemanticColumns::CopyFields(style, sub->m_columns->base, SemanticColumns::All);
+                    sub->m_columns = nullptr;
+                }
+            }
+            else if (sub->m_columns)
+            {
+                auto& column = sub->m_columns->Current();
+                if (cmd == L"colan" && !column.closed)
+                {
+                    const wchar_t* number = p;
+                    const int anchor = ReadDecimalDigit(number);
+                    if (anchor >= 1 && anchor <= 9 && !*number)
+                    {
+                        column.alignment = (anchor - 1) % 3 + 1;
+                        column.hasAlignment = true;
+                    }
+                }
+                else if (cmd == L"colsp")
+                {
+                    AssNumeric::Operand spacing;
+                    if (readOperand(p, false, false, spacing))
+                        column.spacing = (std::max)(1., (std::min)(8192., spacing.Resolve(column.spacing)));
+                }
+            }
+            continue;
+        }
+        if (sub->m_columns && (cmd == L"k" || cmd == L"K" || cmd == L"kf" || cmd == L"ko" ||
+            cmd == L"kO" || cmd == L"kt"))
+            continue;
+        const unsigned columnFields = sub->m_columns && !fAnimate ? SemanticColumns::DefaultFields(cmd) : 0;
+        struct DefaultCapture
+        {
+            STSStyle* snapshot;
+            STSStyle& style;
+            unsigned fields;
+            ~DefaultCapture() { if (snapshot) SemanticColumns::CopyFields(*snapshot, style, fields); }
+        } remember{columnFields ? sub->m_columns->SpliceDefault(style, columnFields) : nullptr, style, columnFields};
+        if (layout && !cmd.Find(L"furi"))
+        {
+            auto& ruby = sub->m_rubyOptions;
+            const auto defaults = !compiled && sub->m_inherited ? sub->m_inherited->ruby : Furigana::Options{};
+            if (cmd == L"furipos")
+            {
+                AssNumeric::Operand x, y;
+                if (params.size() == 2 && readOperand(params[0], false, false, x) &&
+                    readOperand(params[1], false, false, y))
+                {
+                    ruby.manual = true;
+                    const auto bounded = [](double value) { return (std::max)(-10000., (std::min)(10000., value)); };
+                    ruby.offsetX = CalcAnimation(bounded(x.Resolve(ruby.offsetX)), ruby.offsetX, fAnimate);
+                    ruby.offsetY = CalcAnimation(bounded(y.Resolve(ruby.offsetY)), ruby.offsetY, fAnimate);
+                }
+                else if (p.IsEmpty())
+                {
+                    ruby.offsetX = defaults.offsetX;
+                    ruby.offsetY = defaults.offsetY;
+                    ruby.manual = defaults.manual;
+                }
+            }
+            else if (cmd == L"furis" || cmd == L"furisx" || cmd == L"furisy" || cmd == L"furifsp")
+            {
+                const bool spacing = cmd == L"furifsp";
+                AssNumeric::Operand value;
+                if (!p.IsEmpty() && !readOperand(p, false, false, value)) continue;
+                const auto update = [&](double& current, double inherited) {
+                    const double target = p.IsEmpty() ? inherited : value.Resolve(current);
+                    current = CalcAnimation((std::max)(spacing ? -512. : 0., (std::min)(512., target)), current, fAnimate);
+                };
+                if (spacing) update(ruby.spacing, defaults.spacing);
+                else
+                {
+                    if (cmd != L"furisy") update(ruby.scaleX, defaults.scaleX);
+                    if (cmd != L"furisx") update(ruby.scaleY, defaults.scaleY);
+                }
+            }
+            else if (!fAnimate)
+            {
+                const wchar_t* begin = p;
+                wchar_t* end = nullptr;
+                const long value = std::wcstol(begin, &end, 10);
+                if (*end) continue;
+                if (cmd == L"furi") ruby.enabled = p.IsEmpty() ? defaults.enabled : value != 0;
+                if (cmd == L"furiap") ruby.autoGap = p.IsEmpty() ? defaults.autoGap : value != 0;
+                if (cmd == L"furiplaceauto") ruby.outward = p.IsEmpty() ? defaults.outward : value == 1;
+                if (cmd == L"furichangepos") ruby.placement = p.IsEmpty() ? defaults.placement : value == 2 ? 2 : value ? 1 : 0;
+                if (cmd == L"furistyle" && value >= 0 && value <= 2) ruby.style = p.IsEmpty() ? defaults.style : int(value);
+            }
+            continue;
+        }
+        if (layout && cmd == L"mpersp")
+        {
+            if (!tag.parenthesized) continue;
+            auto pins = RenderGeometry::IdentityPins();
+            if (params.size() == pins.size())
+            {
+                bool valid = true;
+                for (size_t i = 0; i < pins.size(); ++i)
+                {
+                    auto value = params[i];
+                    value.Trim();
+                    const wchar_t* begin = value;
+                    wchar_t* end = nullptr;
+                    pins[i] = std::wcstod(begin, &end);
+                    if (begin == end || *end || !std::isfinite(pins[i])) { valid = false; break; }
+                }
+                if (!valid) continue;
+            }
+            else if (params.size() > 1 || !p.IsEmpty()) continue;
+            const auto& from = sub->m_perspectivePins ? *sub->m_perspectivePins : RenderGeometry::IdentityPins();
+            for (size_t i = 0; i < pins.size(); ++i)
+                pins[i] = CalcAnimation(pins[i], from[i], fAnimate);
+            sub->m_perspectivePins = std::make_unique<RenderGeometry::Pins>(pins);
+            continue;
+        }
+        if (layout && (cmd == L"vert" || cmd == L"vtype" || cmd == L"vdir" || cmd == L"vsp" || cmd == L"vcolsp"))
+        {
+            if (fAnimate || !sub->m_words.IsEmpty() || sub->m_columns) continue;
+            if (cmd == L"vsp" || cmd == L"vcolsp")
+            {
+                AssNumeric::Operand operand;
+                auto& spacing = cmd == L"vsp" ? sub->m_verticalSpacing : sub->m_verticalColumnGap;
+                if (p.IsEmpty()) spacing = 0;
+                else if (readOperand(p, false, false, operand)) spacing = operand.Resolve(spacing);
+            }
+            else
+            {
+                const wchar_t* value = p;
+                const int digit = p.IsEmpty() ? 0 : ReadDecimalDigit(value);
+                const int upper = cmd == L"vert" ? 1 : cmd == L"vdir" ? 2 : 3;
+                if (digit < 0 || digit > upper || *value) continue;
+                if (cmd == L"vert") sub->m_vertical = digit != 0;
+                if (cmd == L"vdir") sub->m_verticalDirection = digit;
+                if (cmd == L"vtype") sub->m_verticalProfile = digit;
+            }
+            continue;
+        }
+        if (layout && (cmd == L"ct" || cmd == L"ctan" || cmd == L"ctx" || cmd == L"cty"))
+        {
+            if (cmd == L"ctan" && !fAnimate && !sub->m_curveAnchor)
+            {
+                const wchar_t* value = p;
+                const int digit = ReadDecimalDigit(value);
+                if (digit >= 1 && digit <= 9 && !*value) sub->m_curveAnchor = digit;
+            }
+            else if (cmd == L"ctx" || cmd == L"cty")
+            {
+                AssNumeric::Operand operand;
+                auto& current = cmd == L"ctx" ? sub->m_curveX : sub->m_curveY;
+                if (p.IsEmpty()) current = 0;
+                else if (readOperand(p, false, false, operand))
+                    current = CalcAnimation(operand.Resolve(current), current, fAnimate);
+            }
+            continue;
+        }
+        if (tag.unicodeNumber && (cmd == L"an" || cmd == L"a" || cmd == L"kt" || cmd == L"k" || cmd == L"kO" ||
+            cmd == L"K" || cmd == L"kf" || cmd == L"ko" || cmd == L"p" || cmd == L"q"))
+            p = NormalizeNumericDigits(p);
+        if (sub->m_keepRubyKaraoke && (cmd == L"k" || cmd == L"K" || cmd == L"kf" ||
+            cmd == L"ko" || cmd == L"kO" || cmd == L"kt"))
+            sub->m_keepRubyKaraoke = false;
+        if (tag.extendedScalar)
+        {
+            AssNumeric::Operand operand;
+            bool handled = false;
+            const auto scalar = [&](double& current, double units = 1., bool nonnegative = false,
+                double limit = (std::numeric_limits<double>::max)()) {
+                if (!readOperand(p, false, false, operand)) return;
+                const double target = operand.Resolve(current / units) * units;
+                const double value = CalcAnimation(target, current, fAnimate);
+                if (std::isfinite(value))
+                    current = (std::min)(limit, nonnegative ? (std::max)(0., value) : value);
+            };
+            if (cmd == L"fs")
+            {
+                scalar(style.fontSize, 1., false, 4096.);
+                if (style.fontSize <= 0) style.fontSize = org.fontSize;
+            }
+            else if (cmd == L"fscx") scalar(style.fontScaleX, 1., true);
+            else if (cmd == L"fscy") scalar(style.fontScaleY, 1., true);
+            else if (cmd == L"fsp") scalar(style.fontSpacing);
+            else if (cmd == L"fsvp") scalar(style.mod_verticalSpace, 8.);
+            else if (cmd == L"fshp") scalar(style.mod_horizontalSpace, 8.);
+            else if (cmd == L"fax") scalar(style.fontShiftX);
+            else if (cmd == L"fay") scalar(style.fontShiftY);
+            else if (cmd == L"fr" || cmd == L"frz") scalar(style.fontAngleZ);
+            else if (cmd == L"frx") scalar(style.fontAngleX);
+            else if (cmd == L"fry") scalar(style.fontAngleY);
+            else if (cmd == L"z") scalar(style.mod_z, 80.);
+            else if (cmd == L"frs" || cmd == L"pbo")
+            {
+                auto& current = cmd == L"frs" ? style.mod_fontOrient : m_polygonBaselineOffset;
+                double value = current;
+                scalar(value, cmd == L"frs" ? 10. : 1.);
+                current = int(value);
+            }
+            else if (cmd == L"rnd" || cmd == L"rndx" || cmd == L"rndy" || cmd == L"rndz")
+            {
+                auto apply = [&](int& current) {
+                    double value = current;
+                    scalar(value, 8.);
+                    current = int(value);
+                };
+                if (cmd == L"rnd" || cmd == L"rndx") apply(style.mod_rand.X);
+                if (cmd == L"rnd" || cmd == L"rndy") apply(style.mod_rand.Y);
+                if (cmd == L"rnd" || cmd == L"rndz") apply(style.mod_rand.Z);
+            }
+            else if (cmd == L"bord" || cmd == L"xbord" || cmd == L"ybord")
+            {
+                if (cmd != L"ybord") scalar(style.outlineWidthX, 1., true, 256.);
+                if (cmd != L"xbord") scalar(style.outlineWidthY, 1., true, 256.);
+            }
+            else if (cmd == L"shad" || cmd == L"xshad" || cmd == L"yshad")
+            {
+                if (cmd != L"yshad") scalar(style.shadowDepthX);
+                if (cmd != L"xshad") scalar(style.shadowDepthY);
+            }
+            else if (cmd == L"blur" || cmd == L"xblur" || cmd == L"yblur")
+            {
+                if (cmd != L"yblur") scalar(style.fGaussianBlurX, 1., true, 100.);
+                if (cmd != L"xblur") scalar(style.fGaussianBlurY, 1., true, 100.);
+            }
+            else if (cmd == L"be")
+            {
+                double value = style.fBlur;
+                scalar(value, 1., true);
+                style.fBlur = int((std::min)(127., value));
+            }
+            else handled = true;
+            if (!handled) continue;
+        }
+
+        if (!p.IsEmpty() && p[0] == L'$')
+        {
+            const bool numbered = cmd.GetLength() == 2 && cmd[0] >= L'1' && cmd[0] <= L'4';
+            const bool color = cmd == L"c" || (numbered && cmd[1] == L'c');
+            const bool inverse = cmd == L"alpha" || (numbered && cmd[1] == L'a');
+            if (color || inverse)
+            {
+                KfxPaint::Value value;
+                if (!ReadPaintValue(p, inverse, value)) continue;
+                p.Format(L"%lX", static_cast<unsigned long>(inverse ? value : revcolor(value)));
+            }
+        }
+
+        if (tag.extension == ExtensionTag::Decoration)
+        {
+            using namespace KfxPaint;
+            bool decorationAlpha;
+            CStringW decorationArgument;
+            ReadDecorationScalar(cmd, decorationAlpha, decorationArgument);
+            if (params.size() > 1 || (!params.empty() && !decorationArgument.IsEmpty())) continue;
+            const auto& argument = params.empty() ? decorationArgument : p;
+            const auto progress = paintProgress();
+            if (progress <= 0) continue;
+            const bool reset = argument.IsEmpty();
+            Value value = 0;
+            if (!reset && !ReadPaintValue(argument, decorationAlpha, value)) continue;
+            auto deco = style.decoration ? std::make_shared<DecorationPaint>(*style.decoration) :
+                std::make_shared<DecorationPaint>();
+            auto& solid = decorationAlpha ? deco->inverseAlpha : deco->color;
+            const Value from = solid >= 0 ? Value(solid) : decorationAlpha ? style.alpha[0] : revcolor(style.colors[0]);
+            auto& source = deco->paint[int(decorationAlpha)];
+            Paint target;
+            target.solid = value;
+            source = reset ? Source{} : ResolvePaintSource(*sub, source, std::move(target), from, decorationAlpha,
+                progress, fAnimate && slides() && source ? slides()->Width(DecorationSlideStart + int(decorationAlpha)) : -1);
+            solid = reset ? -1 : int(Mix(from, value, progress, decorationAlpha, false));
+            style.decoration = std::move(deco);
+            continue;
+        }
+
+        if (tag.extension == ExtensionTag::Box)
+        {
+            const wchar_t* name = cmd;
+            if (!wcsncmp(name, L"bs", 2))
+            {
+                if (!fAnimate && sub->m_borderStyleOverride < 0 && params.empty())
+                {
+                    if (!wcscmp(name + 2, L"1")) sub->m_borderStyleOverride = 0;
+                    if (!wcscmp(name + 2, L"3")) sub->m_borderStyleOverride = 1;
+                    if (!wcscmp(name + 2, L"4")) sub->m_borderStyleOverride = 2;
+                    if (!wcscmp(name + 2, L"5")) sub->m_borderStyleOverride = 3;
+                }
+                continue;
+            }
+            name += 3;
+            if (params.empty() && (*name == L'0' || *name == L'1') && !name[1])
+            {
+                if (!fAnimate || paintProgress() == 1) sub->m_boxMode = *name - L'0';
+                continue;
+            }
+            auto box = style.boxShape ? std::make_shared<KfxPaint::BoxShape>(*style.boxShape) :
+                std::make_shared<KfxPaint::BoxShape>();
+            if (*name == L'r')
+            {
+                ++name;
+                AssNumeric::Operand radius;
+                if ((params.empty() && (!*name || readOperand(CStringW(name), false, false, radius))) ||
+                    (!*name && params.size() == 1 && readOperand(p, false, false, radius)))
+                {
+                    box->radius = (std::max)(0., CalcAnimation(radius.Resolve(box->radius), box->radius, fAnimate));
+                    style.boxShape = std::move(box);
+                }
+            }
+            else if (*name == L'p')
+            {
+                ++name;
+                const int first = *name == L'y' ? 2 : 0;
+                const int count = *name == L'x' || *name == L'y' ? 2 : 4;
+                if (count == 2) ++name;
+                const bool tuple = !*name && params.size() == size_t(count);
+                AssNumeric::Operand scalar;
+                if (!tuple && (!params.empty() || !readOperand(CStringW(name), true, false, scalar)))
+                    continue;
+                bool valid = true;
+                for (int i = 0; i < count; ++i)
+                {
+                    auto value = scalar;
+                    if (tuple)
+                    {
+                        if (!readOperand(params[i], true, false, value))
+                        {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    auto& padding = box->padding[first + i];
+                    padding = (std::max)(0., CalcAnimation(value.Resolve(padding), padding, fAnimate));
+                }
+                if (valid) style.boxShape = std::move(box);
+            }
+            continue;
+        }
+
+        if (tag.extension == ExtensionTag::Outline)
+        {
+            using P = OutlineProperty;
+            using namespace KfxPaint;
+            OutlineTag outline;
+            ReadOutlineTag(cmd, outline);
+            const auto property = outline.property;
+            const bool base = !outline.box && outline.layer == 0;
+            const int channel = outline.box ? 3 : 2;
+            auto& ringState = outline.box ? style.boxRings : style.nativeOutline;
+            const bool inverse = property == P::Alpha || property == P::AlphaCorners ||
+                property == P::AlphaGradient || property == P::AlphaSlide;
+            const bool waitingField = property == P::WaitingGradient || property == P::WaitingCorners;
+            const int part = waitingField || property == P::WaitingSlide ? WaitingSlidePart :
+                (outline.box ? BoxSlideStart + 2 * int(outline.layer) :
+                base ? 4 : NativeSlideStart + 2 * int(outline.layer - 1)) + int(inverse);
+            const double progress = paintProgress();
+            if (progress <= 0 || (!params.empty() && !outline.argument.IsEmpty()))
+                continue;
+            const auto& argument = params.empty() ? outline.argument : p;
+            if (property == P::Slide || property == P::AlphaSlide || property == P::WaitingSlide)
+            {
+                if (params.size() > 1) continue;
+                double value = 0;
+                if (argument == L"off") value = -2;
+                else if (!argument.IsEmpty())
+                {
+                    AssNumeric::Operand width;
+                    if (!readOperand(argument, false, false, width)) continue;
+                    value = width.Resolve(slides() ? (std::max)(0., slides()->Width(part)) : 0.);
+                    if (value < 0) continue;
+                    if (!value) value = -1;
+                }
+                auto& state = editSlides();
+                (property == P::WaitingSlide ? state.waiting : outline.box ? state.box[part - BoxSlideStart] :
+                    base ? state.channels[part] : state.outline[part - NativeSlideStart]) = value;
+                continue;
+            }
+            const bool positioned = property == P::Positioned;
+            const bool gradient = property == P::Gradient || property == P::AlphaGradient ||
+                property == P::WaitingGradient || positioned;
+            const bool corners = property == P::Corners || property == P::AlphaCorners || property == P::WaitingCorners;
+            const double width = fAnimate && slides() ? slides()->Width(part) : -1;
+            if (gradient || corners)
+            {
+                Paint target;
+                const bool reset = params.empty() && (positioned ? tag.parenthesized && !fAnimate :
+                    argument.IsEmpty() || argument == L"0");
+                if (!reset && gradient && !readField(params, inverse, positioned, target))
+                    continue;
+                if (!reset && corners)
+                {
+                    if (params.size() != 4) continue;
+                    target.kind = Paint::Kind::Corners;
+                    for (const auto& a : params)
+                    {
+                        Value value;
+                        if (!ReadPaintValue(a, inverse, value)) break;
+                        target.stops.push_back({0, value});
+                    }
+                    if (target.stops.size() != 4) continue;
+                }
+                if (!outline.box && !inverse && !waitingField && !reset)
+                    stopCycle(outline.layer + 2);
+                if (waitingField)
+                {
+                    auto state = copyOutline(ringState);
+                    auto& layer = EditOutlineLayer(*state, 0);
+                    const Value solid = layer.waitingColor >= 0 ? Value(layer.waitingColor) : revcolor(style.colors[2]);
+                    layer.waitingPaint = reset ? Source{} : ResolvePaintSource(*sub,
+                        layer.waitingPaint, std::move(target), solid, false, progress, width, true, fAnimate);
+                    ringState = std::move(state);
+                }
+                else if (base)
+                {
+                    const Value solid = inverse ? style.alpha[2] : revcolor(style.colors[2]);
+                    Source old = style.mod_grad.paint ? style.mod_grad.paint->parts[part] : Source{};
+                    if (positioned && reset && (!old || !old->positioned)) continue;
+                    if (!old && width >= 0 && (style.mod_grad.legacyParts & (1u << part)))
+                        old = std::make_shared<const Paint>(PaintCorners(style, 2, inverse));
+                    SetPaintPart(style, part, reset ? Source{} : ResolvePaintSource(*sub,
+                        std::move(old), std::move(target), solid, inverse, progress, width, true, fAnimate));
+                    style.mod_grad.legacyParts &= ~(1u << part);
+                }
+                else
+                {
+                    auto state = copyOutline(ringState);
+                    auto& layer = EditOutlineLayer(*state, outline.layer);
+                    const int component = int(inverse);
+                    if (positioned && reset && (!layer.paint[component] || !layer.paint[component]->positioned))
+                        continue;
+                    const int fallback = inverse ? layer.inverseAlpha : layer.color;
+                    const Value solid = fallback >= 0 ? Value(fallback) :
+                        inverse ? style.alpha[channel] : revcolor(style.colors[channel]);
+                    layer.paint[component] = reset ? Source{} : ResolvePaintSource(*sub,
+                        layer.paint[component], std::move(target), solid, inverse, progress, width, true, fAnimate);
+                    ringState = std::move(state);
+                }
+                continue;
+            }
+            if (params.size() > 1) continue;
+            if (property == P::Color || property == P::Alpha || property == P::Waiting)
+            {
+                const bool reset = argument.IsEmpty();
+                Value value = inverse ? org.alpha[channel] : revcolor(org.colors[channel]);
+                if (!reset && !ReadPaintValue(argument, inverse, value)) continue;
+                if (!outline.box && property == P::Color) stopCycle(outline.layer + 2);
+                if (base && property != P::Waiting)
+                {
+                    const Value from = inverse ? style.alpha[2] : revcolor(style.colors[2]);
+                    Paint target;
+                    target.solid = value;
+                    ApplyPaintPart(*sub, style, part, std::move(target), progress, width);
+                    style.mod_grad.legacyParts &= ~(1u << part);
+                    const Value mixed = Mix(from, value, progress, inverse, false);
+                    if (inverse) style.alpha[2] = BYTE(mixed);
+                    else style.colors[2] = revcolor(mixed);
+                }
+                else
+                {
+                    auto state = copyOutline(ringState);
+                    auto& layer = EditOutlineLayer(*state, outline.layer);
+                    auto& dest = property == P::Waiting ? layer.waitingColor : inverse ? layer.inverseAlpha : layer.color;
+                    const Value from = dest >= 0 ? Value(dest) : inverse ? style.alpha[channel] : revcolor(style.colors[channel]);
+                    if (property == P::Waiting)
+                    {
+                        Paint target;
+                        target.solid = value;
+                        const double waitingWidth = fAnimate && slides() ? slides()->Width(WaitingSlidePart) : -1;
+                        layer.waitingPaint = reset ? Source{} : ResolvePaintSource(*sub, layer.waitingPaint,
+                            std::move(target), from, false, progress, layer.waitingPaint ? waitingWidth : -1, true);
+                    }
+                    else
+                    {
+                        Paint target;
+                        target.solid = value;
+                        auto& source = layer.paint[int(inverse)];
+                        source = reset ? Source{} : ResolvePaintSource(*sub, source, std::move(target),
+                            from, inverse, progress, source ? width : -1, true);
+                    }
+                    dest = reset ? -1 : int(Mix(from, value, progress, inverse, false));
+                    ringState = std::move(state);
+                }
+                continue;
+            }
+
+            const bool reset = argument.IsEmpty();
+            AssNumeric::Operand value;
+            if (!reset && !readOperand(argument, true, false, value)) continue;
+            if (property == P::Blur || property == P::EdgeBlur)
+            {
+                auto state = copyOutline(ringState);
+                auto& layer = EditOutlineLayer(*state, outline.layer);
+                if (property == P::Blur)
+                {
+                    const double current = layer.blur >= 0 ? layer.blur : style.fGaussianBlurX;
+                    layer.blur = reset ? -1 : CalcAnimation((std::max)(0., (std::min)(value.Resolve(current), 100.)),
+                        current, fAnimate);
+                }
+                else
+                {
+                    const double current = layer.edgeBlur >= 0 ? layer.edgeBlur : style.fBlur;
+                    layer.edgeBlur = reset ? -1 : int(CalcAnimation((std::max)(0., (std::min)(value.Resolve(current), 127.)),
+                        current, fAnimate) + 0.5);
+                }
+                ringState = std::move(state);
+                continue;
+            }
+            const bool applyX = property != P::WidthY;
+            const bool applyY = property != P::WidthX;
+            const auto animateSize = [&](double current, double fallback) {
+                return (std::max)(0., CalcAnimation(reset ? fallback : value.Resolve(current), current, fAnimate));
+            };
+            if (base)
+            {
+                if (applyX) style.outlineWidthX = animateSize(style.outlineWidthX, org.outlineWidthX);
+                if (applyY) style.outlineWidthY = animateSize(style.outlineWidthY, org.outlineWidthY);
+            }
+            else
+            {
+                auto state = copyOutline(ringState);
+                auto& layer = EditOutlineLayer(*state, outline.layer);
+                if (applyX) layer.x = animateSize(layer.x, 0.);
+                if (applyY) layer.y = animateSize(layer.y, 0.);
+                if (!outline.box && (layer.x > 0 || layer.y > 0))
+                {
+                    if (layer.color < 0) layer.color = revcolor(style.colors[2]);
+                    if (layer.inverseAlpha < 0) layer.inverseAlpha = style.alpha[2];
+                }
+                ringState = std::move(state);
+            }
+            continue;
+        }
+
+        if (tag.extension == ExtensionTag::Gradient)
+        {
+            PaintTag paint{};
+            ReadPaintTag(cmd, paint);
+            if (paint.slide)
+            {
+                if (params.size() > 1 || (!params.empty() && !paint.argument.IsEmpty())) continue;
+                const CStringW& argument = params.empty() ? paint.argument : p;
+                double setting = 0;
+                if (argument == L"off") setting = -2;
+                else if (!argument.IsEmpty())
+                {
+                    AssNumeric::Operand width;
+                    if (!readOperand(argument, false, false, width)) continue;
+                    const auto* state = slides();
+                    const double current = !state ? 0. : paint.part < 0 ?
+                        state->global : (std::max)(0., state->Width(paint.part));
+                    setting = width.Resolve((std::max)(0., current));
+                    if (setting < 0) continue;
+                    if (setting == 0) setting = -1;
+                }
+                auto& state = editSlides();
+                (paint.positionedAlpha ? state.positionedAlpha :
+                    paint.decoration ? state.decoration[paint.part - KfxPaint::DecorationSlideStart] :
+                    paint.part < 0 ? state.global : state.channels[paint.part]) = setting;
+            }
+            else if (paint.positionedAlpha)
+            {
+                if (!tag.parenthesized || !paint.argument.IsEmpty()) continue;
+                auto& source = style.mod_grad.positionedOpacity;
+                if (params.empty())
+                {
+                    if (!fAnimate) source.reset();
+                    continue;
+                }
+                constexpr unsigned maxScopes = 32;
+                if (sub->m_positionedAlphaScopes >= maxScopes) continue;
+                KfxPaint::Paint field;
+                if (!readField(params, true, true, field)) continue;
+                const double progress = paintProgress();
+                if (progress <= 0) continue;
+                source = ResolvePaintSource(*sub, source, std::move(field), 0, true, progress,
+                    fAnimate && slides() ? slides()->Width(paint.part) : -1, false, fAnimate);
+                ++sub->m_positionedAlphaScopes;
+            }
+            else if (paint.decoration)
+            {
+                using namespace KfxPaint;
+                const bool inverse = paint.part == DecorationSlideStart + 1;
+                const auto progress = paintProgress();
+                if (progress <= 0) continue;
+                const bool reset = params.empty() && (paint.positioned ? tag.parenthesized && !fAnimate :
+                    paint.argument.IsEmpty() || paint.argument == L"0");
+                Paint field;
+                if (!reset && (!paint.argument.IsEmpty() || !readField(params, inverse, paint.positioned, field)))
+                    continue;
+                auto deco = style.decoration ? std::make_shared<DecorationPaint>(*style.decoration) :
+                    std::make_shared<DecorationPaint>();
+                auto& source = deco->paint[int(inverse)];
+                if (paint.positioned && reset && (!source || !source->positioned)) continue;
+                const int own = inverse ? deco->inverseAlpha : deco->color;
+                const Value solid = own >= 0 ? Value(own) : inverse ? style.alpha[0] : revcolor(style.colors[0]);
+                source = reset ? Source{} : ResolvePaintSource(*sub, source, std::move(field), solid, inverse, progress,
+                    fAnimate && slides() ? slides()->Width(paint.part) : -1, false, fAnimate);
+                style.decoration = std::move(deco);
+            }
+            else if (params.empty() && (paint.argument.IsEmpty() || paint.argument == L"0"))
+            {
+                if (!fAnimate && (!paint.positioned || (tag.parenthesized && paint.argument.IsEmpty() &&
+                    style.mod_grad.paint && style.mod_grad.paint->parts[paint.part] &&
+                    style.mod_grad.paint->parts[paint.part]->positioned)))
+                {
+                    style.mod_grad.legacyParts &= ~(1u << paint.part);
+                    SetPaintPart(style, paint.part, {});
+                }
+            }
+            else if (paint.argument.IsEmpty())
+            {
+                KfxPaint::Paint field;
+                if (readField(params, (paint.part & 1) != 0, paint.positioned, field))
+                {
+                    if (!(paint.part & 1)) stopCycle(unsigned(paint.part / 2));
+                    const auto progress = paintProgress();
+                    ApplyPaintPart(*sub, style, paint.part, std::move(field), progress,
+                                   fAnimate && slides() ? slides()->Width(paint.part) : -1, fAnimate);
+                    if (progress > 0)
+                    {
+                        style.mod_grad.legacyParts &= ~(1u << paint.part);
+                        if (!(paint.part & 1) && style.mod_grad.mode[paint.part / 2] == 2)
+                            style.mod_grad.mode[paint.part / 2] = 0;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Feed ordinary paint tags into a transform only when extended paint
+        // or an explicit slide setting already participates in that channel.
+        const bool numbered = cmd.GetLength() >= 2 && cmd[0] >= L'1' && cmd[0] <= L'4';
+        if (style.mod_grad.paint || slides())
+        {
+            const bool scalarColor = cmd == L"c" || (numbered && cmd.GetLength() == 2 && cmd[1] == L'c');
+            const bool allAlpha = cmd == L"alpha";
+            const bool scalarAlpha = allAlpha || (numbered && cmd.GetLength() == 2 && cmd[1] == L'a');
+            if (scalarColor || scalarAlpha)
+            {
+                const int first = numbered ? cmd[0] - L'1' : 0;
+                const auto progress = paintProgress();
+                for (int channel = first; channel < (allAlpha ? 4 : first + 1); ++channel)
+                {
+                    const int part = channel * 2 + int(scalarAlpha);
+                    const double width = fAnimate && slides() ? slides()->Width(part) : -1;
+                    const auto& state = style.mod_grad.paint;
+                    if ((!state || !state->parts[part]) &&
+                        (width < 0 || !(style.mod_grad.legacyParts & (1u << part))))
+                        continue;
+                    KfxPaint::Paint solid;
+                    solid.solid = scalarAlpha ? KfxPaint::Value(p.IsEmpty() ? org.alpha[channel] : wcstol(p, nullptr, 16) & 255) :
+                        KfxPaint::Value(revcolor(p.IsEmpty() ? org.colors[channel] : wcstol(p, nullptr, 16) & 0xFFFFFF));
+                    ApplyPaintPart(*sub, style, part, std::move(solid), progress, width);
+                }
+                if (progress <= 0)
+                    continue;
+            }
+            if (numbered && cmd.GetLength() == 3 && cmd[1] == L'v' &&
+                (cmd[2] == L'a' || cmd[2] == L'c') && params.size() >= 4)
+            {
+                const bool inverseAlpha = cmd[2] == L'a';
+                const int part = (cmd[0] - L'1') * 2 + int(inverseAlpha);
+                const auto progress = paintProgress();
+                if (progress <= 0) continue;
+                if (!inverseAlpha) stopCycle(unsigned(part / 2));
+                const double width = fAnimate && slides() ? slides()->Width(part) : -1;
+                if (width >= 0 && progress < 1)
+                {
+                    KfxPaint::Paint corners;
+                    corners.kind = KfxPaint::Paint::Kind::Corners;
+                    for (int i = 0; i < 4; ++i)
+                    {
+                        KfxPaint::Value value;
+                        if (!ReadPaintValue(params[i], inverseAlpha, value)) break;
+                        corners.stops.push_back({0, value});
+                    }
+                    if (corners.stops.size() == 4)
+                    {
+                        ApplyPaintPart(*sub, style, part, std::move(corners), progress, width);
+                        continue;
+                    }
+                }
+                else if (style.mod_grad.paint && style.mod_grad.paint->parts[part])
+                    SetPaintPart(style, part, {});
+            }
+        }
+#endif
+
         if(cmd == "1c" || cmd == L"2c" || cmd == L"3c" || cmd == L"4c")
         {
             int i = cmd[0] - '1';
+#ifdef _VSMOD
+            stopCycle(unsigned(i));
+#endif
 
             DWORD c = wcstol(p, NULL, 16);
             style.colors[i] = !p.IsEmpty()
@@ -3356,9 +8052,10 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                               : org.colors[i];
 #ifdef _VSMOD // patch m004. gradient colors
             style.mod_grad.colors[i] = style.colors[i];
+            style.mod_grad.legacyParts &= ~(1u << (2 * i));
             if(!fAnimate)
             {
-                style.mod_grad.mode[i] = 0;
+                style.mod_grad.mode[i] = style.mod_grad.paint && (style.mod_grad.legacyParts & (2u << (2 * i))) ? 1 : 0;
                 for(int j = 0; j < 4; j++)
                 {
                     style.mod_grad.color[i][j] = !p.IsEmpty()
@@ -3383,12 +8080,17 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         {
             DWORD al = wcstol(p, NULL, 16) & 0xff;
             int i = cmd[0] - '1';
+#ifdef _VSMOD
+            if (i == 2 && style.nativeOutline)
+                editOutlineAlpha(p.IsEmpty() ? org.alpha[2] : al, paintProgress());
+#endif
 
             style.alpha[i] = !p.IsEmpty()
                              ? (BYTE)CalcAnimation(al, style.alpha[i], fAnimate)
                              : org.alpha[i];
 #ifdef _VSMOD // patch m004. gradient colors
             style.mod_grad.alphas[i] = style.alpha[i];
+            style.mod_grad.legacyParts &= ~(2u << (2 * i));
             style.mod_grad.b_images[i].alpha = 255 - style.alpha[i];
             if(!fAnimate)
             {
@@ -3443,6 +8145,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     if(t_init)
                     {
                         style.mod_grad.mode[i] = 2;
+                        stopCycle(unsigned(i));
                     }
                     else
                     {
@@ -3451,6 +8154,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                         if(t_temp.initImage(params[0])) // absolute path or default directory
                         {
                             style.mod_grad.mode[i] = 2;
+                            stopCycle(unsigned(i));
                             style.mod_grad.b_images[i] = t_temp;
                             mod_images.Add(t_temp);
                         }
@@ -3458,6 +8162,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                         if(t_temp.initImage(fpath + params[0])) // path + relative path
                         {
                             style.mod_grad.mode[i] = 2;
+                            stopCycle(unsigned(i));
                             style.mod_grad.b_images[i] = t_temp;
                             mod_images.Add(t_temp);
                         }
@@ -3482,6 +8187,8 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 
             if(params.size() >= 4)
             {
+                stopCycle(unsigned(i));
+                style.mod_grad.legacyParts |= 1u << (2 * i);
                 DWORD c;
                 for(int j = 0; j < 4; j++)
                 {
@@ -3512,6 +8219,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 
             if(params.size() >= 4)
             {
+                style.mod_grad.legacyParts |= 2u << (2 * i);
                 int a;
                 for(int j = 0; j < 4; j++)
                 {
@@ -3538,6 +8246,10 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #endif
         else if(cmd == L"alpha")
         {
+#ifdef _VSMOD
+            if (style.nativeOutline)
+                editOutlineAlpha(p.IsEmpty() ? org.alpha[2] : wcstol(p, nullptr, 16) & 255, paintProgress());
+#endif
             for(ptrdiff_t i = 0; i < 4; i++)
             {
                 DWORD al = wcstol(p, NULL, 16) & 0xff;
@@ -3546,6 +8258,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                                  : org.alpha[i];
 #ifdef _VSMOD // patch m004. gradient colors
                 style.mod_grad.alphas[i] = style.alpha[i];
+                style.mod_grad.legacyParts &= ~(2u << (2 * i));
                 if(!fAnimate)
                 {
                     //style.mod_grad.mode[i] = 0;
@@ -3620,6 +8333,18 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                                ? (n == 0 ? FW_NORMAL : n == 1 ? FW_BOLD : n >= 100 ? n : org.fontWeight)
                                    : org.fontWeight;
         }
+#ifdef _VSMOD
+        else if(cmd == L"clippos")
+        {
+            AssNumeric::Operand x, y;
+            if (params.size() == 2 && tag.parenthesized &&
+                readOperand(params[0], false, false, x) && readOperand(params[1], false, false, y))
+            {
+                sub->m_clipOffsetX = CalcAnimation(x.Resolve(sub->m_clipOffsetX), sub->m_clipOffsetX, fAnimate);
+                sub->m_clipOffsetY = CalcAnimation(y.Resolve(sub->m_clipOffsetY, -1), sub->m_clipOffsetY, fAnimate);
+            }
+        }
+#endif
         else if(cmd == L"clip" || cmd == L"iclip")
         {
             bool invert = (cmd == L"iclip");
@@ -3645,14 +8370,6 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             {
                 CRect r;
 
-                sub->m_clipInverse = invert;
-
-                r.SetRect(
-                    wcstol(params[0], NULL, 10),
-                    wcstol(params[1], NULL, 10),
-                    wcstol(params[2], NULL, 10),
-                    wcstol(params[3], NULL, 10));
-
                 CPoint o(0, 0);
 
                 if(sub->m_relativeTo == 1) // TODO: this should also apply to the other two clippings above
@@ -3660,6 +8377,41 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     o.x = m_vidrect.left >> 3;
                     o.y = m_vidrect.top >> 3;
                 }
+#ifdef _VSMOD
+                sub->m_hasRectClip = true;
+                if (tag.extendedArguments)
+                {
+                    const LONG previous[] = {sub->m_clip.left, sub->m_clip.top, sub->m_clip.right, sub->m_clip.bottom};
+                    double resolved[4];
+                    bool valid = true;
+                    for (int i = 0; i < 4; ++i)
+                    {
+                        AssNumeric::Operand operand;
+                        if (!readOperand(params[i], false, false, operand))
+                        {
+                            valid = false;
+                            break;
+                        }
+                        const double scale = i % 2 ? sub->m_scaley : sub->m_scalex;
+                        const double offset = i % 2 ? o.y : o.x;
+                        const double dst = operand.relative ? previous[i] + operand.value * scale :
+                            operand.value * scale + offset;
+                        resolved[i] = CalcAnimation(dst, previous[i], fAnimate);
+                    }
+                    if (valid)
+                    {
+                        sub->m_clipInverse = invert;
+                        sub->m_clip.SetRect(int(resolved[0]), int(resolved[1]), int(resolved[2]), int(resolved[3]));
+                    }
+                    continue;
+                }
+#endif
+                sub->m_clipInverse = invert;
+                r.SetRect(
+                    wcstol(params[0], NULL, 10),
+                    wcstol(params[1], NULL, 10),
+                    wcstol(params[2], NULL, 10),
+                    wcstol(params[3], NULL, 10));
 
                 sub->m_clip.SetRect(
                     (int)CalcAnimation(sub->m_scalex * r.left + o.x, sub->m_clip.left, fAnimate),
@@ -3670,6 +8422,9 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         }
         else if(cmd == L"c")
         {
+#ifdef _VSMOD
+            stopCycle(0);
+#endif
             DWORD c = wcstol(p, NULL, 16);
             style.colors[0] = !p.IsEmpty()
                               ? (((int)CalcAnimation(c & 0xff, style.colors[0] & 0xff, fAnimate)) & 0xff
@@ -3678,9 +8433,10 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                               : org.colors[0];
 #ifdef _VSMOD // patch m004. gradient colors
             style.mod_grad.colors[0] = style.colors[0];
+            style.mod_grad.legacyParts &= ~1u;
             if(!fAnimate)
             {
-                style.mod_grad.mode[0] = 0;
+                style.mod_grad.mode[0] = style.mod_grad.paint && (style.mod_grad.legacyParts & 2u) ? 1 : 0;
                 for(int j = 0; j < 4; j++)
                 {
                     style.mod_grad.color[0][j] = !p.IsEmpty()
@@ -3706,19 +8462,48 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #ifdef _VSMOD // patch m008. distort
         else if(cmd == L"distort")
         {
-            if(params.size() >= 6)
+            const bool extended = params.size() == 8;
+            const bool legacy = params.size() == 6 || (params.size() == 7 && params.back().IsEmpty());
+            if (extended || legacy)
             {
-                DWORD c;
-                for(int j = 0; j < 3; j++)
+                const auto& from = style.mod_distort;
+                MOD_DISTORT to = from;
+                bool valid = true;
+                const auto apply = [&](CStringW value, double current, double& output) {
+                    value.Trim();
+                    if (value.IsEmpty()) return true;
+                    if (legacy && !tag.extendedArguments)
+                    {
+                        const double target = std::wcstod(value, nullptr);
+                        if (!std::isfinite(target) || std::abs(target) > 1024) return false;
+                        output = CalcAnimation(target, current, fAnimate);
+                        return true;
+                    }
+                    AssNumeric::Operand operand;
+                    if (!readOperand(value, false, false, operand)) return false;
+                    const double target = operand.Resolve(current);
+                    if (!std::isfinite(target) || std::abs(target) > 1024) return false;
+                    output = CalcAnimation(target, current, fAnimate);
+                    return true;
+                };
+                for (size_t j = 0; valid && j < 3; ++j)
+                    valid = apply(params[2*j], from.pointsx[j], to.pointsx[j]) &&
+                        apply(params[2*j+1], from.pointsy[j], to.pointsy[j]);
+                if (extended && valid)
+                    valid = apply(params[6], from.x0, to.x0) && apply(params[7], from.y0, to.y0);
+                else if (valid)
                 {
-                    style.mod_distort.pointsx[j] = !p.IsEmpty()
-                                                   ? (CalcAnimation(wcstod(params[j*2], NULL), style.mod_distort.pointsx[j], fAnimate))
-                                                   : org.mod_distort.pointsx[j];
-                    style.mod_distort.pointsy[j] = !p.IsEmpty()
-                                                   ? (CalcAnimation(wcstod(params[j*2+1], NULL), style.mod_distort.pointsy[j], fAnimate))
-                                                   : org.mod_distort.pointsy[j];
+                    to.x0 = CalcAnimation(0, from.x0, fAnimate);
+                    to.y0 = CalcAnimation(0, from.y0, fAnimate);
                 }
-                style.mod_distort.enabled = true;
+                if (valid)
+                {
+                    to.enabled = true;
+                    to.extended = extended;
+                    style.mod_distort = to;
+                    sub->m_hasDistortion = true;
+                    sub->m_hasExtendedWarp |= extended;
+                }
             }
         }
 #endif
@@ -3736,7 +8521,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     sub->m_effects[EF_FADE] = e;
                 }
             }
-            else if(params.size() == 2 && !sub->m_effects[EF_FADE]) // {\fad(t1=t[1], t2=t[2])
+            else if((params.size() == 2 || (cmd == L"fad" && params.size() == 4)) && !sub->m_effects[EF_FADE])
             {
                 if(Effect* e = DNew Effect)
                 {
@@ -3745,6 +8530,25 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                     for(ptrdiff_t i = 1; i < 3; i++)
                         e->t[i] = wcstol(params[i-1], NULL, 10);
                     e->t[0] = e->t[3] = -1; // will be substituted with "start" and "end"
+#ifdef _VSMOD
+                    if (params.size() == 4)
+                    {
+                        for (int side = 0; side < 2; ++side)
+                        {
+                            CStringW argument = params[side + 2];
+                            const int length = argument.GetLength();
+                            const bool combine = length >= 2 && !argument.Right(2).CompareNoCase(L"+a");
+                            if (combine) argument = argument.Left(length - 2).Trim();
+                            KfxPaint::Value color;
+                            if (ReadPaintValue(argument, false, color))
+                            {
+                                e->fadeColors[side] = color;
+                                e->hasFadeColor[side] = true;
+                                if (!combine) e->param[side * 2] = 0;
+                            }
+                        }
+                    }
+#endif
 
                     sub->m_effects[EF_FADE] = e;
                 }
@@ -3819,21 +8623,27 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         }
         else if(cmd == L"fsc")
         {
-#ifdef _VSMOD // patch f004. \fsc(%f) is working
-            double dst = wcstod(p, NULL);
-            double nx = CalcAnimation(dst, style.fontScaleX, fAnimate);
-            style.fontScaleX = !p.IsEmpty()
-                               ? (nx < 0 ? 0 : nx)
-                                   : org.fontScaleX;
-            double ny = CalcAnimation(dst, style.fontScaleY, fAnimate);
-            style.fontScaleY = !p.IsEmpty()
-                               ? (ny < 0 ? 0 : ny)
-                                   : org.fontScaleY;
+#ifdef _VSMOD
+            AssNumeric::Operand operand;
+            if (p.IsEmpty()) style.softScale = 100;
+            else if (readOperand(p, true, false, operand))
+                style.softScale = (std::max)(0., (std::min)(10000., CalcAnimation(
+                    operand.Resolve(style.softScale), style.softScale, fAnimate)));
 #else
             style.fontScaleX = org.fontScaleX;
             style.fontScaleY = org.fontScaleY;
 #endif
         }
+#ifdef _VSMOD
+        else if(cmd == L"scale")
+        {
+            AssNumeric::Operand operand;
+            if (p.IsEmpty()) style.objectScale = 100;
+            else if (readOperand(p, true, false, operand))
+                style.objectScale = (std::max)(0., (std::min)(10000., CalcAnimation(
+                    operand.Resolve(style.objectScale), style.objectScale, fAnimate)));
+        }
+#endif
         else if(cmd == L"fsp")
         {
             style.fontSpacing = !p.IsEmpty()
@@ -3924,6 +8734,15 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                       ? wcstol(p, NULL, 10) * 10
                       : 1000;
         }
+#ifdef _VSMOD
+        else if(cmd == L"kO")
+        {
+            sub->m_revealKaraoke = true;
+            m_ktype = 3;
+            m_kstart = m_kend;
+            m_kend += !p.IsEmpty() ? wcstol(p, NULL, 10) * 10 : 1000;
+        }
+#endif
         else if(cmd == L"ko")
         {
             m_ktype = 2;
@@ -3944,6 +8763,7 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #ifdef _LUA
         else if(cmd == L"lua")
         {
+            if (sub->m_measuringLayout) continue;
             if(params.size() > 0)
             {
                 if(LuaHasFunction(L, params[0]))
@@ -4108,6 +8928,46 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #endif
         else if(cmd == L"move") // {\move(x1=param[0], y1=param[1], x2=param[2], y2=param[3][, t1=t[0], t2=t[1]])}
         {
+#ifdef _VSMOD
+            if (sub->m_motion && (sub->m_motion->shifted || sub->m_motion->hasMove))
+                continue;
+            if ((params.size() == 4 || params.size() == 6) && !sub->m_effects[EF_MOVE] &&
+                tag.extendedArguments)
+            {
+                AssMotion::Move move{};
+                AssNumeric::Operand* args[] = {&move.x1, &move.y1, &move.x2, &move.y2};
+                bool valid = true;
+                for (int i = 0; i < 4; ++i)
+                {
+                    valid = readOperand(params[i], false, false, *args[i]);
+                    if (!valid) break;
+                    args[i]->value *= i % 2 ? sub->m_scaley * (args[i]->relative ? -8 : 8) : sub->m_scalex * 8;
+                }
+                if (!valid) continue;
+                move.end = m_delay;
+                if (params.size() == 6)
+                {
+                    AssNumeric::Operand start, end;
+                    if (!readOperand(params[4], false, true, start) || !readOperand(params[5], false, true, end) ||
+                        start.relative || end.relative || start.value < INT_MIN || end.value < INT_MIN ||
+                        start.value > INT_MAX || end.value > INT_MAX)
+                        continue;
+                    move.start = int(start.value);
+                    move.end = int(end.value);
+                    if (move.start > move.end) std::swap(move.start, move.end);
+                    if (move.end <= 0)
+                    {
+                        move.start = 0;
+                        move.end = m_delay;
+                    }
+                }
+                if (!sub->m_motion) sub->m_motion = std::make_unique<AssMotion::Track>();
+                sub->m_motion->hasMove = true;
+                sub->m_motion->move = move;
+                sub->m_fAnimated = true;
+                continue;
+            }
+#endif
             if((params.size() == 4 || params.size() == 6) && !sub->m_effects[EF_MOVE])
             {
                 if(Effect* e = DNew Effect)
@@ -4139,6 +8999,27 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         else if(cmd == L"org") // {\org(x=param[0], y=param[1])}
         {
 #ifdef _VSMOD // patch f003. moving \org for some karaoke effects. part 1
+            if (params.size() == 2 && tag.extendedArguments)
+            {
+                std::array<AssNumeric::Operand, 2> next;
+                if (!readOperand(params[0], false, false, next[0]) || !readOperand(params[1], false, false, next[1]))
+                    continue;
+                if ((sub->m_origin || sub->m_effects[EF_ORG]) && !next[0].relative && !next[1].relative)
+                    continue;
+                next[0].value *= sub->m_scalex * 8;
+                next[1].value *= sub->m_scaley * (next[1].relative ? -8 : 8);
+                if (!sub->m_origin)
+                    sub->m_origin = std::make_unique<std::array<AssNumeric::Operand, 2>>(next);
+                else
+                    for (int i = 0; i < 2; ++i)
+                    {
+                        auto& previous = (*sub->m_origin)[i];
+                        if (next[i].relative) previous.value += next[i].value;
+                        else previous = next[i];
+                    }
+                continue;
+            }
+            if (sub->m_origin) continue;
             if((params.size() == 2 || params.size() == 4 || params.size() == 6) && !sub->m_effects[EF_ORG])
             {
                 if(Effect* e = new Effect)
@@ -4179,6 +9060,42 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
         }
         else if(cmd == L"pos")
         {
+#ifdef _VSMOD
+            if (params.size() == 2 && (fAnimate || tag.extendedArguments))
+            {
+                AssNumeric::Operand x, y;
+                if (!readOperand(params[0], false, false, x) || !readOperand(params[1], false, false, y))
+                    continue;
+                x.value *= sub->m_scalex * 8;
+                y.value *= sub->m_scaley * (y.relative ? -8 : 8);
+                if (fAnimate || x.relative || y.relative)
+                {
+                    if (!sub->m_motion) sub->m_motion = std::make_unique<AssMotion::Track>();
+                    if (fAnimate)
+                    {
+                        const int end = m_animEnd || m_exactAnimationEnd ? m_animEnd : m_delay;
+                        if (sub->m_motion->intents.size() < AssMotion::Track::Limit &&
+                            std::isfinite(m_animAccel) && m_animAccel >= 0)
+                            sub->m_motion->intents.push_back({x, y, m_animStart,
+                                (std::max)(m_animStart, end), m_animAccel});
+                    }
+                    else sub->m_motion->Translate(x, y);
+                    continue;
+                }
+                if (!sub->m_effects[EF_MOVE] && (!sub->m_motion || (!sub->m_motion->shifted && !sub->m_motion->hasMove)))
+                {
+                    auto* e = new Effect;
+                    e->param[0] = 0;
+                    e->param[1] = e->param[3] = int(x.value);
+                    e->param[2] = e->param[4] = int(y.value);
+                    e->t[0] = e->t[1] = 0;
+                    sub->m_effects[EF_MOVE] = e;
+                }
+                continue;
+            }
+            if (sub->m_motion && (sub->m_motion->shifted || sub->m_motion->hasMove))
+                continue;
+#endif
             if(params.size() == 2 && !sub->m_effects[EF_MOVE])
             {
                 if(Effect* e = DNew Effect)
@@ -4221,6 +9138,9 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
             int n = wcstol(p, NULL, 10);
             sub->m_wrapStyle = !p.IsEmpty() && (0 <= n && n <= 3)
                                ? n
+#ifdef _VSMOD
+                               : !compiled && sub->m_inherited ? sub->m_inherited->wrap
+#endif
                                : m_defaultWrapStyle;
         }
 #ifdef _VSMOD // patch m003. random text points
@@ -4258,7 +9178,36 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
 #endif
         else if(cmd == L"r")
         {
+#ifdef _VSMOD
+            if (!fAnimate)
+            {
+                sub->m_boxMode = -1;
+                sub->m_curveAnchor = 0;
+                sub->m_curveX = sub->m_curveY = 0;
+                sub->m_rubyOptions = Furigana::Options{};
+                sub->m_warpedAnchor = 0;
+                sub->m_cycles.reset();
+                sub->m_scrollGroup = 0;
+                sub->m_scrollDuration = 300;
+                sub->m_scrollRows = 0;
+            }
+#endif
+#ifdef _VSMOD
+            if (slides()) editSlides() = {};
+#endif
             STSStyle* val;
+#ifdef _VSMOD
+            if (!fAnimate && sub->m_inherited)
+            {
+                auto& defaults = *sub->m_inherited;
+                const bool named = !p.IsEmpty() && m_styles.Lookup(CString(p), val) && val;
+                style = named ? *val : defaults.original;
+                ApplyMetadata(*sub, named ? CString(p) : defaults.style, style, false, named);
+                defaults.ruby = sub->m_rubyOptions;
+                org = style;
+                continue;
+            }
+#endif
             style = (!p.IsEmpty() && m_styles.Lookup(CString(p), val) && val) ? *val : org;
         }
         else if(cmd == L"shad")
@@ -4280,12 +9229,37 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                                ? (n == 0 ? false : n == 1 ? true : org.fStrikeOut)
                                    : org.fStrikeOut;
         }
+#ifdef _VSMOD
+        else if (cmd == L"tan" || cmd == L"ta")
+        {
+            if (fAnimate || p.GetLength() != 1) continue;
+            const wchar_t* number = p;
+            const int alignment = ReadDecimalDigit(number);
+            if (alignment < 1 || alignment > 9) continue;
+            const int horizontal = alignment % 3;
+            if (cmd == L"tan")
+            {
+                sub->m_textAnchor = horizontal;
+                sub->m_verticalAnchor = alignment;
+            }
+            else
+            {
+                const auto inserted = sub->m_lineAlignment.emplace(sub->m_logicalLine,
+                    CSubtitle::LineAlignment{horizontal, horizontal, alignment});
+                inserted.first->second.inherited = horizontal;
+            }
+        }
+#endif
         else if(cmd == L"t") // \t([<t1>,<t2>,][<accel>,]<style modifiers>)
         {
+#ifdef _VSMOD
+            if (sub->m_measuringLayout) continue;
+#endif
             p.Empty();
 
             m_animStart = m_animEnd = 0;
             m_animAccel = 1;
+            m_exactAnimationEnd = false;
 
             if(params.size() == 1)
             {
@@ -4310,7 +9284,34 @@ bool CRenderedTextSubtitle::ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& 
                 p = params[3];
             }
 
+#ifdef _VSMOD
+            bool valid = true;
+            if (tag.extendedArguments && params.size() >= 2 && params.size() <= 4)
+                for (size_t i = 0; i + 1 < params.size(); ++i)
+                {
+                    if (!ExtendedNumber(params[i])) continue;
+                    const bool time = params.size() >= 3 && i < 2;
+                    AssNumeric::Operand operand;
+                    if (!readOperand(params[i], false, time, operand) || operand.relative ||
+                        (time && (operand.value < INT_MIN || operand.value > INT_MAX)) ||
+                        (!time && operand.value < 0))
+                    {
+                        valid = false;
+                        break;
+                    }
+                    if (!time) m_animAccel = operand.value;
+                    else if (i == 0) m_animStart = int(operand.value);
+                    else
+                    {
+                        m_animEnd = int(operand.value);
+                        m_exactAnimationEnd = true;
+                    }
+                }
+            if (!valid) continue;
+            ParseSSATag(sub, p, style, org, true, slides());
+#else
             ParseSSATag(sub, p, style, org, true);
+#endif
 
             sub->m_fAnimated = true;
         }
@@ -4531,14 +9532,14 @@ double CRenderedTextSubtitle::CalcAnimation(double dst, double src, bool fAnimat
 {
     PROFILE_RENDER_STAGE(Animation);
     int s = m_animStart ? m_animStart : 0;
-    int e = m_animEnd ? m_animEnd : m_delay;
+    int e = m_animEnd || m_exactAnimationEnd ? m_animEnd : m_delay;
 
     if(fAnimate && fabs(dst - src) >= 0.0001)
     {
         if(m_time < s) dst = src;
         else if(s <= m_time && m_time < e)
         {
-            const double fraction = 1.0 * (m_time - s) / (e - s);
+            const double fraction = (double(m_time) - s) / (double(e) - s);
             const double t = m_animAccel == 1.0 ? fraction : pow(fraction, m_animAccel);
             dst = (1 - t) * src + t * dst;
         }
@@ -4548,11 +9549,11 @@ double CRenderedTextSubtitle::CalcAnimation(double dst, double src, bool fAnimat
     return(dst);
 }
 
-CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry)
+CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry, bool measuringLayout)
 {
     PROFILE_RENDER_STAGE(Subtitle);
     CSubtitle* previous = nullptr;
-    if (m_subtitleCache.Lookup(entry, previous) && !previous->m_fAnimated)
+    if (!measuringLayout && m_subtitleCache.Lookup(entry, previous) && !previous->m_fAnimated)
         return previous;
 
     std::unique_ptr<CSubtitle> owned(DNew CSubtitle());
@@ -4565,6 +9566,66 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry)
 #endif
 
     CStringW str = GetStrW(entry, true);
+#ifdef _VSMOD
+    sub->m_measuringLayout = measuringLayout;
+    if (!measuringLayout && str.Find(L'$') >= 0 && NeedsLayoutVariables(str)
+#ifdef _LUA
+        && !hasExternalLua
+#endif
+        )
+    {
+        if (!m_overrideTags)
+            m_overrideTags = std::make_unique<OverrideTagCache>();
+        auto& cache = m_overrideTags->layout;
+        const auto existing = cache.find(entry);
+        if (!m_doOverrideStyle && existing != cache.end())
+            sub->m_layoutVariables = std::make_unique<AssNumeric::Context>(existing->second);
+        else
+        {
+            std::unique_ptr<CSubtitle> baseline(GetSubtitle(entry, true));
+            if (baseline && !baseline->IsEmpty() && baseline->m_scalex > 0 && baseline->m_scaley > 0)
+            {
+                CRect rect = baseline->m_rect;
+                if (auto* motion = baseline->m_effects[EF_MOVE])
+                    if (!motion->param[0])
+                    {
+                        const auto alignment = baseline->m_scrAlignment;
+                        const auto x = alignment % 3 == 1 ? rect.left :
+                            alignment % 3 == 2 ? rect.CenterPoint().x : rect.right;
+                        const auto y = alignment <= 3 ? rect.bottom :
+                            alignment <= 6 ? rect.CenterPoint().y : rect.top;
+                        rect.OffsetRect(motion->param[1] - x, motion->param[2] - y);
+                    }
+                AssNumeric::Context bounds{};
+                const int baseX = baseline->m_scrAlignment % 3 == 1 ? rect.left :
+                    baseline->m_scrAlignment % 3 == 2 ? rect.CenterPoint().x : rect.right;
+                int left = INT_MAX, right = INT_MIN;
+                POSITION lines = baseline->GetHeadPosition();
+                while (lines)
+                {
+                    const auto* line = baseline->GetNext(lines);
+                    const int x = baseline->LineLeft(*line, baseX);
+                    left = (std::min)(left, x);
+                    right = (std::max)(right, x + line->m_width);
+                }
+                bounds[AssNumeric::Left] = left / (baseline->m_scalex * 8);
+                bounds[AssNumeric::Top] = rect.top / (baseline->m_scaley * 8);
+                bounds[AssNumeric::Right] = right / (baseline->m_scalex * 8);
+                bounds[AssNumeric::Bottom] = rect.bottom / (baseline->m_scaley * 8);
+                bounds[AssNumeric::Width] = bounds[AssNumeric::Right] - bounds[AssNumeric::Left];
+                bounds[AssNumeric::Height] = bounds[AssNumeric::Bottom] - bounds[AssNumeric::Top];
+                bounds[AssNumeric::Center] = (bounds[AssNumeric::Left] + bounds[AssNumeric::Right]) / 2;
+                bounds[AssNumeric::Middle] = (bounds[AssNumeric::Top] + bounds[AssNumeric::Bottom]) / 2;
+                sub->m_layoutVariables = std::make_unique<AssNumeric::Context>(bounds);
+                if (!m_doOverrideStyle)
+                {
+                    if (cache.size() >= 256) cache.clear();
+                    cache.emplace(entry, bounds);
+                }
+            }
+        }
+    }
+#endif
 
     STSStyle stss, orgstss;
     if(m_doOverrideStyle && m_pStyleOverride != NULL)
@@ -4633,6 +9694,7 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry)
 #endif
     m_animStart = m_animEnd = 0;
     m_animAccel = 1;
+    m_exactAnimationEnd = false;
     m_ktype = m_kstart = m_kend = 0;
     m_nPolygon = 0;
     m_polygonBaselineOffset = 0;
@@ -4650,19 +9712,144 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry)
     }
 #endif
     ParseEffect(sub, GetAt(entry).effect);
+#ifdef _VSMOD
+    if (str.Find(L"chatmode") >= 0 || str.Find(L'[') >= 0)
+        for (int left = 0; !sub->m_chat && (left = str.Find(L'{', left)) >= 0;)
+        {
+            const int right = str.Find(L'}', left + 1);
+            if (right < 0) break;
+            if (!m_overrideTags) m_overrideTags = std::make_unique<OverrideTagCache>();
+            const auto tags = m_overrideTags->Get(str.Mid(left + 1, right - left - 1));
+            for (const auto& tag : *tags)
+                if (tag.command == L"chatmode" && !tag.parameters.empty())
+                {
+                    int value;
+                    if (!NativeScroll::Integer(tag.parameters[0], value) || value < 1 || value > 3) continue;
+                    sub->m_chat = std::make_unique<NativeChat::Scene>();
+                    sub->m_chat->mode = value;
+                    sub->m_chat->width = (std::max)(80 * 8, int(m_size.cx * .48));
+                    sub->m_chat->pad = (std::max)(16, int(12 * sub->m_scalex * 8));
+                    sub->m_chat->textWidth = (std::max)(64, int(sub->m_chat->width * .75) - sub->m_chat->pad * 4);
+                    break;
+                }
+            left = right + 1;
+        }
+    if (sub->m_chat && sub->m_chat->mode == 2)
+        str = NativeChat::LazyMessages(str, *sub->m_chat);
+    else if (sub->m_chat && sub->m_chat->mode == 3)
+    {
+        CStringW payload;
+        bool boundary = true;
+        int side = -1;
+        for (int i = 0; i < str.GetLength();)
+        {
+            if (str[i] == L'{')
+            {
+                const int close = str.Find(L'}', i + 1);
+                if (close >= 0)
+                {
+                    const auto body = str.Mid(i + 1, close - i - 1);
+                    bool next = boundary && body == L"|";
+                    if (boundary && !next)
+                    {
+                        const auto tags = m_overrideTags->Get(body);
+                        for (const auto& tag : *tags)
+                        {
+                            int value;
+                            if (tag.command != L"ta" || tag.parameters.empty() ||
+                                !NativeScroll::Integer(tag.parameters[0], value) || value < 1 || value > 9 || value % 3 == 2)
+                                continue;
+                            side = value % 3 ? -1 : 1;
+                            next = true;
+                            break;
+                        }
+                    }
+                    if (next && sub->m_chat->boundaries.size() < 128)
+                    {
+                        if (payload.Right(2) == L"\\N") payload.Truncate(payload.GetLength() - 2);
+                        sub->m_chat->boundaries.push_back({{}, side});
+                        payload += L"{\\msgmarker}";
+                    }
+                    if (body != L"|" || !next) payload += str.Mid(i, close - i + 1);
+                    i = close + 1;
+                    continue;
+                }
+            }
+            if (str[i] == L'\\' && str[i + 1] == L'N')
+            {
+                payload += L"\\N";
+                boundary = true;
+                i += 2;
+            }
+            else
+            {
+                if (!iswspace(str[i])) boundary = false;
+                payload.AppendChar(str[i++]);
+            }
+        }
+        str = std::move(payload);
+    }
+    if (!m_metadataCarriers.empty() && !m_doOverrideStyle)
+    {
+        const auto& source = GetAt(entry);
+        sub->m_inherited = std::make_unique<CSubtitle::InheritedMetadata>();
+        auto& defaults = *sub->m_inherited;
+        defaults.style = source.style;
+        defaults.actor = source.actor;
+        defaults.original = stss;
+        ApplyMetadata(*sub, defaults.style, stss, true, false);
+        defaults.ruby = sub->m_rubyOptions;
+        defaults.wrap = sub->m_wrapStyle;
+        orgstss = stss;
+    }
+    const bool escapedAngles = str.Find(L'<') >= 0 &&
+        (str.Find(L"\\<") >= 0 || str.Find(L"\\>") >= 0 || str.Find(L"\\|\\") >= 0);
+    if ((str.Find(L"\\ct(") >= 0 || str.Find(L'[') >= 0 ||
+         (str.Find(L"\\N") >= 0 && str.Find(L"\\c") >= 0)) &&
+        !sub->m_chat && !sub->m_effects[EF_SCROLL] && !sub->m_effects[EF_BANNER]
+#ifdef _LUA
+        && !hasExternalLua
+#endif
+        )
+    {
+        if (!m_overrideTags) m_overrideTags = std::make_unique<OverrideTagCache>();
+        for (int left = 0; !sub->m_curve && (left = str.Find(L'{', left)) >= 0;)
+        {
+            const int right = str.Find(L'}', left + 1);
+            if (right < 0) break;
+            const auto tags = m_overrideTags->Get(str.Mid(left + 1, right - left - 1));
+            for (const auto& tag : *tags)
+                if (tag.command == L"ct" && tag.parenthesized && tag.parameters.size() == 1)
+                {
+                    sub->m_curve = m_overrideTags->Curve(tag.parameters[0]);
+                    if (sub->m_curve) break;
+                }
+            left = right + 1;
+        }
+    }
+#endif
 
     while(!str.IsEmpty())
     {
         bool fParsed = false;
 
         int i;
+#ifdef _VSMOD
+        Furigana::Fields ruby;
+        if (str[0] == L'<' && !m_nPolygon && !sub->m_columns && sub->m_rubyOptions.enabled && str.Find(L'|') >= 0)
+            ruby = Furigana::Read(str);
+#endif
 
         if(str[0] == '{' && (i = str.Find(L'}')) > 0)
         {
             if(fParsed = ParseSSATag(sub, str.Mid(1, i - 1), stss, orgstss))
                 str = str.Mid(i + 1);
         }
-        else if(str[0] == '<' && (i = str.Find(L'>')) > 0)
+        else if(
+#ifdef _VSMOD
+            !ruby.length &&
+#endif
+            str[0] == '<' && (i = str.Find(L'>')) > 0)
         {
             if(fParsed = ParseHtmlTag(sub, str.Mid(1, i - 1), stss, orgstss))
                 str = str.Mid(i + 1);
@@ -4670,20 +9857,83 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry)
 
         if(fParsed)
         {
-            i = str.FindOneOf(L"{<");
+#ifdef _VSMOD
+            if (escapedAngles && sub->m_rubyOptions.enabled) i = Furigana::NextOverride(str, 0);
+            else
+#endif
+                i = str.FindOneOf(L"{<");
             if(i < 0) i = str.GetLength();
             if(i == 0) continue;
         }
         else
         {
-            i = str.Mid(1).FindOneOf(L"{<");
-            if(i < 0) i = str.GetLength() - 1;
-            i++;
+#ifdef _VSMOD
+            if (escapedAngles && sub->m_rubyOptions.enabled) i = Furigana::NextOverride(str, 1);
+            else
+#endif
+            {
+                i = str.Mid(1).FindOneOf(L"{<");
+                if(i < 0) i = str.GetLength() - 1;
+                i++;
+            }
         }
+
+#ifdef _VSMOD
+        bool columnRow = false;
+        if (sub->m_columns && !m_nPolygon)
+            for (int j = 0; j < i; ++j)
+            {
+                if (str[j] == L'|')
+                {
+                    if (j == 0)
+                    {
+                        sub->m_columns->NextCell(stss, false);
+                        str = str.Mid(1);
+                    }
+                    i = j;
+                    break;
+                }
+                if (str[j] == L'\\' && str[j + 1] == L'|')
+                    ++j;
+                else if (str[j] == L'\\' && str[j + 1] == L'N')
+                {
+                    columnRow = j == 0;
+                    i = columnRow ? 2 : j;
+                    break;
+                }
+            }
+        if (i == 0) continue;
+#endif
 
         STSStyle tmp;
 
+#ifdef _VSMOD
+        if (sub->m_chat)
+        {
+            auto& chat = *sub->m_chat;
+            if (!chat.current) BeginChatMessage(chat, {}, stss);
+            auto& message = chat.messages[chat.current - 1];
+            std::copy_n(stss.colors, 4, message.colors);
+            std::copy_n(stss.alpha, 4, message.alpha);
+            message.skin = chat.skin;
+            message.showName = chat.showNames;
+            message.receipt = chat.mode == 3 || message.name == chat.main ? chat.receipt : 0;
+            message.readDelay = chat.readDelay;
+        }
+#endif
         tmp = stss;
+#ifdef _VSMOD
+        if (sub->m_chat)
+        {
+            const auto& skin = sub->m_chat->skin;
+            if (skin.outlineColor >= 0) tmp.colors[2] = revcolor(skin.outlineColor);
+            else tmp.colors[2] = 0;
+            if (skin.outlineAlpha >= 0) tmp.alpha[2] = BYTE(skin.outlineAlpha);
+            else tmp.alpha[2] = 0;
+            if (skin.outline >= 0) tmp.outlineWidthX = tmp.outlineWidthY = skin.outline;
+            tmp.borderStyle = 0;
+        }
+#endif
 
         tmp.fontSize = sub->m_scaley * tmp.fontSize * 64;
         tmp.fontSpacing = sub->m_scalex * tmp.fontSpacing * 64;
@@ -4691,15 +9941,58 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry)
         tmp.outlineWidthY *= (m_fScaledBAS ? sub->m_scaley : 1) * 8;
         tmp.shadowDepthX *= (m_fScaledBAS ? sub->m_scalex : 1) * 8;
         tmp.shadowDepthY *= (m_fScaledBAS ? sub->m_scaley : 1) * 8;
+#ifdef _VSMOD
+        if (tmp.softScale != 100 || tmp.objectScale != 100)
+        {
+            const double object = tmp.objectScale / 100;
+            const double glyph = object * tmp.softScale / 100;
+            tmp.fontScaleX *= glyph;
+            tmp.fontScaleY *= glyph;
+            tmp.outlineWidthX *= object;
+            tmp.outlineWidthY *= object;
+            tmp.shadowDepthX *= object;
+            tmp.shadowDepthY *= object;
+            tmp.fGaussianBlurX *= object;
+            tmp.fGaussianBlurY *= object;
+            tmp.mod_verticalSpace *= object;
+            tmp.mod_horizontalSpace *= object;
+            tmp.mod_rand.X *= object;
+            tmp.mod_rand.Y *= object;
+            tmp.mod_rand.Z *= object;
+            if (tmp.mod_jitter.enabled)
+            {
+                auto& offset = tmp.mod_jitter.offset;
+                offset.SetRect(int(offset.left * object), int(offset.top * object),
+                    int(offset.right * object), int(offset.bottom * object));
+            }
+        }
+#endif
 
+#ifdef _VSMOD
+        if (ruby.length && ParseFurigana(sub, ruby, tmp))
+        {
+            sub->m_curve.reset();
+            str = str.Mid(ruby.length);
+            continue;
+        }
+#endif
         if(m_nPolygon)
         {
             ParsePolygon(sub, str.Left(i), tmp);
         }
         else
         {
-            ParseString(sub, str.Left(i), tmp);
+            auto text = str.Left(i);
+#ifdef _VSMOD
+            if (sub->m_columns) text.Replace(L"\\|", L"|");
+            else if (escapedAngles && sub->m_rubyOptions.enabled && text.Find(L'\\') >= 0)
+                Furigana::Unescape(text);
+#endif
+            ParseString(sub, text, tmp);
         }
+#ifdef _VSMOD
+        if (columnRow) sub->m_columns->NextCell(stss, true);
+#endif
 
         str = str.Mid(i);
     }
@@ -4729,9 +10022,49 @@ CSubtitle* CRenderedTextSubtitle::GetSubtitle(int entry)
         marginRect.bottom += m_size.cy - m_vidrect.bottom;
     }
 
-    sub->CreateClippers(m_size);
+    if (!measuringLayout)
+        sub->CreateClippers(m_size);
 
+#ifdef _VSMOD
+    const int borderStyle = sub->m_borderStyleOverride < 0 ? stss.borderStyle : sub->m_borderStyleOverride;
+    const bool hasBox = sub->m_boxMode < 0 ? borderStyle == 2 : sub->m_boxMode != 0;
+    if (hasBox || sub->m_borderStyleOverride >= 0 || sub->m_boxMode == 0)
+    {
+        POSITION words = sub->m_words.GetHeadPosition();
+        while (words)
+        {
+            auto& style = sub->m_words.GetNext(words)->m_style;
+            if (hasBox)
+                style.borderStyle = 2;
+            else if (sub->m_borderStyleOverride >= 0)
+                style.borderStyle = sub->m_borderStyleOverride == 2 ? 0 : sub->m_borderStyleOverride;
+            else if (style.borderStyle == 2)
+                style.borderStyle = 0;
+        }
+    }
+#endif
     sub->MakeLines(m_size, marginRect);
+#ifdef _VSMOD
+    if (!sub->m_columnBlocks.empty()) sub->ArrangeColumns();
+    if (!sub->m_rubyGroups.empty() && !sub->m_verticalLaidOut)
+        sub->PlaceHorizontalRuby();
+    sub->MeasureScrollRows();
+    sub->CurveLines();
+#endif
+    if (measuringLayout)
+        return owned.release();
+#ifdef _VSMOD
+    if (sub->m_chat)
+        sub->ArrangeChat(stss, m_size.cy);
+    else if (hasBox)
+    {
+        if (sub->m_revealKaraoke)
+            sub->m_fAnimated = true;
+        sub->CreateEventBox(borderStyle, m_time, m_fScaledBAS);
+    }
+    sub->ConfigureDistortion();
+    if (sub->m_scrollContexts.empty() && !sub->m_chat) sub->ConfigurePerspective();
+#endif
 
     m_subtitleCache[entry] = sub;
     delete previous;
@@ -4814,14 +10147,17 @@ struct PreparedWord
 static std::function<void()> PrepareEventGeometry(CSubtitle* subtitle, CPoint origin,
     CPoint transformOrigin, CRect rectangle, int time, REFERENCE_TIME timestamp)
 {
+#ifdef _VSMOD
+    auto scroll = subtitle->ScrollFrame(time, rectangle.top);
+    const ScrollFrameScope scrollScope(scroll);
+#endif
     std::vector<PreparedWord> words;
     int y = rectangle.top;
     POSITION linePosition = subtitle->GetHeadPosition();
     while (linePosition)
     {
         CLine* line = subtitle->GetNext(linePosition);
-        int x = subtitle->m_scrAlignment % 3 == 1 ? origin.x :
-            subtitle->m_scrAlignment % 3 == 0 ? origin.x - line->m_width : origin.x - line->m_width / 2;
+        int x = subtitle->LineLeft(*line, origin.x);
         POSITION wordPosition = line->GetHeadPosition();
         while (wordPosition)
         {
@@ -4832,8 +10168,10 @@ static std::function<void()> PrepareEventGeometry(CSubtitle* subtitle, CPoint or
             CPoint position(x, y + line->m_ascent - word->m_ascent);
             int layer = 1;
 #ifdef _VSMOD
+            position = word->LayoutPosition(position);
             position.x -= style.mod_horizontalSpace;
             position.y -= style.mod_verticalSpace;
+            position.y += ScrollOffset(*word);
             position += word->m_style.mod_jitter.getOffset(timestamp);
 #endif
             // Match the first Paint invocation, because its origin determines
@@ -4847,7 +10185,11 @@ static std::function<void()> PrepareEventGeometry(CSubtitle* subtitle, CPoint or
             else if (style.outlineWidthX + style.outlineWidthY > 0 &&
                 !(word->m_ktype == 2 && time < word->m_kstart))
                 layer = 3;
-            if (word->NeedsPreparation(position))
+            if (word->NeedsPreparation(position)
+#ifdef _VSMOD
+                || subtitle->m_perspective
+#endif
+                )
                 words.push_back({word, position, layer});
             x += word->m_width;
         }
@@ -4855,13 +10197,27 @@ static std::function<void()> PrepareEventGeometry(CSubtitle* subtitle, CPoint or
     }
     if (words.empty())
         return {};
-    return [words = std::move(words), transformOrigin] {
+    return [words = std::move(words), transformOrigin
+#ifdef _VSMOD
+        , subtitle, origin, rectangle, timestamp, scroll = std::move(scroll)
+#endif
+        ] {
+#ifdef _VSMOD
+        const ScrollFrameScope scrollScope(scroll);
+        if (subtitle->m_perspective)
+            subtitle->PreparePerspective(origin, transformOrigin, rectangle, timestamp);
+#endif
         for (const auto& prepared : words)
         {
-#if defined(_VSMOD) && defined(_LUA)
-            prepared.word->Paint(prepared.position, transformOrigin, prepared.layer);
+#ifdef _VSMOD
+            const CPoint preparedOrigin(transformOrigin.x, transformOrigin.y + ScrollOffset(*prepared.word));
 #else
-            prepared.word->Paint(prepared.position, transformOrigin);
+            const CPoint preparedOrigin = transformOrigin;
+#endif
+#if defined(_VSMOD) && defined(_LUA)
+            prepared.word->Paint(prepared.position, preparedOrigin, prepared.layer);
+#else
+            prepared.word->Paint(prepared.position, preparedOrigin);
 #endif
         }
     };
@@ -4872,6 +10228,22 @@ struct FramePaint
     std::function<CRect()> paint;
     int entry;
 };
+
+#if defined(_VSMOD) && defined(_LUA)
+static bool HasLuaPixelHandler(CSubtitle& subtitle)
+{
+    POSITION line = subtitle.GetHeadPosition();
+    while (line)
+    {
+        auto* words = subtitle.GetNext(line);
+        POSITION word = words->GetHeadPosition();
+        while (word)
+            if (!words->GetNext(word)->LuaRendererHandler.IsEmpty())
+                return true;
+    }
+    return false;
+}
+#endif
 
 static CRect PaintFrameBands(EventWorkerPool& pool, const std::vector<FramePaint>& events, int height)
 {
@@ -4892,6 +10264,9 @@ static CRect PaintFrameBands(EventWorkerPool& pool, const std::vector<FramePaint
         int top = 0, bottom = 0;
         uint64_t pixels = 0;
         std::vector<const OverlayDraw*> draws;
+#ifdef _VSMOD
+        bool positionedAlpha = false;
+#endif
     };
     // Bound the number of jobs for large surfaces. Smaller bands distribute
     // overlapping effects independently of how many distinct events draw them.
@@ -4917,6 +10292,9 @@ static CRect PaintFrameBands(EventWorkerPool& pool, const std::vector<FramePaint
                         (std::max)(int(draw.bounds.top), band.top);
                     band.pixels += uint64_t(rows) * draw.bounds.Width();
                     band.draws.push_back(&draw);
+#ifdef _VSMOD
+                    if (draw.gradient.positionedOpacity) band.positionedAlpha = true;
+#endif
                 }
             }
         }
@@ -4926,8 +10304,7 @@ static CRect PaintFrameBands(EventWorkerPool& pool, const std::vector<FramePaint
     if (totalPixels < 2 * pixelsPerWorker)
     {
         for (const auto& event : overlays)
-            for (const auto& draw : event.draws)
-                draw.Blend(draw.bounds.top, draw.bounds.bottom);
+            event.Blend();
         return bounds;
     }
 
@@ -4942,6 +10319,13 @@ static CRect PaintFrameBands(EventWorkerPool& pool, const std::vector<FramePaint
             if (band.draws.empty())
                 break;
             work.emplace_back([job = &band] {
+#ifdef _VSMOD
+                if (job->positionedAlpha)
+                {
+                    BlendCapturedBands(job->draws, job->top, job->bottom);
+                    return;
+                }
+#endif
                 for (const auto* draw : job->draws)
                     draw->Blend(job->top, job->bottom);
             });
@@ -5106,12 +10490,18 @@ try
         bool fPosOverride = false, fOrgOverride = false;
 
         int alpha = 0x00;
+#ifdef _VSMOD
+        KfxPaint::Fade paintFade;
+#endif
 
         CPoint org2;
 
         BYTE* pAlphaMask = s->m_pClipper ? s->m_pClipper->m_pAlphaMask : NULL;
 
 #ifdef _VSMOD // patch m006. moveable vector clip
+        const CPoint clipOffset(int(s->m_clipOffsetX * s->m_scalex), int(s->m_clipOffsetY * s->m_scaley));
+        if (s->m_hasRectClip)
+            clipRect.OffsetRect(clipOffset);
         MOD_MOVEVC mod_vc;
         mod_vc.spd = CSize(spd.w, spd.h);
         //mod_vc.alphamask = pAlphaMask;
@@ -5319,6 +10709,7 @@ try
             break;
             case EF_FADE: // {\fade(a1=param[0], a2=param[1], a3=param[2], t1=t[0], t2=t[1], t3=t[2], t4=t[3]) or {\fad(t1=t[1], t2=t[2])
             {
+                const auto* effect = s->m_effects[k];
                 int t1 = s->m_effects[k]->t[0];
                 int t2 = s->m_effects[k]->t[1];
                 int t3 = s->m_effects[k]->t[2];
@@ -5344,6 +10735,21 @@ try
                     alpha = (int)(s->m_effects[k]->param[1] * (1 - t) + s->m_effects[k]->param[2] * t);
                 }
                 else if(m_time >= t4) alpha = s->m_effects[k]->param[2];
+#ifdef _VSMOD
+                if (effect->hasFadeColor[0] || effect->hasFadeColor[1])
+                {
+                    const bool start = m_time < t2;
+                    const int side = start ? 0 : 1;
+                    if (effect->hasFadeColor[side])
+                    {
+                        paintFade.color = effect->fadeColors[side];
+                        if (start)
+                            paintFade.amount = m_time < t1 ? 1.0 : 1.0 - double(m_time - t1) / (t2 - t1);
+                        else if (m_time >= t3)
+                            paintFade.amount = m_time >= t4 ? 1.0 : double(m_time - t3) / (t4 - t3);
+                    }
+                }
+#endif
             }
             break;
             case EF_BANNER: // Banner;delay=param[0][;leftoright=param[1];fadeawaywidth=param[2]]
@@ -5425,7 +10831,30 @@ try
             }
         }
 
-        if(!fPosOverride && !fOrgOverride && !s->m_fAnimated)
+#ifdef _VSMOD
+        if (s->m_pClipper && clipOffset != CPoint(0, 0))
+        {
+            mod_vc.enable = true;
+            mod_vc.pos += clipOffset;
+            mod_vc.isInverse = s->m_pClipper->m_inverse;
+        }
+        if (s->m_motion)
+        {
+            const CPoint origin = s->m_relativeTo == 1 ? m_vidrect.TopLeft() : CPoint(0, 0);
+            const CPoint current(
+                s->m_scrAlignment % 3 == 1 ? r.left : s->m_scrAlignment % 3 == 2 ? r.CenterPoint().x : r.right,
+                s->m_scrAlignment <= 3 ? r.bottom : s->m_scrAlignment <= 6 ? r.CenterPoint().y : r.top);
+            const auto moved = s->m_motion->At({double(current.x - origin.x), double(current.y - origin.y)}, m_time);
+            const auto bounded = [](double value) { return int((std::max)(-10000000., (std::min)(value, 10000000.))); };
+            r.OffsetRect(bounded(moved.x) + origin.x - current.x, bounded(moved.y) + origin.y - current.y);
+            fPosOverride = true;
+        }
+#endif
+        if(!fPosOverride && !fOrgOverride && !s->m_fAnimated
+#ifdef _VSMOD
+            && !s->m_origin && s->m_scrollContexts.empty() && !s->m_chat
+#endif
+            )
             r = m_sla.AllocRect(s, segment, entry, stse.layer, m_collisions);
 
         CPoint org;
@@ -5433,6 +10862,14 @@ try
         org.y = s->m_scrAlignment <= 3 ? r.bottom : s->m_scrAlignment <= 6 ? r.CenterPoint().y : r.top;
 
         if(!fOrgOverride) org2 = org;
+#ifdef _VSMOD
+        if (s->m_origin)
+        {
+            const CPoint frameOrigin = s->m_relativeTo == 1 ? m_vidrect.TopLeft() : CPoint(0, 0);
+            org2.x = LONG((*s->m_origin)[0].Resolve(org2.x - frameOrigin.x)) + frameOrigin.x;
+            org2.y = LONG((*s->m_origin)[1].Resolve(org2.y - frameOrigin.y)) + frameOrigin.y;
+        }
+#endif
 
         const int eventTime = m_time;
         if (parallel && !captureOverlays)
@@ -5443,6 +10880,12 @@ try
         }
         auto paint = [=, &spd]() mutable {
         PROFILE_RENDER_STAGE(EventPaint);
+#ifdef _VSMOD
+        const auto scroll = s->ScrollFrame(eventTime, r.top);
+        const ScrollFrameScope scrollScope(scroll);
+        if (s->m_perspective)
+            s->PreparePerspective(org, org2, r, rt);
+#endif
         CRect bbox2(0, 0, 0, 0);
         CPoint p, p2(0, r.top);
 
@@ -5457,14 +10900,52 @@ try
         iclipRect[2] = CRect(clipRect.right, clipRect.top, spd.w, clipRect.bottom);
         iclipRect[3] = CRect(0, clipRect.bottom, spd.w, spd.h);
 
+#ifdef _VSMOD
+        if (!s->m_eventBox.empty())
+        {
+            for (auto i = s->m_eventBox.rbegin(); i != s->m_eventBox.rend(); ++i)
+            {
+                auto& box = **i;
+                const auto* scrollState = WordScroll(box);
+                if (scrollState && scrollState->hidden) continue;
+                if (box.m_chatReceipt == 2 && s->m_chat && box.m_scrollGroup)
+                {
+                    const auto& message = s->m_chat->messages[box.m_scrollGroup - 1];
+                    if (int64_t(eventTime) < int64_t(message.start) + message.readDelay) continue;
+                }
+                const int dy = ScrollOffset(box);
+                const CPoint origin = CPoint(org.x, p2.y + dy) + s->m_warpedShift;
+                const CPoint boxTransform(org2.x, org2.y + dy);
+                auto& style = box.m_style;
+#ifdef _LUA
+                box.Paint(origin, boxTransform, 4);
+#else
+                box.Paint(origin, boxTransform);
+#endif
+                const DWORD opacity = MulDiv(255 - style.alpha[3], 255 - alpha, 255);
+                const DWORD colors[4] = {DWORD(revcolor(style.colors[3])) | (opacity << 24), DWORD(-1), 0, 0};
+                style.mod_grad.fadalpha = alpha;
+                style.mod_grad.paintOffsetY = dy;
+                style.mod_grad.paintGroup = box.m_scrollGroup;
+                style.mod_grad.subpixx = origin.x & 7;
+                style.mod_grad.subpixy = origin.y & 7;
+                const auto drawBox = [&](CRect& clip) {
+                    auto visible = box.RubyClip(clip, origin.x, origin.y);
+                    bbox2 |= box.Draw(spd, visible, pAlphaMask, origin.x, origin.y, colors, true, false, 3,
+                        style.mod_grad, mod_vc, style.mod_blendMode, false, false);
+                };
+                if (s->m_clipInverse)
+                    for (auto& clip : iclipRect) drawBox(clip);
+                else drawBox(clipRect);
+            }
+        }
+#endif
         pos = s->GetHeadPosition();
         while(pos)
         {
             CLine* l = s->GetNext(pos);
 
-            p.x = (s->m_scrAlignment % 3) == 1 ? org.x
-                  : (s->m_scrAlignment % 3) == 0 ? org.x - l->m_width
-                  :							   org.x - (l->m_width / 2);
+            p.x = s->LineLeft(*l, org.x);
 
 #ifdef _VSMOD // patch m006. moveable vector clip
             if(s->m_clipInverse)
@@ -5501,9 +10982,7 @@ try
         {
             CLine* l = s->GetNext(pos);
 
-            p.x = (s->m_scrAlignment % 3) == 1 ? org.x
-                  : (s->m_scrAlignment % 3) == 0 ? org.x - l->m_width
-                  :							   org.x - (l->m_width / 2);
+            p.x = s->LineLeft(*l, org.x);
 
 #ifdef _VSMOD // patch m006. moveable vector clip
             if(s->m_clipInverse)
@@ -5540,9 +11019,7 @@ try
         {
             CLine* l = s->GetNext(pos);
 
-            p.x = (s->m_scrAlignment % 3) == 1 ? org.x
-                  : (s->m_scrAlignment % 3) == 0 ? org.x - l->m_width
-                  :							   org.x - (l->m_width / 2);
+            p.x = s->LineLeft(*l, org.x);
 
 #ifdef _VSMOD // patch m006. moveable vector clip
             if(s->m_clipInverse)
@@ -5573,6 +11050,38 @@ try
         }
         return bbox2;
         };
+#ifdef _VSMOD
+        if (s->m_paintSegments || paintFade.amount > 0)
+        {
+            bool collectSegments = s->m_paintSegments != 0;
+#ifdef _LUA
+            // A Lua pixel callback can read the destination during the draw.
+            if (collectSegments && (hasExternalLua || m_doOverrideStyle))
+                collectSegments = !HasLuaPixelHandler(*s);
+#endif
+            auto paintExtended = [=]() mutable {
+                const OverlayPaintScope context(paintFade, s->m_scalex, s->m_scaley);
+                if (!collectSegments || IsCapturingOverlays())
+                    return paint();
+                OverlayDrawList overlays;
+                CRect bounds;
+                {
+                    const OverlayCaptureScope capture(overlays);
+                    bounds = paint();
+                }
+                overlays.Blend();
+                return bounds;
+            };
+            if (parallel)
+                compositions.push_back({std::move(paintExtended), entry});
+            else
+            {
+                bbox2 |= paintExtended();
+                clearLuaData(entry);
+            }
+            continue;
+        }
+#endif
         if (parallel)
             compositions.push_back({std::move(paint), entry});
         else

@@ -59,7 +59,7 @@ CSRIAPI void csri_oborodzuki_profile_reset()
     render_profile() = RenderProfile{};
 }
 
-CSRIAPI void csri_oborodzuki_profile_read_v2(uint64_t* ns, uint64_t* calls)
+CSRIAPI void csri_oborodzuki_profile_read_v3(uint64_t* ns, uint64_t* calls)
 {
     const auto& profile = render_profile();
     for (unsigned i = 0; i < static_cast<unsigned>(RenderStage::Count); ++i) {

@@ -22,6 +22,7 @@
 #pragma once
 
 #include <memory>
+#include <map>
 #include <vector>
 #include "..\SubPic\ISubPic.h"
 #ifdef _VSMOD // patch m004. gradient colors
@@ -73,6 +74,8 @@ public:
     MOD_BLEND mod_blendMode = BLEND_NORMAL;
 };
 
+struct OverlayDrawList;
+
 struct OverlayDraw
 {
     CRect bounds;
@@ -84,6 +87,13 @@ struct OverlayDraw
     int colorType;
     MOD_GRADIENT gradient;
     MOD_MOVEVC maskPosition;
+    const std::map<uint64_t, CRect>* paintSegments = nullptr;
+    CRect paintBounds{0, 0, 0, 0};
+    KfxPaint::Fade paintFade;
+    KfxPaint::PaintBoundary boundary;
+    double paintScaleX = 1, paintScaleY = 1;
+    bool reversePaint = false;
+    const OverlayDrawList* captureOwner = nullptr;
 #else
     int maskPitch;
 #endif
@@ -97,7 +107,33 @@ struct OverlayDrawList
     // A word can replace its coverage mask between the shadow and outline.
     // Keep earlier phases alive until all bands have read them.
     std::vector<std::unique_ptr<BYTE[]>> retiredMasks;
+    std::map<uint64_t, CRect> paintSegments;
+#ifdef _VSMOD
+    bool hasPositionedAlpha = false;
+#endif
+    void Blend() const;
 };
+
+#ifdef _VSMOD
+void BlendCapturedBands(const std::vector<const OverlayDraw*>& draws, int top, int bottom);
+#endif
+
+#ifdef _VSMOD
+class OverlayPaintScope
+{
+    const OverlayPaintScope* previous;
+
+public:
+    const KfxPaint::Fade fade;
+    const double scaleX, scaleY;
+    OverlayPaintScope(KfxPaint::Fade fade, double sx, double sy);
+    ~OverlayPaintScope();
+    OverlayPaintScope(const OverlayPaintScope&) = delete;
+    OverlayPaintScope& operator=(const OverlayPaintScope&) = delete;
+};
+
+bool IsCapturingOverlays();
+#endif
 
 class OverlayCaptureScope
 {
@@ -134,6 +170,14 @@ private:
     tSpanBuffer mOutline;
     tSpanBuffer mWideOutline;
     int mWideBorder;
+#ifdef _VSMOD
+    struct ContourEdge { LONG x0, y0, x1, y1; unsigned contour; };
+    std::unique_ptr<std::vector<ContourEdge>> m_geometricEdges;
+    unsigned m_geometricContour = 0;
+    bool CreateMiteredRegion(int rx, int ry);
+    static void SubtractOutlineSpans(const tSpanBuffer& outer, const tSpanBuffer& inner,
+        tSpanBuffer& output, uint64_t offset);
+#endif
 
     struct Edge
     {
@@ -178,13 +222,24 @@ public:
     bool EndPath(HDC hdc);
     bool PartialBeginPath(HDC hdc, bool bClearPath);
     bool PartialEndPath(HDC hdc, long dx, long dy);
-    bool ScanConvert();
+    bool ScanConvert(bool geometric = false);
     bool CreateWidenedRegion(int borderX, int borderY);
+#ifdef _VSMOD
+    struct OutlineTarget
+    {
+        int x, y;
+        Rasterizer* mask;
+    };
+    bool CreateOutlineRings(const std::vector<OutlineTarget>& layers, Rasterizer* shadow);
+    bool CreateDecorationMask(const Rasterizer& decorated, const Rasterizer& glyphs);
+#endif
     void DeleteOutlines();
-    bool Rasterize(int xsub, int ysub, int fBlur, double fGaussianBlurX, double fGaussianBlurY);
+    bool Rasterize(int xsub, int ysub, int fBlur, double fGaussianBlurX, double fGaussianBlurY,
+        bool separateMask = false);
     int getOverlayWidth();
 #ifdef _VSMOD // patch m004. gradient colors
-    CRect Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int xsub, int ysub, const DWORD* switchpts, bool fBody, bool fBorder, int typ, MOD_GRADIENT& mod_grad, MOD_MOVEVC& mod_vc, MOD_BLEND mod_blendMode);
+    CRect Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int xsub, int ysub, const DWORD* switchpts, bool fBody, bool fBorder, int typ, MOD_GRADIENT& mod_grad, MOD_MOVEVC& mod_vc, MOD_BLEND mod_blendMode, bool reversePaint = false, bool applyPositionedAlpha = true,
+        const KfxPaint::PaintBoundary* boundary = nullptr);
 #else
     CRect Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int xsub, int ysub, const DWORD* switchpts, bool fBody, bool fBorder);
 #endif

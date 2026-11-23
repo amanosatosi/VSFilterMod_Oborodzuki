@@ -196,7 +196,7 @@ void run_csri(HMODULE dll, const std::vector<char>& script, const Workload& work
     if (!instance || csri_request_fmt(instance, &format))
         throw std::runtime_error("CSRI initialization failed");
     auto reset = reinterpret_cast<ProfileReset>(GetProcAddress(dll, "csri_oborodzuki_profile_reset"));
-    auto read = reinterpret_cast<ProfileRead>(GetProcAddress(dll, "csri_oborodzuki_profile_read_v2"));
+    auto read = reinterpret_cast<ProfileRead>(GetProcAddress(dll, "csri_oborodzuki_profile_read_v3"));
     measure([&](int t, uint8_t* pixels) {
         csri_frame frame{};
         frame.pixfmt = format.pixfmt;

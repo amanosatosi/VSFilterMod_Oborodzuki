@@ -164,7 +164,7 @@ void run_csri(HMODULE dll, const std::vector<char>& input, const Playback& playb
     if (!instance || csri_request_fmt(instance.get(), &format))
         throw std::runtime_error("CSRI rejected the input file or playback format");
     const auto reset = reinterpret_cast<ProfileReset>(GetProcAddress(dll, "csri_oborodzuki_profile_reset"));
-    const auto read = reinterpret_cast<ProfileRead>(GetProcAddress(dll, "csri_oborodzuki_profile_read_v2"));
+    const auto read = reinterpret_cast<ProfileRead>(GetProcAddress(dll, "csri_oborodzuki_profile_read_v3"));
     play(playback, [&](int timestamp, uint8_t* pixels) {
         csri_frame frame{};
         frame.pixfmt = format.pixfmt;

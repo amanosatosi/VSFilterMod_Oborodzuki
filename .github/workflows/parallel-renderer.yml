@@ -7,7 +7,7 @@ on:
         type: boolean
         default: true
   push:
-    branches: [feature/parallel-event-rendering]
+    branches: [feature/parallel-event-rendering, codex/kfx-paint-extensions, codex/mangetsu-extensions-round-2, codex/mangetsu-extensions-round-3, codex/mangetsu-extensions-round-4]
     paths: ['src/**', '.github/parallel/**', '.github/workflows/parallel-renderer.yml']
 permissions:
   contents: read
@@ -15,6 +15,9 @@ permissions:
 env:
   PARALLEL_FULL: "${{ inputs.full || contains(github.event.head_commit.message, 'Parallel-KFX full') }}"
   PARALLEL_QUICK: "${{ contains(github.event.head_commit.message, 'Parallel-KFX quick') }}"
+  KFX_ROUND2: "${{ github.ref_name == 'codex/mangetsu-extensions-round-2' || (github.ref_name == 'codex/mangetsu-extensions-round-3' || github.ref_name == 'codex/mangetsu-extensions-round-4') }}"
+  KFX_ROUND4: "${{ github.ref_name == 'codex/mangetsu-extensions-round-4' }}"
+  KFX_ROUND3: "${{ (github.ref_name == 'codex/mangetsu-extensions-round-3' || github.ref_name == 'codex/mangetsu-extensions-round-4') }}"
 jobs:
   build:
     runs-on: windows-2022
@@ -25,7 +28,9 @@ jobs:
           repository: amanosatosi/libassmod
           ref: 60e06ef0d4535c5403f446fd46b996df4d0d2560
           path: benchmark-source
-          sparse-checkout: libass
+          sparse-checkout: |
+            libass
+            test/fonts
       - name: Compile renderer and existing hosts
         shell: cmd
         run: |
@@ -35,8 +40,14 @@ jobs:
           set "MANGETSU_REVISION=60e06ef0d4535c5403f446fd46b996df4d0d2560"
           pwsh -File .github\kfx\build-harness.ps1 -Revision "%GITHUB_SHA%" || exit /b 1
           move bundle hosts || exit /b 1
+          copy benchmark-source\test\fonts\furi-tight-ascent.ttf hosts\furi-tight-ascent.ttf || exit /b 1
+          copy benchmark-source\test\fonts\NotoSansMyanmar-Regular.ttf hosts\NotoSansMyanmar-Regular.ttf || exit /b 1
           cl /nologo /std:c++17 /O2 /EHsc /MT /Ibenchmark-source\libass .github\ci\render-bench.cpp /Fe:hosts\render-bench.exe || exit /b 1
           cl /nologo /std:c++17 /O2 /EHsc /MT .github\parallel\concurrent.cpp /Fe:hosts\concurrent.exe user32.lib || exit /b 1
+          if not "%GITHUB_REF_NAME%"=="feature/parallel-event-rendering" (
+            cl /nologo /std:c++17 /O2 /EHsc /MT .github\parallel\paint-math.cpp /Fe:hosts\paint-math.exe || exit /b 1
+            hosts\paint-math.exe || exit /b 1
+          )
       - uses: actions/upload-artifact@v4
         with:
           name: parallel-hosts-${{ github.sha }}
@@ -56,8 +67,8 @@ jobs:
       - name: Download the previous parallel renderer
         uses: actions/download-artifact@v4
         with:
-          name: parallel-hosts-b110ccac5d1b9b55410b1d50df46dfaf29468503
-          run-id: 44151605518
+          name: parallel-hosts-${{ env.KFX_ROUND4 == 'true' && '393b0acc89129a4531fb95bd0367c52be5532951' || env.KFX_ROUND3 == 'true' && 'ddaec6149e323f8d0d690e60af0e7ea8a6ad1acc' || (env.KFX_ROUND2 == 'true' && 'f81f31adac460894914aeab362b9906ce50d603a' || (github.ref_name == 'codex/kfx-paint-extensions' && '20c6174b9cc15292f77ea99605f22df39faf539c' || 'b110ccac5d1b9b55410b1d50df46dfaf29468503')) }}
+          run-id: ${{ env.KFX_ROUND4 == 'true' && '44356341316' || env.KFX_ROUND3 == 'true' && '44317693536' || (env.KFX_ROUND2 == 'true' && '44218421620' || (github.ref_name == 'codex/kfx-paint-extensions' && '44199501549' || '44151605518')) }}
           github-token: ${{ github.token }}
           path: threading-baseline
       - name: Record actual runner hardware
@@ -68,8 +79,19 @@ jobs:
              image = $env:ImageVersion
              ram = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
              revision = $env:GITHUB_SHA } | ConvertTo-Json -Depth 4 | Set-Content parallel-results/environment.json
+      - name: Download the pinned Mangetsu paint reference
+        if: github.ref_name != 'feature/parallel-event-rendering'
+        uses: actions/download-artifact@v4
+        with:
+          name: renderer-mangetsu-60e06ef0d4535c5403f446fd46b996df4d0d2560
+          run-id: 44199501683
+          github-token: ${{ github.token }}
+          path: mangetsu-paint
+      - name: Compare KFX paint pixels, seeks and worker budgets
+        if: github.ref_name != 'feature/parallel-event-rendering'
+        run: python .github/parallel/paint-check.py
       - name: Reuse pre-threading renderer for a same-runner reference
-        if: env.PARALLEL_FULL == 'true'
+        if: env.PARALLEL_FULL == 'true' && env.KFX_ROUND3 != 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -121,6 +143,13 @@ jobs:
               Set-Content "worker-profile/mixed-$workers.json"
             if ($LASTEXITCODE) { throw 'Instrumented mixed workload failed' }
           }
+      - name: Profile the KFX paint stages
+        if: github.ref_name != 'feature/parallel-event-rendering'
+        shell: pwsh
+        run: |
+          python .github/parallel/paint-check.py --profile
+          if ($LASTEXITCODE) { throw 'Instrumented paint workload failed' }
+          Copy-Item parallel-results/paint/paint-profile.json worker-profile/paint-profile.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -24,6 +24,16 @@
 #include <memory>
 #include "STS.h"
 #include "Rasterizer.h"
+#include "NumericExpression.h"
+#include "AssMotion.h"
+#include "RenderGeometry.h"
+#include "ShapedText.h"
+#include "Furigana.h"
+#include "NativeScroll.h"
+#include "NativeChat.h"
+#ifdef _VSMOD
+#include "ColumnLayout.h"
+#endif
 #include "..\SubPic\ISubPic.h"
 
 class CMyFont : public CFont
@@ -44,13 +54,40 @@ class CWord : public Rasterizer
     void CustomTransform(CPoint org, CString F, int Layer);
 #endif
 
-    void Transform(CPoint org);
+    void Transform(CPoint org, bool layoutWarped = false);
 
     bool CreateOpaqueBox();
+#ifdef _VSMOD
+    struct NativeOutlineMasks;
+    std::unique_ptr<NativeOutlineMasks> m_nativeMasks;
+    bool CreateNativeOutline();
+    bool RasterizeNativeOutline(CPoint p);
+    std::unique_ptr<CWord> m_undecoratedGlyphs;
+    std::unique_ptr<Rasterizer> m_decorationMask;
+    virtual std::unique_ptr<CWord> CreateUndecoratedWord() { return {}; }
+    bool RasterizeDecorations(CPoint p, CPoint org);
+    bool NeedsDecorationMask() const;
+#endif
 
 protected:
     double m_scalex, m_scaley;
     CStringW m_str;
+#ifdef _VSMOD
+    std::unique_ptr<CRect> m_distortionDomain;
+    struct LayoutPlacement
+    {
+        CPoint offset;
+        double cosine = 1, sine = 0, center = 0, baseline = 0;
+        int clipStart = INT_MIN, clipEnd = INT_MAX;
+        bool rotate = false;
+        bool curve = false;
+    };
+    std::unique_ptr<LayoutPlacement> m_layoutPlacement;
+    void RotateLayoutOutline();
+    bool WarpBeforeLayout();
+    bool m_projectedPath = false;
+    bool m_rawPathReady = false;
+#endif
 
     void MeasureSelectedFont();
     virtual bool CreatePath() = 0;
@@ -67,8 +104,10 @@ public:
     int m_ktype, m_kstart, m_kend;
 
     int m_width, m_ascent, m_descent;
+    int m_logicalLine = 0;
 
     CWord(STSStyle& style, CStringW str, int ktype, int kstart, int kend, double scalex, double scaley); // str[0] = 0 -> m_fLineBreak = true (in this case we only need and use the height of m_font from the whole class)
+    CWord(CWord& word);
     virtual ~CWord();
 
     virtual CWord* Copy() = 0;
@@ -77,6 +116,59 @@ public:
     {
         return !m_fDrawn || (m_p.x & 7) != (p.x & 7) || (m_p.y & 7) != (p.y & 7);
     }
+
+#ifdef _VSMOD
+    CPoint LayoutPosition(CPoint flat) const;
+    void PlaceLayout(CPoint offset, double cosine, double sine, double center, double baseline);
+    void ClipRubyCoverage(int start, int end)
+    {
+        m_layoutPlacement->clipStart = start;
+        m_layoutPlacement->clipEnd = end;
+    }
+    CRect RubyClip(const CRect& clip, int x, int y) const;
+    void OffsetLayout(CPoint offset);
+    bool IsOnCurve() const { return m_layoutPlacement && m_layoutPlacement->curve; }
+    void MarkCurve() { m_layoutPlacement->curve = true; }
+    KfxPaint::PaintBoundary CurvePaintBoundary(CPoint position, CPoint origin, double progress) const;
+    bool RawOutlineBounds(CRect& bounds);
+    void SetDistortionDomain(const CRect& domain) { m_distortionDomain = std::make_unique<CRect>(domain); }
+    void AddWarpedBounds(CPoint position, RenderGeometry::Point& min, RenderGeometry::Point& max) const;
+    bool m_verticalWord = false;
+    bool m_isRubyReading = false;
+    unsigned m_rubyGroup = 0;
+    unsigned m_scrollGroup = 0;
+    int m_chatReceipt = 0;
+    unsigned m_columnCell = 0;
+    int VerticalPaintSplit(int y, double progress) const
+    {
+        const int top = m_layoutPlacement && m_layoutPlacement->clipStart != INT_MIN ?
+            m_layoutPlacement->clipStart : mOffsetY;
+        const int bottom = m_layoutPlacement && m_layoutPlacement->clipEnd != INT_MAX ?
+            m_layoutPlacement->clipEnd : mOffsetY + mOverlayHeight * 8;
+        return (y + top + int(progress * (bottom - top)) + 4) >> 3;
+    }
+    int HorizontalRubyPaintSplit(int fallback, double progress) const
+    {
+        if (!m_layoutPlacement || (m_layoutPlacement->clipStart == INT_MIN &&
+                m_layoutPlacement->clipEnd == INT_MAX))
+            return fallback;
+        const int left = m_layoutPlacement->clipStart == INT_MIN ? mOffsetX : m_layoutPlacement->clipStart;
+        const int right = m_layoutPlacement->clipEnd == INT_MAX ?
+            mOffsetX + mOverlayWidth * 8 : m_layoutPlacement->clipEnd;
+        return (left - mOffsetX + int(progress * (right - left))) >> 3;
+    }
+    bool PrepareProjectedPath(const RenderGeometry::Perspective& projection, CPoint relativeOrigin,
+        CPoint position, int64_t& areaBudget);
+    void ResetProjectedPath();
+    bool m_wrapAfter = false;
+    bool HasNativeOutline() const;
+    CRect DrawNativeOutline(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int y, int time, int fade,
+        MOD_MOVEVC& vectorClip);
+    CRect DrawNativeShadow(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int y, DWORD* colors,
+        MOD_MOVEVC& vectorClip);
+    CRect DrawBodyPaint(SubPicDesc& spd, CRect& clip, BYTE* mask, int x, int y, const DWORD* colors,
+        MOD_MOVEVC& vectorClip, bool reverse, int channel = 0, const KfxPaint::PaintBoundary* boundary = nullptr);
+#endif
 
 #if defined (_VSMOD) && defined(_LUA)
     void Paint(CPoint p, CPoint org, int Layer);
@@ -89,6 +181,9 @@ class CText : public CWord
 {
 protected:
     virtual bool CreatePath();
+#ifdef _VSMOD
+    std::unique_ptr<CWord> CreateUndecoratedWord() override;
+#endif
 
 public:
     CText(STSStyle& style, CStringW str, int ktype, int kstart, int kend, double scalex, double scaley);
@@ -149,6 +244,7 @@ class CLine : public CAtlList<CWord*>
 {
 public:
     int m_width, m_ascent, m_descent, m_borderX, m_borderY;
+    int m_horizontalAnchor = -1;
 
     virtual ~CLine();
 
@@ -189,6 +285,8 @@ public:
     enum eftype type;
     int param[9];
     int t[4];
+    DWORD fadeColors[2]{};
+    bool hasFadeColor[2]{};
 };
 
 #if defined (_VSMOD) && defined(_LUA)
@@ -203,6 +301,79 @@ class CSubtitle : public CAtlList<CLine*>
     CLine* GetNextLine(POSITION& pos, int maxwidth);
 
 public:
+    unsigned m_paintSegments = 0;
+    std::unique_ptr<KfxPaint::SlideSettings> m_slideSettings;
+#ifdef _VSMOD
+    int m_borderStyleOverride = -1;
+    int m_boxMode = -1;
+    bool m_revealKaraoke = false;
+    std::vector<std::unique_ptr<CWord>> m_eventBox;
+    std::unique_ptr<AssNumeric::Context> m_layoutVariables;
+    bool m_measuringLayout = false;
+    std::unique_ptr<AssMotion::Track> m_motion;
+    std::unique_ptr<std::array<AssNumeric::Operand, 2>> m_origin;
+    std::shared_ptr<const RenderGeometry::Curve> m_curve;
+    double m_curveX = 0, m_curveY = 0, m_curveScale = 1;
+    int m_curveAnchor = 0;
+    bool m_curveShapeFailed = false;
+    void CurveLines();
+    bool m_vertical = false, m_verticalLaidOut = false;
+    int m_verticalProfile = 0, m_verticalDirection = 0, m_verticalAnchor = 0;
+    double m_verticalSpacing = 0, m_verticalColumnGap = 0;
+    bool MakeVerticalLines(int height, CSize& bounds);
+    std::unique_ptr<RenderGeometry::Pins> m_perspectivePins;
+    std::unique_ptr<RenderGeometry::Perspective> m_perspective;
+    CPoint m_perspectiveOrigin = CPoint(INT_MIN, INT_MIN);
+    int m_perspectiveLeft = 0;
+    REFERENCE_TIME m_perspectiveTime = 0;
+    bool m_perspectiveJitter = false;
+    void ConfigurePerspective();
+    void PreparePerspective(CPoint anchor, CPoint origin, const CRect& bounds, REFERENCE_TIME timestamp);
+    struct RubyGroup
+    {
+        struct Timing { int type, start, end; double width; };
+        Furigana::Options options;
+        std::array<std::vector<std::unique_ptr<CWord>>, 2> annotations;
+        std::vector<Timing> baseTiming;
+    };
+    std::vector<RubyGroup> m_rubyGroups;
+    Furigana::Options m_rubyOptions;
+    struct InheritedMetadata
+    {
+        CString style, actor;
+        STSStyle original;
+        Furigana::Options ruby;
+        int wrap = 0, boxMode = -1;
+        std::unique_ptr<KfxPaint::SlideSettings> slides;
+    };
+    std::unique_ptr<InheritedMetadata> m_inherited;
+    int m_annotationLeft = 0, m_annotationRight = 0;
+    bool m_keepRubyKaraoke = false;
+    void PlaceHorizontalRuby();
+    std::vector<std::unique_ptr<SemanticColumns::Block>> m_columnBlocks;
+    SemanticColumns::Block* m_columns = nullptr;
+    void ArrangeColumns();
+    bool m_hasDistortion = false, m_hasExtendedWarp = false;
+    int m_warpedAnchor = 0;
+    CPoint m_warpedShift = CPoint(0, 0);
+    void ConfigureDistortion();
+    std::unique_ptr<KfxPaint::Cycles> m_cycles;
+    unsigned m_scrollGroup = 0;
+    int m_scrollDuration = 300, m_scrollRows = 0;
+    std::vector<NativeScroll::Context> m_scrollContexts;
+    std::unique_ptr<NativeChat::Scene> m_chat;
+    void ArrangeChat(STSStyle& style, int frameHeight);
+    void MeasureScrollRows();
+    std::vector<NativeScroll::Frame> ScrollFrame(int time, int top) const;
+    double m_clipOffsetX = 0, m_clipOffsetY = 0;
+    bool m_hasRectClip = false;
+    struct LineAlignment { int first, inherited, full; };
+    std::map<int, LineAlignment> m_lineAlignment;
+    int m_logicalLine = 0, m_textAnchor = -1, m_textWidth = 0;
+    unsigned m_positionedAlphaScopes = 0;
+    void CreateEventBox(int borderStyle, int time, bool scaledBorder);
+    void AddBoxRegion(CWord& word, double left, double top, double right, double bottom, bool scaledBorder);
+#endif
     int m_scrAlignment;
     int m_wrapStyle;
     bool m_fAnimated;
@@ -228,6 +399,8 @@ public:
     void CreateClippers(CSize size);
 
     void MakeLines(CSize size, CRect marginRect);
+    void AppendWord(CWord* word);
+    int LineLeft(const CLine& line, int anchor) const;
 };
 
 class CScreenLayoutAllocator
@@ -248,6 +421,7 @@ public:
 };
 
 struct OverrideTagCache;
+struct OverrideTag;
 struct TextGeometryCache;
 struct TextDeviceContext;
 class EventWorkerPool;
@@ -261,6 +435,11 @@ class CRenderedTextSubtitle : public CSimpleTextSubtitle, public ISubPicProvider
     std::unique_ptr<TextGeometryCache> m_textGeometry;
     std::unique_ptr<TextDeviceContext> m_textDC;
     std::unique_ptr<EventWorkerPool> m_eventWorkers;
+#ifdef _VSMOD
+    std::unique_ptr<ShapedText::Context> m_shaper;
+    bool ParseShapedString(CSubtitle* sub, const CStringW& text, STSStyle& style, bool verticalVariants);
+    bool ParseFurigana(CSubtitle* sub, Furigana::Fields& fields, STSStyle& style);
+#endif
 
     CScreenLayoutAllocator m_sla;
 
@@ -277,6 +456,7 @@ class CRenderedTextSubtitle : public CSimpleTextSubtitle, public ISubPicProvider
     // temp variables, used when parsing the script
     int m_time, m_delay;
     int m_animStart, m_animEnd;
+    bool m_exactAnimationEnd = false;
     double m_animAccel;
     int m_ktype, m_kstart, m_kend;
     int m_nPolygon;
@@ -287,7 +467,11 @@ class CRenderedTextSubtitle : public CSimpleTextSubtitle, public ISubPicProvider
     void ParseEffect(CSubtitle* sub, CString str);
     void ParseString(CSubtitle* sub, CStringW str, STSStyle& style);
     void ParsePolygon(CSubtitle* sub, CStringW str, STSStyle& style);
-    bool ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org, bool fAnimate = false);
+    bool ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org, bool fAnimate = false,
+        const KfxPaint::SlideSettings* inheritedSlides = nullptr, const std::vector<OverrideTag>* compiled = nullptr);
+#ifdef _VSMOD
+    void ApplyMetadata(CSubtitle& subtitle, const CString& styleName, STSStyle& style, bool initial, bool named);
+#endif
     bool ParseHtmlTag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org);
 
 #if defined(_VSMOD) && defined(_LUA)
@@ -296,7 +480,7 @@ class CRenderedTextSubtitle : public CSimpleTextSubtitle, public ISubPicProvider
 
     double CalcAnimation(double dst, double src, bool fAnimate);
 
-    CSubtitle* GetSubtitle(int entry);
+    CSubtitle* GetSubtitle(int entry, bool measuringLayout = false);
 
 protected:
     virtual void OnChanged();

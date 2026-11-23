@@ -20,6 +20,7 @@
  */
 
 #include "stdafx.h"
+#include "AssUnicode.h"
 #include "STS.h"
 #include <atlbase.h>
 #include <atlconv.h>
@@ -1261,6 +1262,10 @@ int GetInt(CStringW& buff, char sep = ',') //throw(...)
     CStringW fmtstr = str.GetLength() > 2 && (str.Left(2) == L"&h" || str.Left(2) == L"0x")
                       ? str = str.Mid(2), L"%x"
                               : L"%d";
+#ifdef _VSMOD
+    if (fmtstr == L"%d" && AssNumeric::HasNonAscii(str))
+        str = AssNumeric::NormalizeDigits(str).c_str();
+#endif
 
     int ret;
     if(swscanf(str, fmtstr, &ret) != 1) throw 1;
@@ -1274,6 +1279,10 @@ double GetFloat(CStringW& buff, char sep = ',') //throw(...)
 
     str = GetStr(buff, sep);
     str.MakeLower();
+#ifdef _VSMOD
+    if (AssNumeric::HasNonAscii(str))
+        str = AssNumeric::NormalizeDigits(str).c_str();
+#endif
 
     float ret;
     if(swscanf(str, L"%f", &ret) != 1) throw 1;
@@ -1281,7 +1290,7 @@ double GetFloat(CStringW& buff, char sep = ',') //throw(...)
     return((double)ret);
 }
 
-static bool LoadFont(CString& font)
+static bool LoadFont(CString& font, std::vector<BYTE>* attachment = nullptr)
 {
     int len = font.GetLength();
 
@@ -1312,6 +1321,8 @@ static bool LoadFont(CString& font)
         pData[datalen++] = ((pData[(len&~3)+1] & 15) << 4) | ((pData[(len&~3)+2] >> 2) & 15);
     }
 
+    if (attachment && datalen > 0 && datalen <= 8 * 1024 * 1024)
+        attachment->assign(static_cast<const BYTE*>(pData), static_cast<const BYTE*>(pData) + datalen);
     HANDLE hFont = INVALID_HANDLE_VALUE;
 
     if(HMODULE hModule = LoadLibrary(_T("GDI32.DLL")))
@@ -1358,9 +1369,19 @@ static bool LoadFont(CString& font)
     return(true);
 }
 
-static bool LoadUUEFont(CTextFile* file)
+static bool LoadUUEFont(CTextFile* file, std::vector<std::vector<BYTE>>* attachments = nullptr)
 {
     CString s, font;
+    const auto install = [&] {
+        std::vector<BYTE> bytes;
+        LoadFont(font, attachments && attachments->size() < 16 ? &bytes : nullptr);
+        if (!bytes.empty())
+        {
+            size_t total = bytes.size();
+            for (const auto& prior : *attachments) total += prior.size();
+            if (total <= 32 * 1024 * 1024) attachments->push_back(std::move(bytes));
+        }
+    };
     while(file->ReadString(s))
     {
         s.Trim();
@@ -1376,7 +1397,7 @@ static bool LoadUUEFont(CTextFile* file)
         }
         if(s.Find(_T("fontname:")) == 0)
         {
-            LoadFont(font);
+            install();
             font.Empty();
             continue;
         }
@@ -1385,7 +1406,7 @@ static bool LoadUUEFont(CTextFile* file)
     }
 
     if(!font.IsEmpty())
-        LoadFont(font);
+        install();
 
     return(true);
 }
@@ -1912,7 +1933,11 @@ static bool OpenSubStationAlpha(CTextFile* file, CSimpleTextSubtitle& ret, int C
                 if(sver >= 5)	style->fontSpacing = max(style->fontSpacing, 0);
 #endif
                 style->fontAngleX = style->fontAngleY = 0;
-                style->borderStyle = style->borderStyle == 1 ? 0 : style->borderStyle == 3 ? 1 : 0;
+                style->borderStyle = style->borderStyle == 3 ? 1 :
+#ifdef _VSMOD
+                    style->borderStyle == 4 ? 2 : style->borderStyle == 5 ? 3 :
+#endif
+                    0;
                 style->outlineWidthX = max(style->outlineWidthX, 0);
                 style->outlineWidthY = max(style->outlineWidthY, 0);
                 style->shadowDepthX = max(style->shadowDepthX, 0);
@@ -2002,7 +2027,11 @@ static bool OpenSubStationAlpha(CTextFile* file, CSimpleTextSubtitle& ret, int C
         }
         else if(entry == L"fontname")
         {
-            LoadUUEFont(file);
+            LoadUUEFont(file
+#ifdef _VSMOD
+                , &ret.AttachedFontsForImport()
+#endif
+            );
         }
 #ifdef _VSMOD // load png graphic from text resources
         else if(entry == L"filename")
@@ -2133,7 +2162,11 @@ static bool OpenXombieSub(CTextFile* file, CSimpleTextSubtitle& ret, int CharSet
                 style->fontScaleX = max(style->fontScaleX, 0);
                 style->fontScaleY = max(style->fontScaleY, 0);
                 style->fontSpacing = max(style->fontSpacing, 0);
-                style->borderStyle = style->borderStyle == 1 ? 0 : style->borderStyle == 3 ? 1 : 0;
+                style->borderStyle = style->borderStyle == 3 ? 1 :
+#ifdef _VSMOD
+                    style->borderStyle == 4 ? 2 : style->borderStyle == 5 ? 3 :
+#endif
+                    0;
                 style->outlineWidthX = max(style->outlineWidthX, 0);
                 style->outlineWidthY = max(style->outlineWidthY, 0);
                 style->shadowDepthX = max(style->shadowDepthX, 0);
@@ -2377,6 +2410,10 @@ CSimpleTextSubtitle& CSimpleTextSubtitle::operator = (CSimpleTextSubtitle& sts)
 void CSimpleTextSubtitle::Copy(CSimpleTextSubtitle& sts)
 {
     Empty();
+#ifdef _VSMOD
+    m_metadataCarriers = sts.m_metadataCarriers;
+    m_attachedFonts = sts.m_attachedFonts;
+#endif
 
 #ifdef _VSMOD
 #ifdef _LUA
@@ -2418,6 +2455,11 @@ void CSimpleTextSubtitle::Append(CSimpleTextSubtitle& sts, int timeoff)
     }
 
     CopyStyles(sts.m_styles, true);
+#ifdef _VSMOD
+    for (const auto& carrier : sts.m_metadataCarriers)
+        if (m_metadataCarriers.size() < 8192)
+            m_metadataCarriers.push_back(carrier);
+#endif
 
     for(ptrdiff_t i = 0, j = sts.GetCount(); i < j; i++)
     {
@@ -2469,6 +2511,10 @@ bool CSimpleTextSubtitle::CopyStyles(const CSTSStyleMap& styles, bool fAppend)
 
 void CSimpleTextSubtitle::Empty()
 {
+#ifdef _VSMOD
+    m_metadataCarriers.clear();
+    m_attachedFonts.clear();
+#endif
     m_dstScreenSize = CSize(0, 0);
     m_styles.Free();
     m_segments.RemoveAll();
@@ -2509,6 +2555,17 @@ void CSimpleTextSubtitle::Add(CStringW str, bool fUnicode, int start, int end, C
     sub.end = end;
     sub.readorder = readorder < 0 ? GetCount() : readorder;
 
+#ifdef _VSMOD
+    if (effect == L"oborodzuki-style" || effect == L"oborodzuki-colorcoding")
+    {
+        if (start < end && m_metadataCarriers.size() < 8192 && str.GetLength() <= 16384)
+        {
+            m_metadataCarriers.push_back(std::move(sub));
+            OnChanged();
+        }
+        return;
+    }
+#endif
     int n = (int)__super::GetCount();
     
     // Entries with a null duration don't belong to any segments since
@@ -3359,7 +3416,7 @@ bool CSimpleTextSubtitle::SaveAs(CString fn, exttype et, double fps, CTextFile::
                             s->colors[2] & 0xffffff,
                             s->colors[3] & 0xffffff,
                             s->fontWeight > FW_NORMAL ? -1 : 0, s->fItalic ? -1 : 0,
-                            s->borderStyle == 0 ? 1 : s->borderStyle == 1 ? 3 : 0,
+                            s->borderStyle == 0 ? 1 : s->borderStyle + 2,
                             (int)s->outlineWidthY, (int)s->shadowDepthY,
                             s->scrAlignment <= 3 ? s->scrAlignment : s->scrAlignment <= 6 ? ((s->scrAlignment - 3) | 8) : s->scrAlignment <= 9 ? ((s->scrAlignment - 6) | 4) : 2,
                             s->marginRect.left, s->marginRect.right, (s->marginRect.top + s->marginRect.bottom) / 2,
@@ -3380,7 +3437,7 @@ bool CSimpleTextSubtitle::SaveAs(CString fn, exttype et, double fps, CTextFile::
                             s->fItalic ? -1 : 0, s->fUnderline ? -1 : 0, s->fStrikeOut ? -1 : 0,
                             (int)s->fontScaleX, (int)s->fontScaleY,
                             (int)s->fontSpacing, (float)s->fontAngleZ,
-                            s->borderStyle == 0 ? 1 : s->borderStyle == 1 ? 3 : 0,
+                            s->borderStyle == 0 ? 1 : s->borderStyle + 2,
                             (int)s->outlineWidthY, (int)s->shadowDepthY,
                             s->scrAlignment,
                             s->marginRect.left, s->marginRect.right, (s->marginRect.top + s->marginRect.bottom) / 2,
@@ -3517,7 +3574,7 @@ bool CSimpleTextSubtitle::SaveAs(CString fn, exttype et, double fps, CTextFile::
                     s->fItalic ? -1 : 0, s->fUnderline ? -1 : 0, s->fStrikeOut ? -1 : 0,
                     (int)s->fontScaleX, (int)s->fontScaleY,
                     (int)s->fontSpacing, (float)s->fontAngleZ,
-                    s->borderStyle == 0 ? 1 : s->borderStyle == 1 ? 3 : 0,
+                    s->borderStyle == 0 ? 1 : s->borderStyle + 2,
                     (int)s->outlineWidthY, (int)s->shadowDepthY,
                     s->scrAlignment,
                     s->marginRect.left, s->marginRect.right, (s->marginRect.top + s->marginRect.bottom) / 2,
@@ -3582,6 +3639,11 @@ void STSStyle::SetDefault()
     mod_rand.clear();
     // patch m004. gradient colors
     mod_grad.clear();
+    nativeOutline.reset();
+    boxRings.reset();
+    boxShape.reset();
+    decoration.reset();
+    softScale = objectScale = 100;
     // patch m007. symbol rotating
     mod_fontOrient = 0;
     // vpatch v001. Orthogonal 2D projection
@@ -3631,6 +3693,12 @@ bool STSStyle::operator == (STSStyle& s)
            && mod_rand == s.mod_rand
            // patch m004. gradient colors
            && mod_grad == s.mod_grad
+           && nativeOutline == s.nativeOutline
+           && boxRings == s.boxRings
+           && boxShape == s.boxShape
+           && decoration == s.decoration
+           && softScale == s.softScale
+           && objectScale == s.objectScale
            // patch m007. symbol rotating
            && mod_fontOrient == s.mod_fontOrient
            // patch m008. distort
@@ -3707,6 +3775,12 @@ void STSStyle::mod_CopyStyleFrom(STSStyle& s)
     mod_rand = s.mod_rand;
     //patch m004. gradient colors
     mod_grad = s.mod_grad;
+    nativeOutline = s.nativeOutline;
+    boxRings = s.boxRings;
+    boxShape = s.boxShape;
+    decoration = s.decoration;
+    softScale = s.softScale;
+    objectScale = s.objectScale;
     // patch m007. symbol rotating
     mod_fontOrient = s.mod_fontOrient;
     // patch m008. distort
@@ -4078,7 +4152,8 @@ MOD_GRADIENT::MOD_GRADIENT()
 
 bool MOD_GRADIENT::operator == (MOD_GRADIENT& mg)
 {
-    return (color[0][0] == mg.color[0][0] // T.T
+    return (paint == mg.paint && positionedOpacity == mg.positionedOpacity && (!paint || legacyParts == mg.legacyParts)
+            && color[0][0] == mg.color[0][0]
             && color[1][0] == mg.color[1][0]
             && color[2][0] == mg.color[2][0]
             && color[3][0] == mg.color[3][0]
@@ -4140,6 +4215,11 @@ void MOD_GRADIENT::clear()
     bodyIsGradAlpha = false;
     img_alpha = 0;
     clipDiff = 0;
+    paint.reset();
+    positionedOpacity.reset();
+    legacyParts = 0;
+    paintOffsetY = 0;
+    paintGroup = 0;
 }
 
 #include <math.h>
@@ -4239,6 +4319,7 @@ MOD_DISTORT::MOD_DISTORT()
 bool MOD_DISTORT::operator == (MOD_DISTORT& md)
 {
     return(enabled == md.enabled
+           && extended == md.extended && x0 == md.x0 && y0 == md.y0
            && pointsx[0] == md.pointsx[0]
            && pointsx[1] == md.pointsx[1]
            && pointsx[2] == md.pointsx[2]

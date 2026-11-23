@@ -43,6 +43,23 @@
 
 static thread_local OverlayDrawList* activeOverlayDraws = nullptr;
 
+#ifdef _VSMOD
+static thread_local const OverlayPaintScope* activeKfxPaint = nullptr;
+
+OverlayPaintScope::OverlayPaintScope(KfxPaint::Fade fade, double sx, double sy)
+    : previous(activeKfxPaint), fade(fade), scaleX(std::abs(sx)), scaleY(std::abs(sy))
+{
+    activeKfxPaint = this;
+}
+
+OverlayPaintScope::~OverlayPaintScope()
+{
+    activeKfxPaint = previous;
+}
+
+bool IsCapturingOverlays() { return activeOverlayDraws != nullptr; }
+#endif
+
 OverlayCaptureScope::OverlayCaptureScope(OverlayDrawList& list) : previous(activeOverlayDraws)
 {
     activeOverlayDraws = &list;
@@ -216,6 +233,15 @@ void Rasterizer::_EvaluateLine(int pt1idx, int pt2idx)
 
 void Rasterizer::_EvaluateLine(int x0, int y0, int x1, int y1)
 {
+#ifdef _VSMOD
+    if (m_geometricEdges && (x0 != x1 || y0 != y1))
+    {
+        if (m_geometricEdges->size() >= 65536)
+            m_geometricEdges.reset();
+        else
+            m_geometricEdges->push_back({x0, y0, x1, y1, m_geometricContour});
+    }
+#endif
     if(lastp.x != x0 || lastp.y != y0)
     {
         _EvaluateLine(lastp.x, lastp.y, x0, y0);
@@ -418,7 +444,7 @@ bool Rasterizer::PartialEndPath(HDC hdc, long dx, long dy)
     return false;
 }
 
-bool Rasterizer::ScanConvert()
+bool Rasterizer::ScanConvert(bool geometric)
 {
     PROFILE_RENDER_STAGE(ScanConvert);
     size_t lastmoveto = -1;
@@ -429,6 +455,13 @@ bool Rasterizer::ScanConvert()
     mOutline.clear();
     mWideOutline.clear();
     mWideBorder = 0;
+#ifdef _VSMOD
+    if (geometric)
+        m_geometricEdges = std::make_unique<std::vector<ContourEdge>>();
+    else
+        m_geometricEdges.reset();
+    m_geometricContour = 0;
+#endif
 
     // Determine bounding box
 
@@ -509,6 +542,9 @@ bool Rasterizer::ScanConvert()
         case PT_MOVETO:
             if(lastmoveto >= 0 && firstp != lastp)
                 _EvaluateLine(lastp.x, lastp.y, firstp.x, firstp.y);
+#ifdef _VSMOD
+            if (m_geometricEdges) ++m_geometricContour;
+#endif
             lastmoveto = i;
             fFirstSet = false;
             lastp = mpPathPoints[i];
@@ -891,6 +927,10 @@ bool Rasterizer::CreateWidenedRegion(int rx, int ry)
     mWideBorder = max(rx, ry);
     if (mOutline.empty())
         return true;
+#ifdef _VSMOD
+    if (m_geometricEdges && !m_geometricEdges->empty())
+        return CreateMiteredRegion(rx, ry);
+#endif
 
     // Keep the whole-outline path for dimensions where the packed horizontal
     // offset may carry into the row, or where indexing rows would be costly.
@@ -921,13 +961,161 @@ bool Rasterizer::CreateWidenedRegion(int rx, int ry)
     return true;
 }
 
+#ifdef _VSMOD
+void Rasterizer::SubtractOutlineSpans(const tSpanBuffer& outer, const tSpanBuffer& inner,
+    tSpanBuffer& output, uint64_t offset)
+{
+    auto cut = inner.begin();
+    for (const auto& span : outer)
+    {
+        auto start = span.first;
+        while (cut != inner.end() && cut->second + offset <= start) ++cut;
+        while (cut != inner.end() && cut->first + offset < span.second)
+        {
+            if (cut->first + offset > start)
+                output.emplace_back(start, cut->first + offset);
+            start = (std::max)(start, cut->second + offset);
+            if (start >= span.second) break;
+            ++cut;
+        }
+        if (start < span.second)
+            output.emplace_back(start, span.second);
+    }
+}
+
+bool Rasterizer::CreateDecorationMask(const Rasterizer& decorated, const Rasterizer& glyphs)
+{
+    if (decorated.mOutline.empty() || glyphs.mOutline.empty()) return false;
+    mWidth = decorated.mWidth;
+    mHeight = decorated.mHeight;
+    mPathOffsetX = decorated.mPathOffsetX;
+    mPathOffsetY = decorated.mPathOffsetY;
+    mWideBorder = 0;
+    const auto dx = int64_t(glyphs.mPathOffsetX) - mPathOffsetX;
+    const auto dy = int64_t(glyphs.mPathOffsetY) - mPathOffsetY;
+    const uint64_t offset = uint64_t(dy * 0x100000000ll + dx);
+    SubtractOutlineSpans(decorated.mOutline, glyphs.mOutline, mOutline, offset);
+    return !mOutline.empty();
+}
+
+bool Rasterizer::CreateMiteredRegion(int rx, int ry)
+{
+    struct Point { double x, y; };
+    const double sx = (std::min)(rx, 2048) * 8.0;
+    const double sy = (std::min)(ry, 2048) * 8.0;
+    mWideBorder = int(2 * (std::max)(sx, sy) / 8) + 8;
+    if (!sx && !sy) return true;
+
+    const auto normal = [&](const ContourEdge& edge) {
+        const double dx = (double(edge.x1) - edge.x0) / (std::max)(1., sx);
+        const double dy = (double(edge.y1) - edge.y0) / (std::max)(1., sy);
+        const double inverse = 1 / std::hypot(dx, dy);
+        return Point{-dy * inverse, dx * inverse};
+    };
+    const auto shift = [&](Point point, Point n, double side) {
+        return Point{point.x + sx * n.x * side, point.y + sy * n.y * side};
+    };
+
+    std::vector<POINT> points;
+    std::vector<BYTE> types;
+    // Stroke primitives have the same winding so overlaps merge in the scan
+    // converter. The original fill is unioned afterward, including its holes.
+    const auto add = [&](std::array<Point, 4> polygon, unsigned count) {
+        double area = 0;
+        for (unsigned i = 0; i < count; ++i)
+        {
+            const auto& a = polygon[i];
+            const auto& b = polygon[(i + 1) % count];
+            area += a.x * b.y - a.y * b.x;
+        }
+        if (std::abs(area) < 0.1) return;
+        for (unsigned i = 0; i < count; ++i)
+        {
+            const auto& p = polygon[area > 0 ? i : count - 1 - i];
+            points.push_back({LONG(std::lround(p.x)), LONG(std::lround(p.y))});
+            types.push_back(i ? PT_LINETO : PT_MOVETO);
+        }
+    };
+    const auto& edges = *m_geometricEdges;
+    for (size_t begin = 0; begin < edges.size();)
+    {
+        size_t end = begin + 1;
+        while (end < edges.size() && edges[end].contour == edges[begin].contour) ++end;
+        for (size_t i = begin; i < end; ++i)
+        {
+            const auto& edge = edges[i];
+            const Point a{double(edge.x0), double(edge.y0)}, b{double(edge.x1), double(edge.y1)};
+            const Point n = normal(edge);
+            add({shift(a, n, -1), shift(b, n, -1), shift(b, n, 1), shift(a, n, 1)}, 4);
+            const auto& following = edges[i + 1 == end ? begin : i + 1];
+            if (following.x0 != edge.x1 || following.y0 != edge.y1) continue;
+            const Point next = normal(following);
+            const double denominator = 1 + n.x * next.x + n.y * next.y;
+            Point miter{};
+            if (denominator > 1e-8)
+                miter = {(n.x + next.x) / denominator, (n.y + next.y) / denominator};
+            const bool sharp = denominator > 1e-8 && miter.x * miter.x + miter.y * miter.y <= 4;
+            const double side = n.x * next.y - n.y * next.x > 0 ? -1. : 1.;
+            if (sharp) add({b, shift(b, n, side), shift(b, miter, side), shift(b, next, side)}, 4);
+            else add({b, shift(b, n, side), shift(b, next, side), b}, 3);
+        }
+        begin = end;
+    }
+    if (points.empty())
+    {
+        mWideOutline = mOutline;
+        return true;
+    }
+    Rasterizer strokes;
+    if (!strokes.CopyPath(points.data(), types.data(), points.size()) || !strokes.ScanConvert())
+        return false;
+    const uint64_t offset = uint64_t(int64_t(strokes.mPathOffsetY) * 0x100000000ll + strokes.mPathOffsetX);
+    mWideOutline.reserve(mOutline.size() + strokes.mOutline.size());
+    MergeOutlineSpans(mOutline.cbegin(), mOutline.cend(), strokes.mOutline.cbegin(), strokes.mOutline.cend(),
+        offset, offset, [&](uint64_t start, uint64_t end) { mWideOutline.emplace_back(start, end); });
+    return true;
+}
+
+bool Rasterizer::CreateOutlineRings(const std::vector<OutlineTarget>& layers, Rasterizer* shadow)
+{
+    const tSpanBuffer* inner = &mOutline;
+    tSpanBuffer previous;
+    auto initMask = [this](Rasterizer& target) {
+        target.mWidth = mWidth;
+        target.mHeight = mHeight;
+        target.mPathOffsetX = mPathOffsetX;
+        target.mPathOffsetY = mPathOffsetY;
+        target.mWideBorder = mWideBorder;
+    };
+    for (const auto& layer : layers)
+    {
+        mWideOutline.clear();
+        if (!CreateWidenedRegion(layer.x, layer.y))
+            return false;
+        initMask(*layer.mask);
+        SubtractOutlineSpans(mWideOutline, *inner, layer.mask->mOutline, 0);
+        mWideOutline.swap(previous);
+        inner = &previous;
+    }
+    if (shadow)
+    {
+        initMask(*shadow);
+        shadow->mOutline.swap(previous);
+    }
+    mWideOutline.clear();
+    mWideBorder = 0;
+    return true;
+}
+#endif
+
 void Rasterizer::DeleteOutlines()
 {
     mWideOutline.clear();
     mOutline.clear();
 }
 
-bool Rasterizer::Rasterize(int xsub, int ysub, int fBlur, double fGaussianBlurX, double fGaussianBlurY)
+bool Rasterizer::Rasterize(int xsub, int ysub, int fBlur, double fGaussianBlurX, double fGaussianBlurY,
+    bool separateMask)
 {
     PROFILE_RENDER_STAGE(Rasterize);
     if (activeOverlayDraws && mpOverlayBuffer)
@@ -964,7 +1152,7 @@ bool Rasterizer::Rasterize(int xsub, int ysub, int fBlur, double fGaussianBlurX,
     else if (fGaussianBlurX == 0 && fGaussianBlurY != 0)
         direction = 2;
 
-    if(!mWideOutline.empty() || fBlur || fGaussianBlur > 0)
+    if(!mWideOutline.empty() || separateMask || fBlur || fGaussianBlur > 0)
     {
         int bluradjust = 0;
         if(fGaussianBlur > 0)
@@ -1140,6 +1328,116 @@ static void BlendOverlay(RasterizerNfo& info, bool body, COverlayGetter* color, 
         Mixer(&info, color).Draw(body);
 }
 
+#ifdef _VSMOD
+// Each band makes its own sampler from immutable event paint and full bounds.
+class COverlayKfxPaint : public COverlayGetter
+{
+    const OverlayDraw& draw;
+    KfxPaint::Sampler samplers[2][2];
+    struct DotGrid
+    {
+        DWORD color = 0;
+        int period = 0, rows = 0, radius = 0;
+        bool Sample(int x, int y) const
+        {
+            if (!period) return false;
+            const int py = y * 16 + 8;
+            const int row = py / rows;
+            const int dy = py % rows - rows / 2;
+            const int px = x * 16 + 8 + ((row & 1) ? period / 2 : 0);
+            const int dx = px % period - period / 2;
+            return int64_t(dx) * dx + int64_t(dy) * dy <= int64_t(radius) * radius;
+        }
+    } dots[2];
+
+    int Channel(int slice) const
+    {
+        return draw.colorType ? draw.colorType : slice ^ int(draw.reversePaint);
+    }
+
+    DWORD Sample(int slice, int x, int y) const
+    {
+        if (draw.boundary.Active())
+        {
+            const double px = draw.bounds.left + x + .5;
+            const double py = draw.bounds.bottom - y - .5;
+            slice = px * draw.boundary.x + py * draw.boundary.y < draw.boundary.offset ? 0 : 1;
+        }
+        const auto& gradient = draw.gradient;
+        const auto& rgb = samplers[slice][0];
+        const auto& alpha = samplers[slice][1];
+        const int channel = Channel(slice);
+        const DWORD solid = draw.info.sw[slice * 2];
+        const unsigned bits = gradient.legacyParts >> (2 * channel);
+        const bool image = gradient.mode[channel] == 2;
+        const bool previousShader = !gradient.paint &&
+            (gradient.mode[draw.colorType] || (draw.colorType == 0 && gradient.mode[1]));
+        const bool legacyRgb = !rgb.Active() && (previousShader || image || (bits & 1));
+        const bool legacyAlpha = !alpha.Active() && (previousShader || image || (bits & 2));
+        const DWORD legacy = (legacyRgb || legacyAlpha) && (gradient.mode[channel] || previousShader) ?
+            gradient.getmixcolor(x, y, channel) : solid;
+        DWORD color = (legacyRgb ? legacy : solid) & 0xFFFFFF;
+        DWORD opacity = (legacyAlpha ? legacy : solid) >> 24;
+        if (rgb.Active() || alpha.Active())
+        {
+            const double px = draw.bounds.left + x + 0.5;
+            const double py = draw.bounds.bottom - y - 0.5;
+            double u = 0, v = 0;
+            if (rgb.UsesCorners() || alpha.UsesCorners())
+            {
+                u = KfxPaint::Unit(double(gradient.xoffset + x) / gradient.width);
+                v = KfxPaint::Unit(1.0 - double(y) / gradient.height);
+            }
+            if (rgb.Active()) color = rgb.At(px, py, u, v);
+            if (alpha.Active())
+                opacity = ((255 - alpha.At(px, py, u, v)) * (255 - gradient.fadalpha) + 127) / 255;
+        }
+        if (dots[slice].Sample(gradient.xoffset + x, gradient.yoffset + draw.info.h - 1 - y))
+            color = dots[slice].color;
+        if (draw.paintFade.amount > 0)
+            color = KfxPaint::Mix(color, draw.paintFade.color, draw.paintFade.amount, false, false);
+        return color | (opacity << 24);
+    }
+
+public:
+    explicit COverlayKfxPaint(const OverlayDraw& draw) : draw(draw)
+    {
+        if (!draw.gradient.paint)
+            return;
+        const auto& paint = *draw.gradient.paint;
+        if (paint.dots && draw.colorType < 3)
+            for (int slice = 0; slice < (draw.colorType ? 1 : 2); ++slice)
+            {
+                const unsigned target = paint.dotTarget >= 0 ? paint.dotTarget : Channel(slice);
+                const auto layer = paint.dots->Layer(target);
+                const auto period = (layer.spacing < 0 ? 2.5 * layer.diameter : layer.spacing) * draw.paintScaleY;
+                if (layer.color >= 0 && layer.diameter > 0 && period > 0)
+                    dots[slice] = {DWORD(layer.color), (std::max)(1, int(std::lround(period * 16))),
+                        (std::max)(1, int(std::lround(period * 13.8564064606))),
+                        (std::max)(1, int(std::lround(layer.diameter * draw.paintScaleY * 8)))};
+            }
+        for (int slice = 0; slice < (draw.colorType ? 1 : 2); ++slice)
+            for (int component = 0; component < 2; ++component)
+            {
+                const auto& source = paint.parts[Channel(slice) * 2 + component];
+                if (!source) continue;
+                CRect rect = draw.paintBounds;
+                if (draw.paintSegments)
+                {
+                    const auto found = draw.paintSegments->find((uint64_t(draw.gradient.paintGroup) << 32) | source->segment);
+                    if (found != draw.paintSegments->end()) rect = found->second;
+                }
+                samplers[slice][component].Prepare(source.get(),
+                    {double(rect.left), double(rect.top), double(rect.right), double(rect.bottom)},
+                    draw.paintScaleX, draw.paintScaleY, component != 0, draw.gradient.paintOffsetY / 8.);
+            }
+    }
+
+    DWORD getcolor1(int x, int y) override { return Sample(0, x, y); }
+    DWORD getcolor2(int x, int y) override { return Sample(draw.colorType ? 0 : 1, x, y); }
+};
+#endif
+
 void OverlayDraw::Blend(int top, int bottom) const
 {
     const int first = (std::max)(top, int(bounds.top));
@@ -1157,17 +1455,48 @@ void OverlayDraw::Blend(int top, int bottom) const
     // The mixers count down from the bottom of the original clipped draw.
     band.rowOffset = bounds.bottom - last;
 
-    COverlayColor solid(band.sw[0], band.sw[2]);
-    COverlayGetter* color = &solid;
 #ifdef _VSMOD
+    const bool legacyShading = gradient.mode[colorType] || (colorType == 0 && gradient.mode[1]);
+    auto fadeSolid = [&](DWORD source) {
+        return (source & 0xFF000000u) |
+            KfxPaint::Mix(source & 0xFFFFFF, paintFade.color, paintFade.amount, false, false);
+    };
+    COverlayColor solid(fadeSolid(band.sw[0]), fadeSolid(band.sw[2]));
+    COverlayGetter* color = &solid;
     COverlayGradient shaded(gradient, colorType);
-    if (gradient.mode[colorType] || (colorType == 0 && gradient.mode[1]))
+    if (legacyShading)
         color = &shaded;
     COverlayAlpha mask(maskPosition);
 #else
+    COverlayColor solid(band.sw[0], band.sw[2]);
+    COverlayGetter* color = &solid;
     COverlayAlpha mask(alphaMask, maskPitch, info.h);
 #endif
     auto* alpha = alphaMask ? &mask : nullptr;
+#ifdef _VSMOD
+    if (gradient.paint || boundary.Active() || (legacyShading && paintFade.amount > 0))
+    {
+        if (boundary.Active())
+            band.sw[1] = 0xffffffff;
+        else if (gradient.paint && band.sw[1] != 0xffffffff)
+        {
+            const int64_t split = int64_t(int32_t(band.sw[3])) - band.xo;
+            band.sw[3] = split >= 0 ? DWORD(split) : DWORD(-1);
+            band.xo = 0;
+        }
+        if (gradient.paint && !body && alpha)
+            band.s = band.src;
+        COverlayKfxPaint extended(*this);
+        if (g_cpuid.m_flags & CCpuID::sse2)
+            BlendOverlay<COverlayMixerSSE2>(band, body, &extended, alpha);
+        else
+            BlendOverlay<COverlayMixer>(band, body, &extended, alpha);
+#ifndef _M_X64
+        _mm_empty();
+#endif
+        return;
+    }
+#endif
     if (g_cpuid.m_flags & CCpuID::sse2)
         BlendOverlay<COverlayMixerSSE2>(band, body, color, alpha);
     else
@@ -1175,6 +1504,164 @@ void OverlayDraw::Blend(int top, int bottom) const
 #ifndef _M_X64
     _mm_empty();
 #endif
+}
+
+#ifdef _VSMOD
+namespace
+{
+struct PositionedDraw
+{
+    struct Pixel { DWORD color = 0; BYTE coverage = 0; };
+    const OverlayDraw& draw;
+    COverlayKfxPaint color;
+    KfxPaint::Sampler opacity;
+    std::vector<Pixel> row;
+    size_t scope;
+    int divider;
+
+    PositionedDraw(const OverlayDraw& source, size_t scopeIndex)
+        : draw(source), color(source), row(source.bounds.Width()), scope(scopeIndex),
+          divider(source.info.sw[1] == DWORD(-1) ? source.bounds.Width() :
+            int((std::max)(int64_t(0), (std::min)(int64_t(source.bounds.Width()),
+                int64_t(int32_t(source.info.sw[3])) + 1 - source.info.xo))))
+    {
+        opacity.Prepare(draw.gradient.positionedOpacity.get(), {}, draw.paintScaleX, draw.paintScaleY, true,
+            draw.gradient.paintOffsetY / 8.);
+    }
+
+    void Sample(int y, int left, float* above)
+    {
+        const int fromBottom = draw.bounds.bottom - y - 1;
+        const auto offset = 2 * ptrdiff_t(draw.info.overlayp) * (y - draw.bounds.top);
+        const auto* source = draw.info.src + offset;
+        const auto* selected = draw.info.s + offset;
+        if (!draw.body && draw.alphaMask && !draw.gradient.paint)
+            source = selected;
+        for (int x = 0; x < int(row.size()); ++x)
+        {
+            auto& pixel = row[x];
+            pixel.coverage = draw.body ? selected[2 * x] :
+                BYTE((std::max)(0, source[2 * x + 1] - source[2 * x]));
+            if (draw.alphaMask && pixel.coverage)
+                pixel.coverage = BYTE(pixel.coverage * draw.maskPosition.GetAlphaValue(x, fromBottom) >> 6);
+            if (!pixel.coverage) continue;
+            pixel.color = x < divider ? color.getcolor1(x, fromBottom) : color.getcolor2(x, fromBottom);
+            const unsigned original = pixel.coverage * (pixel.color >> 24) >> 6;
+            const int screenX = draw.bounds.left + x;
+            auto& remaining = above[screenX - left];
+            const auto inverse = opacity.At(screenX + 0.5, y + 0.5, 0, 0);
+            if (inverse)
+            {
+                // Allocate this source's share of the masked finished paint.
+                // The sources above it must still attenuate it in painter order.
+                const double k = (255 - inverse) / 255.0;
+                const auto adjusted = unsigned(std::lround(original * k * remaining / (1 - k + k * remaining)));
+                pixel.coverage = adjusted ? 64 : 0;
+                pixel.color = (pixel.color & 0xffffff) | (adjusted << 24);
+            }
+            remaining *= 1 - original / 255.f;
+        }
+    }
+
+    template<class Mixer>
+    void Blend(int y, Mixer& mixer) const
+    {
+        auto* dst = reinterpret_cast<DWORD*>(reinterpret_cast<BYTE*>(draw.info.dst) +
+            ptrdiff_t(y - draw.bounds.top) * draw.info.pitch);
+        for (int x = 0; x < int(row.size()); ++x)
+            if (row[x].coverage)
+                mixer.PixMix(dst + x, row[x].color, row[x].coverage, draw.info.mod_blendMode);
+    }
+};
+
+void BlendPositionedOverlays(const OverlayDraw* const* draws, size_t count, int top, int bottom)
+{
+    PROFILE_RENDER_STAGE(Composite);
+    int left = INT_MAX, right = INT_MIN;
+    int firstRow = bottom, lastRow = top;
+    std::vector<std::pair<const KfxPaint::Paint*, unsigned>> scopes;
+    std::vector<std::unique_ptr<PositionedDraw>> positioned(count);
+    for (size_t i = 0; i < count; ++i)
+    {
+        const auto& draw = *draws[i];
+        firstRow = (std::min)(firstRow, int(draw.bounds.top));
+        lastRow = (std::max)(lastRow, int(draw.bounds.bottom));
+        const auto* mask = draw.gradient.positionedOpacity.get();
+        if (!mask) continue;
+        const auto key = std::make_pair(mask, draw.gradient.paintGroup);
+        const auto old = std::find(scopes.begin(), scopes.end(), key);
+        const size_t scope = old - scopes.begin();
+        if (old == scopes.end()) scopes.push_back(key);
+        positioned[i] = std::make_unique<PositionedDraw>(draw, scope);
+        left = (std::min)(left, int(draw.bounds.left));
+        right = (std::max)(right, int(draw.bounds.right));
+    }
+    if (scopes.empty())
+    {
+        for (size_t i = 0; i < count; ++i) draws[i]->Blend(top, bottom);
+        return;
+    }
+    const size_t width = right - left;
+    std::vector<float> above(width * scopes.size());
+    RasterizerNfo unused{};
+    COverlayMixer scalar(&unused, nullptr);
+    COverlayMixerSSE2 simd(&unused, nullptr);
+    const bool sse2 = (g_cpuid.m_flags & CCpuID::sse2) != 0;
+    for (int y = (std::max)(top, firstRow); y < (std::min)(bottom, lastRow); ++y)
+    {
+        std::fill(above.begin(), above.end(), 1.f);
+        for (size_t i = count; i-- > 0;)
+            if (positioned[i] && draws[i]->bounds.top <= y && draws[i]->bounds.bottom > y)
+                positioned[i]->Sample(y, left, above.data() + positioned[i]->scope * width);
+        for (size_t i = 0; i < count; ++i)
+        {
+            if (draws[i]->bounds.top > y || draws[i]->bounds.bottom <= y) continue;
+            if (!positioned[i])
+                draws[i]->Blend(y, y + 1);
+            else if (sse2)
+                positioned[i]->Blend(y, simd);
+            else
+                positioned[i]->Blend(y, scalar);
+        }
+    }
+#ifndef _M_X64
+    _mm_empty();
+#endif
+}
+}
+
+void BlendCapturedBands(const std::vector<const OverlayDraw*>& draws, int top, int bottom)
+{
+    for (size_t i = 0; i < draws.size();)
+    {
+        const auto* owner = draws[i]->captureOwner;
+        if (!owner || !owner->hasPositionedAlpha)
+        {
+            draws[i++]->Blend(top, bottom);
+            continue;
+        }
+        size_t end = i + 1;
+        while (end < draws.size() && draws[end]->captureOwner == owner) ++end;
+        BlendPositionedOverlays(draws.data() + i, end - i, top, bottom);
+        i = end;
+    }
+}
+#endif
+
+void OverlayDrawList::Blend() const
+{
+#ifdef _VSMOD
+    if (hasPositionedAlpha)
+    {
+        std::vector<const OverlayDraw*> commands;
+        commands.reserve(draws.size());
+        for (const auto& draw : draws) commands.push_back(&draw);
+        BlendPositionedOverlays(commands.data(), commands.size(), 0, INT_MAX);
+        return;
+    }
+#endif
+    for (const auto& draw : draws)
+        draw.Blend(draw.bounds.top, draw.bounds.bottom);
 }
 
 // Render a subpicture onto a surface.
@@ -1188,7 +1675,8 @@ void OverlayDraw::Blend(int top, int bottom) const
 // fBorder tells whether to render the border of the subs.
 #ifdef _VSMOD // patch m004. gradient colors
 CRect Rasterizer::Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int xsub, int ysub,
-                       const DWORD* switchpts, bool fBody, bool fBorder, int typ, MOD_GRADIENT& mod_grad, MOD_MOVEVC& mod_vc, MOD_BLEND mod_blendMode)
+                       const DWORD* switchpts, bool fBody, bool fBorder, int typ, MOD_GRADIENT& mod_grad, MOD_MOVEVC& mod_vc, MOD_BLEND mod_blendMode, bool reversePaint, bool applyPositionedAlpha,
+                       const KfxPaint::PaintBoundary* boundary)
 #else
 CRect Rasterizer::Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int xsub, int ysub,
                        const DWORD* switchpts, bool fBody, bool fBorder)
@@ -1212,6 +1700,51 @@ CRect Rasterizer::Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int x
     int xo = 0, yo = 0;
 
     int yBeforeClip = y;
+
+#ifdef _VSMOD
+    CRect paintBounds(0, 0, 0, 0);
+    if (mod_grad.paint)
+    {
+        const auto& parts = mod_grad.paint->parts;
+        const int last = typ ? 2 * typ + 2 : 4;
+        const int first = 2 * typ;
+        bool hasField = false;
+        for (int part = first; part < last; ++part)
+            hasField = hasField || (parts[part] && !parts[part]->positioned);
+        if (hasField)
+        {
+            PROFILE_RENDER_STAGE(PaintBounds);
+            int left = w, right = 0, top = h, bottom = 0;
+            const int offset = fBorder ? 1 : 0;
+            for (int row = 0; row < h; ++row)
+            {
+                const auto* mask = mpOverlayBuffer + 2 * ptrdiff_t(w) * row + offset;
+                int begin = 0;
+                while (begin < w && !mask[2 * begin]) ++begin;
+                if (begin == w) continue;
+                int end = w;
+                while (end > begin && !mask[2 * (end - 1)]) --end;
+                left = (std::min)(left, begin);
+                right = (std::max)(right, end);
+                top = (std::min)(top, row);
+                bottom = row + 1;
+            }
+            if (top < bottom)
+                paintBounds.SetRect(x + left, y + top, x + right, y + bottom);
+            else
+                paintBounds.SetRect(x, y, x+w, y+h);
+            if (activeOverlayDraws && top < bottom)
+                for (int part = first; part < last; ++part)
+                    if (parts[part] && !parts[part]->positioned)
+                    {
+                        auto& segments = activeOverlayDraws->paintSegments;
+                        const auto key = (uint64_t(mod_grad.paintGroup) << 32) | parts[part]->segment;
+                        const auto inserted = segments.emplace(key, paintBounds);
+                        if (!inserted.second) inserted.first->second |= paintBounds;
+                    }
+        }
+    }
+#endif
 
     // Again, limiting?
     if(x < r.left)
@@ -1255,12 +1788,26 @@ CRect Rasterizer::Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int x
     draw.maskPosition.curpos = CPoint(x, y);
     draw.maskPosition.alphamask = draw.alphaMask;
     draw.gradient = mod_grad;
+    if (!applyPositionedAlpha) draw.gradient.positionedOpacity.reset();
     draw.gradient.width = mOverlayWidth;
     draw.gradient.height = mOverlayHeight;
     draw.gradient.xoffset = xo;
     draw.gradient.yoffset = yo;
     draw.gradient.clipDiff = (std::max)(0, yBeforeClip + mOverlayHeight - int(clipRect.bottom));
     draw.colorType = typ;
+    if (boundary) draw.boundary = *boundary;
+    draw.reversePaint = reversePaint && mod_grad.paint;
+    if (mod_grad.paint)
+    {
+        draw.paintBounds = paintBounds;
+        draw.paintSegments = activeOverlayDraws ? &activeOverlayDraws->paintSegments : nullptr;
+    }
+    if (activeKfxPaint)
+    {
+        draw.paintFade = activeKfxPaint->fade;
+        draw.paintScaleX = activeKfxPaint->scaleX;
+        draw.paintScaleY = activeKfxPaint->scaleY;
+    }
     info.mod_blendMode = mod_blendMode;
 #else
     draw.maskPitch = spd.w;
@@ -1305,7 +1852,20 @@ CRect Rasterizer::Draw(SubPicDesc& spd, CRect& clipRect, byte* pAlphaMask, int x
 #endif
 
     if (activeOverlayDraws)
+    {
+#ifdef _VSMOD
+        draw.captureOwner = activeOverlayDraws;
+        if (draw.gradient.positionedOpacity) activeOverlayDraws->hasPositionedAlpha = true;
+#endif
         activeOverlayDraws->draws.push_back(std::move(draw));
+    }
+#ifdef _VSMOD
+    else if (draw.gradient.positionedOpacity)
+    {
+        const OverlayDraw* command = &draw;
+        BlendPositionedOverlays(&command, 1, bbox.top, bbox.bottom);
+    }
+#endif
     else
         draw.Blend(bbox.top, bbox.bottom);
     return bbox;
@@ -1365,6 +1925,7 @@ void MOD_MOVEVC::clear()
 
 byte MOD_MOVEVC::GetAlphaValue(int wx, int wy) const
 {
+    PROFILE_RENDER_STAGE(PaintClip);
     byte alpham;
     if(!enable)
     {

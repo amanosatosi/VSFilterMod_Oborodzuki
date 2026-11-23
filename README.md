@@ -2,6 +2,13 @@ VSFilterMod Oborodzuki, based on VSFilterMod by Vmoe Fansub
 
 New override tags: [wiki page](https://github.com/computerfan/VSFilterMod/wiki)
 
+The [KFX paint extensions guide](docs/kfx-paint-extensions.md) covers attached color and alpha
+gradients, sliding transforms, and extended color fades.
+The [Round 2 guide](docs/mangetsu-extensions-round-2.md) covers native outlines, event boxes,
+positioned paint, karaoke, numeric expressions, motion, and text alignment.
+The [Round 3 guide](docs/mangetsu-extensions-round-3.md) covers native furigana, vertical and
+column layout, curved text, geometric warping, and pattern paint.
+
 Important note: **DO NOT use mod tags in a softsub (ASS file) distribution**, because most players just ignore them, and they may not efficient enough for real-time rendering.
 
 Base branches:

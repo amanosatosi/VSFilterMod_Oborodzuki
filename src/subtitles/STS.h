@@ -25,6 +25,7 @@
 #include <wxutil.h>
 #include "TextFile.h"
 #include "GFN.h"
+#include "PaintExtensions.h"
 
 unsigned SubtitleFontRevision();
 
@@ -168,6 +169,11 @@ public:
     MOD_PNGIMAGE	b_images[4];
 
     int clipDiff;
+    std::shared_ptr<const KfxPaint::Sources> paint;
+    KfxPaint::Source positionedOpacity;
+    unsigned legacyParts = 0;
+    int paintOffsetY = 0;
+    unsigned paintGroup = 0;
 
     MOD_GRADIENT();
     bool operator == (MOD_GRADIENT& mg);
@@ -183,6 +189,8 @@ class MOD_DISTORT
 public:
     double  pointsx[3]; //P1-P3
     double  pointsy[3]; //P1-P3
+    double  x0 = 0, y0 = 0;
+    bool extended = false;
     bool enabled;
 
     MOD_DISTORT();
@@ -213,7 +221,7 @@ class STSStyle
 public:
     CRect	marginRect; // measured from the sides
     int		scrAlignment; // 1 - 9: as on the numpad, 0: default
-    int		borderStyle; // 0: outline, 1: opaque box
+    int		borderStyle; // 0: outline, 1: opaque box, 2: event box, 3: geometric outline
     double	outlineWidthX, outlineWidthY;
     double	shadowDepthX, shadowDepthY;
     COLORREF colors[4]; // usually: {primary, secondary, outline/background, shadow}
@@ -243,6 +251,11 @@ public:
     MOD_RANDOM mod_rand;
     // patch m004. gradient colors
     MOD_GRADIENT mod_grad;
+    std::shared_ptr<const KfxPaint::OutlineStyle> nativeOutline;
+    std::shared_ptr<const KfxPaint::OutlineStyle> boxRings;
+    std::shared_ptr<const KfxPaint::BoxShape> boxShape;
+    std::shared_ptr<const KfxPaint::DecorationPaint> decoration;
+    double softScale, objectScale; // independent percentages
     // patch m007. symbol rotating
     int mod_fontOrient;
     // patch m008. distort
@@ -342,9 +355,16 @@ class CSimpleTextSubtitle : public CAtlArray<STSEntry>
 
 protected:
     CAtlArray<STSSegment> m_segments;
+#ifdef _VSMOD
+    std::vector<STSEntry> m_metadataCarriers;
+    std::vector<std::vector<BYTE>> m_attachedFonts;
+#endif
     virtual void OnChanged() {}
 
 public:
+#ifdef _VSMOD
+    std::vector<std::vector<BYTE>>& AttachedFontsForImport() { return m_attachedFonts; }
+#endif
     CString m_name;
     LCID m_lcid;
     exttype m_exttype;
