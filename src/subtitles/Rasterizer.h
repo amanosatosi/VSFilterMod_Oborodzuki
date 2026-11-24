@@ -197,9 +197,9 @@ protected:
     int mOffsetX, mOffsetY;
     int mOverlayWidth, mOverlayHeight;
     byte *mpOverlayBuffer;
+    void _TrashPath();
 
 private:
-    void _TrashPath();
     void _TrashOverlay();
     void _TrashScanBuffers();
     void _ReallocEdgeBuffer(size_t edges);

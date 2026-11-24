@@ -362,25 +362,8 @@ bool Rasterizer::CopyPath(const POINT* points, const BYTE* types, size_t count)
 
 bool Rasterizer::EndPath(HDC hdc)
 {
-    ::CloseFigure(hdc);
-
-    if(::EndPath(hdc))
-    {
-        mPathPoints = GetPath(hdc, NULL, NULL, 0);
-
-        if(!mPathPoints)
-            return true;
-
-        mpPathTypes = (BYTE*)malloc(sizeof(BYTE) * mPathPoints);
-        mpPathPoints = (POINT*)malloc(sizeof(POINT) * mPathPoints);
-
-        if(mPathPoints == GetPath(hdc, mpPathPoints, mpPathTypes, mPathPoints))
-            return true;
-    }
-
-    ::AbortPath(hdc);
-
-    return false;
+    _TrashPath();
+    return PartialEndPath(hdc, 0, 0);
 }
 
 bool Rasterizer::PartialBeginPath(HDC hdc, bool bClearPath)
@@ -393,56 +376,42 @@ bool Rasterizer::PartialBeginPath(HDC hdc, bool bClearPath)
 
 bool Rasterizer::PartialEndPath(HDC hdc, long dx, long dy)
 {
+    const auto fail = [&] {
+        ::AbortPath(hdc);
+        _TrashPath();
+        return false;
+    };
     ::CloseFigure(hdc);
+    if (!::EndPath(hdc)) return fail();
+    const int count = ::GetPath(hdc, nullptr, nullptr, 0);
+    if (count == 0) return true;
+    if (count < 0 || size_t(count) > SIZE_MAX / sizeof(POINT) - mPathPoints)
+        return fail();
 
-    if(::EndPath(hdc))
-    {
-        int nPoints;
-        BYTE* pNewTypes;
-        POINT* pNewPoints;
+    const size_t total = mPathPoints + size_t(count);
+    // GDI requires an aligned output buffer even for its byte-sized path types.
+    // An appended glyph can begin at any byte in our packed type array.
+    const size_t typeOffset = (mPathPoints + sizeof(DWORD) - 1) & ~(sizeof(DWORD) - 1);
+    auto* types = static_cast<BYTE*>(realloc(mpPathTypes, typeOffset + size_t(count)));
+    if (!types) return fail();
+    mpPathTypes = types;
+    auto* points = static_cast<POINT*>(realloc(mpPathPoints, total * sizeof(POINT)));
+    if (!points) return fail();
+    mpPathPoints = points;
 
-        nPoints = GetPath(hdc, NULL, NULL, 0);
-
-        if(!nPoints)
-            return true;
-
-        pNewTypes = (BYTE*)realloc(mpPathTypes, (mPathPoints + nPoints) * sizeof(BYTE));
-        pNewPoints = (POINT*)realloc(mpPathPoints, (mPathPoints + nPoints) * sizeof(POINT));
-
-        if(pNewTypes)
-            mpPathTypes = pNewTypes;
-
-        if(pNewPoints)
-            mpPathPoints = pNewPoints;
-
-        BYTE* pTypes = DNew BYTE[nPoints];
-        POINT* pPoints = DNew POINT[nPoints];
-
-        if(pNewTypes && pNewPoints && nPoints == GetPath(hdc, pPoints, pTypes, nPoints))
+    auto* added = points + mPathPoints;
+    if (::GetPath(hdc, added, types + typeOffset, count) != count)
+        return fail();
+    if (typeOffset != mPathPoints)
+        memmove(types + mPathPoints, types + typeOffset, size_t(count));
+    if (dx || dy)
+        for (int i = 0; i < count; ++i)
         {
-            for(ptrdiff_t i = 0; i < nPoints; ++i)
-            {
-                mpPathPoints[mPathPoints + i].x = pPoints[i].x + dx;
-                mpPathPoints[mPathPoints + i].y = pPoints[i].y + dy;
-                mpPathTypes[mPathPoints + i] = pTypes[i];
-            }
-
-            mPathPoints += nPoints;
-
-            delete[] pTypes;
-            delete[] pPoints;
-            return true;
+            added[i].x += dx;
+            added[i].y += dy;
         }
-        else
-            DebugBreak();
-
-        delete[] pTypes;
-        delete[] pPoints;
-    }
-
-    ::AbortPath(hdc);
-
-    return false;
+    mPathPoints = total;
+    return true;
 }
 
 bool Rasterizer::ScanConvert(bool geometric)

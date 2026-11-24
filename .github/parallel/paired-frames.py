@@ -51,7 +51,7 @@ def main():
     parser.add_argument("baseline", type=Path)
     parser.add_argument("candidate", type=Path)
     parser.add_argument("fixture", type=Path)
-    parser.add_argument("--workers", required=True, type=int, choices=range(1, 9))
+    parser.add_argument("--workers", required=True, type=int, choices=range(1, 13))
     parser.add_argument("--first-ms", type=int, default=1000)
     parser.add_argument("--last-ms", type=int, default=4999)
     parser.add_argument("--frames", type=int, default=60)

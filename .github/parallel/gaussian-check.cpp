@@ -8,6 +8,23 @@
 
 int main()
 {
+    for (double sigma : {0.000001, 203.5, 204., 256., 1024.}) {
+        GaussianKernel filter(sigma);
+        long long sum = 0;
+        for (int i = 0; i < filter.width; ++i) {
+            if (filter.kernel[i] < 0 || filter.kernel[i] != filter.kernel[filter.width - i - 1])
+                return 1;
+            sum += filter.kernel[i];
+        }
+        if (sum != filter.divisor || sum <= 0 || sum * 255 > INT_MAX)
+            return 1;
+        if (sigma >= 204 && !filter.kernel[filter.width / 4])
+            return 1;
+        std::vector<unsigned char> row(filter.width, 173), out(row.size());
+        SeparableFilterX<1>(row.data(), out.data(), filter.width, 1, filter.width,
+            filter.kernel, filter.width, filter.divisor, 0);
+        if (row != out) return 1;
+    }
     std::mt19937 random(719);
     unsigned cases = 0;
     for (double sigma : {.42, .55, .8, 1., 1.5, 2., 3., 4., 6., 9., 20., 45.}) {

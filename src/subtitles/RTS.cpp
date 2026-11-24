@@ -2124,10 +2124,19 @@ bool CText::CreatePath()
                 return(false);
             }
 
-            PartialBeginPath(g_hDC, bFirstPath);
+            if (!PartialBeginPath(g_hDC, bFirstPath))
+            {
+                _TrashPath();
+                return false;
+            }
             bFirstPath = false;
-            TextOutW(g_hDC, 0, 0, s, 1);
-            PartialEndPath(g_hDC, width, 0);
+            if (!TextOutW(g_hDC, 0, 0, s, 1))
+            {
+                ::AbortPath(g_hDC);
+                _TrashPath();
+                return false;
+            }
+            if (!PartialEndPath(g_hDC, width, 0)) return false;
 
             width += extent.cx + (int)m_style.fontSpacing;
         }
@@ -2141,11 +2150,14 @@ bool CText::CreatePath()
             return(false);
         }
 
-        const bool begun = BeginPath(g_hDC);
-        const bool drawn = !!TextOutW(g_hDC, 0, 0, m_str, m_str.GetLength());
-        const bool ended = EndPath(g_hDC);
-        if (geometry && !geometry->hasPath && begun && drawn && ended && selected &&
-            font.GetSafeHandle() && (!mPathPoints || (mpPathPoints && mpPathTypes)))
+        if (!BeginPath(g_hDC)) return false;
+        if (!TextOutW(g_hDC, 0, 0, m_str, m_str.GetLength()))
+        {
+            ::AbortPath(g_hDC);
+            return false;
+        }
+        if (!EndPath(g_hDC)) return false;
+        if (geometry && !geometry->hasPath && selected && font.GetSafeHandle())
             activeTextGeometry->SavePath(*geometry, mpPathPoints, mpPathTypes, mPathPoints);
     }
 

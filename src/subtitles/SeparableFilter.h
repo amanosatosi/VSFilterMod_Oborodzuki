@@ -27,6 +27,7 @@
 #include <omp.h>
 #endif
 #include <math.h>
+#include <climits>
 #include <algorithm>
 #include <emmintrin.h>
 #include <vector>
@@ -135,7 +136,10 @@ struct GaussianKernel
         width = (int)(sigma * 3 + 0.5) | 1; // binary-or with 1 to make sure the number is odd
         if(width < 3) width = 3;
         kernel = DNew int[width];
-        kernel[width/2] = (int)(NormalDist(sigma, 0) * 255);
+        const double peak = NormalDist(sigma, 0) * 255;
+        // At very small sigma every off-centre tap is zero. A unit impulse
+        // keeps the normalized result exact without overflowing the pixel sum.
+        kernel[width/2] = peak <= INT_MAX / 255 ? int(peak) : 1;
         divisor = kernel[width/2];
         for(int x = width / 2 - 1; x >= 0; x--)
         {
@@ -143,6 +147,22 @@ struct GaussianKernel
             divisor += val * 2;
             kernel[x] = val;
             kernel[width - x - 1] = val;
+        }
+        if (divisor == 0)
+        {
+            // A broad Gaussian can round every individual tap to zero.
+            // Quantize cumulative mass so the mirrored kernel retains both
+            // its shape and a nonzero, safely representable normalization.
+            double mass = 0;
+            int previous = 0;
+            for (int x = 0; x <= width / 2; ++x)
+            {
+                mass += 65536.0 * NormalDist(sigma, width / 2 - x);
+                const int cumulative = int(mass + 0.5);
+                kernel[x] = kernel[width - x - 1] = cumulative - previous;
+                previous = cumulative;
+            }
+            divisor = 2 * previous - kernel[width / 2];
         }
     }
     inline ~GaussianKernel()

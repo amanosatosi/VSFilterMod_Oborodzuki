@@ -21,8 +21,8 @@ if sys.argv[1:] == ["--fixtures-only"]:
     raise SystemExit()
 cpu = os.cpu_count() or 1
 print("Checking concurrent instances and repeated teardown", flush=True)
-for count in (4, 32):
-    subprocess.run(["hosts/concurrent.exe", DLL, str((ROOT / f"overlap-{count}.ass").resolve())],
+for count, workers in ((4, 4), (32, 4), (32, 12)):
+    subprocess.run(["hosts/concurrent.exe", DLL, str((ROOT / f"overlap-{count}.ass").resolve()), str(workers)],
                    check=True, timeout=180)
 
 baseline = str(Path("threading-baseline/renderer/renderer.dll").resolve(strict=True))
