@@ -188,8 +188,8 @@ jobs:
         with:
           name: oborodzuki-benchmark-windows-x64-${{ github.sha }}
           path: |
-            portable-dist/*.zip
-            portable-dist/*.sha256
+            portable-dist/Oborodzuki-Benchmark-*.zip
+            portable-dist/Oborodzuki-Benchmark-*.zip.sha256
           if-no-files-found: error
           compression-level: 0
           retention-days: 60

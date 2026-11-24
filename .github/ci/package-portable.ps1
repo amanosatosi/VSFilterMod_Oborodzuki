@@ -23,13 +23,11 @@ Assert-KfxPe benchmark-harness/render-bench.exe $false
 Copy-Item benchmark-harness "$binaries/hosts" -Recurse
 
 $pythonVersion = '3.13.11'
-$pythonZip = Join-Path $dist 'python-runtime.tmp'
-Invoke-WebRequest "https://www.python.org/ftp/python/$pythonVersion/python-$pythonVersion-embed-amd64.zip" -OutFile $pythonZip
-if ((Get-FileHash $pythonZip).Hash -cne '1EC066FB61BA5E8C73E29E048CD07C26850F74585E3A116005135B31B8004890') {
+$pythonArchive = Join-Path $env:RUNNER_TEMP 'oborodzuki-python-embed.zip'
+Invoke-WebRequest "https://www.python.org/ftp/python/$pythonVersion/python-$pythonVersion-embed-amd64.zip" -OutFile $pythonArchive
+if ((Get-FileHash $pythonArchive).Hash -cne '1EC066FB61BA5E8C73E29E048CD07C26850F74585E3A116005135B31B8004890') {
     throw 'Embedded Python checksum mismatch'
 }
-$pythonArchive = "$pythonZip.zip"
-Move-Item $pythonZip $pythonArchive
 Expand-Archive $pythonArchive $runtime
 Get-ChildItem $runtime -Filter '*._pth' | ForEach-Object {
     Add-Content -LiteralPath $_.FullName -Value '../.github/ci' -Encoding ascii

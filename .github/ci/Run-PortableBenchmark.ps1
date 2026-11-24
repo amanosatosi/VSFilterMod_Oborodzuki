@@ -158,6 +158,8 @@ try {
         Write-RunLog 'Using the exact revision in this extracted portable ZIP.'
         $root
     } else { Get-Package }
+    $env:GH_TOKEN = $null
+    $env:GITHUB_TOKEN = $null
     & "$package/runtime/python.exe" -B "$package/.github/ci/portable_benchmark.py" $results
     $exitCode = $LASTEXITCODE
     if ($exitCode) { Write-RunLog "Benchmark ended with exit code $exitCode. See the reports and log." }

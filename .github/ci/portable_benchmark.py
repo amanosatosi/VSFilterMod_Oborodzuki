@@ -515,6 +515,10 @@ def main(results):
     write_json(results / "results.json", record)
     result_code = 1
     progress = None
+    keep_awake = ctypes.WinDLL("kernel32").SetThreadExecutionState
+    keep_awake.argtypes = (wintypes.DWORD,)
+    keep_awake.restype = wintypes.DWORD
+    awake = False
     with ((results / "benchmark.log").open("a", encoding="utf-8", buffering=1) as log,
           (results / "correctness-report.txt").open("w", encoding="utf-8", buffering=1) as checks,
           (results / "frame-times.csv").open("w", newline="", encoding="utf-8-sig") as times):
@@ -530,6 +534,9 @@ def main(results):
             record["harness"] = read_json(HOST / "build.json")
             record["system"].update(windows_hardware(), registered_fonts=registered_fonts(), python=platform.python_version())
             system = record["system"]
+            # Keep an unattended run awake without keeping the screen on.
+            awake = bool(keep_awake(0x80000001))
+            system["sleep_inhibited_during_run"] = awake
             workers = worker_counts(system["available_logical_processors"], system["physical_cores"])
             record["workers"] = workers
             plan = inspect_fixture(ROOT / "fixtures" / "op.fx.4testing.ass")
@@ -586,6 +593,8 @@ def main(results):
             log.write(record["error"] + "\n")
             checks.write(f"{record['status'].upper()}: {record['error']}\n")
         finally:
+            if awake:
+                keep_awake(0x80000000)
             record["finished_at"] = datetime.now().astimezone().isoformat()
             if progress:
                 progress.finish(record["completed"])
