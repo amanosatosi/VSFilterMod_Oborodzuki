@@ -317,9 +317,14 @@ public:
 
 class EventWorkerPool
 {
+#ifdef OBORODZUKI_PROFILE
+    static constexpr unsigned maxWorkers = 8; // Keep the v2 profile statistics layout.
+#else
+    static constexpr unsigned maxWorkers = 12;
+#endif
     std::vector<std::thread> threads;
     mutable std::mutex mutex;
-    std::condition_variable ready[7], finished;
+    std::condition_variable ready[maxWorkers - 1], finished;
     const std::vector<std::function<void()>>* tasks = nullptr;
     std::atomic<size_t> next{0};
     size_t generation = 0;
@@ -460,7 +465,7 @@ public:
         {
             wchar_t* end = nullptr;
             const auto count = wcstoul(option, &end, 10);
-            if (end != option && !*end && count >= 1 && count <= 8)
+            if (end != option && !*end && count >= 1 && count <= maxWorkers)
                 workers = unsigned(count);
         }
     }

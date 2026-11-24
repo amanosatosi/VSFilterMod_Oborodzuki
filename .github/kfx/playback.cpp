@@ -24,6 +24,7 @@
 // Shared implementations from render-bench.cpp, compiled with its entry point renamed.
 uint64_t cpu_ticks();
 uint64_t frame_hash(const std::vector<uint8_t>& pixels);
+void benchmark_progress(int completed, int total, std::chrono::steady_clock::time_point& previous);
 void blend_legacy(const ASS_Image* image, uint8_t* pixels);
 void blend_rgba(const ASS_ImageRGBA* image, uint8_t* pixels);
 
@@ -101,6 +102,11 @@ void play(const Playback& playback, Render render, double setupMs, int parsedEve
         reset();
     const auto passCpu = cpu_ticks();
     const auto passStart = Clock::now();
+    const bool portable = std::getenv("OBORODZUKI_BENCH_PORTABLE") != nullptr;
+    Clock::time_point progress;
+    const int total = playback.endFrame - playback.firstFrame;
+    if (portable)
+        benchmark_progress(0, total, progress);
     for (int index = playback.firstFrame; index < playback.endFrame; ++index) {
         const int64_t presentationNs = int64_t(index) * 1000000000 / fps;
         const int renderTimestampMs = index * 1000 / fps;
@@ -118,7 +124,9 @@ void play(const Playback& playback, Render render, double setupMs, int parsedEve
             << ',' << frameCpu << ',' << std::hex << std::setw(16) << std::setfill('0') << hash << std::dec << '\n';
         if (std::binary_search(playback.captures.begin(), playback.captures.end(), index))
             capture_frame(playback.output, index, pixels);
-        if ((index + 1) % 600 == 0)
+        if (portable)
+            benchmark_progress(index + 1 - playback.firstFrame, total, progress);
+        else if ((index + 1) % 600 == 0)
             std::cout << "Rendered through frame " << index + 1 << '/' << playback.endFrame << std::endl;
     }
     const auto passMs = elapsed_ms(passStart);

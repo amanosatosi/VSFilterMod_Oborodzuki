@@ -1,6 +1,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -47,6 +48,40 @@ uint64_t cpu_ticks()
         return (uint64_t(t.dwHighDateTime) << 32) | t.dwLowDateTime;
     };
     return ticks(kernel) + ticks(user);
+}
+
+unsigned process_threads()
+{
+    const auto snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE)
+        throw std::runtime_error("Could not inspect benchmark process threads");
+    THREADENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+    unsigned count = 0;
+    if (Thread32First(snapshot, &entry)) {
+        do {
+            if (entry.th32OwnerProcessID == GetCurrentProcessId())
+                ++count;
+            entry.dwSize = sizeof(entry);
+        } while (Thread32Next(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+    if (!count)
+        throw std::runtime_error("No threads found for benchmark process");
+    return count;
+}
+
+// Emit progress between timed calls and throttle it by wall time.
+void benchmark_progress(int completed, int total, Clock::time_point& previous)
+{
+    if (completed && completed != total && completed % 8)
+        return;
+    const auto now = Clock::now();
+    if (completed && completed != total && now - previous < std::chrono::seconds(1))
+        return;
+    std::fprintf(stderr, "BENCH_PROGRESS %d %d\n", completed, total);
+    std::fflush(stderr);
+    previous = now;
 }
 
 void blend_legacy(const ASS_Image* image, uint8_t* pixels)
@@ -122,6 +157,7 @@ void measure(Render render, const Workload& workload, double setup_ms,
     const bool real = workload.name == L"real";
     const bool regression = workload.name == L"regression";
     const bool iteration = std::getenv("OBORODZUKI_BENCH_ITERATION") != nullptr;
+    const bool portable = std::getenv("OBORODZUKI_BENCH_PORTABLE") != nullptr;
     const int count = regression ? 20 : real ? (iteration ? 60 : 240) : (iteration ? 120 : 600);
     auto time_at = [&workload, real, count, iteration](int i) {
         if (real)
@@ -147,10 +183,16 @@ void measure(Render render, const Workload& workload, double setup_ms,
     if (reset_profile)
         reset_profile();
     uint64_t cpu = 0;
+    timings.reserve(count);
+    Clock::time_point progress;
+    if (portable)
+        benchmark_progress(0, count, progress);
     for (int i = 0; i < count; ++i) {
         const auto [ms, ticks] = one_frame(time_at(i));
         timings.push_back(ms);
         cpu += ticks;
+        if (portable)
+            benchmark_progress(i + 1, count, progress);
     }
     constexpr auto stages = static_cast<unsigned>(RenderStage::Count);
     uint64_t ns[stages]{}, calls[stages]{};
@@ -180,7 +222,8 @@ void measure(Render render, const Workload& workload, double setup_ms,
     if (regression && hashes[2] != hashes.back())
         throw std::runtime_error("Rendered pixels changed after seeking back to 1500 ms");
 
-    std::sort(timings.begin(), timings.end());
+    auto sorted = timings;
+    std::sort(sorted.begin(), sorted.end());
     const double total = std::accumulate(timings.begin(), timings.end(), 0.0);
     const double cpu_ms = cpu / 10000.0;
     PROCESS_MEMORY_COUNTERS memory{};
@@ -189,13 +232,19 @@ void measure(Render render, const Workload& workload, double setup_ms,
     std::printf("{\"frames\":%d,\"warmup_frames\":%d,\"setup_ms\":%.6f,\"first_frame_ms\":%.6f,\"avg_ms\":%.6f,"
         "\"median_ms\":%.6f,\"p95_ms\":%.6f,\"p99_ms\":%.6f,\"worst_ms\":%.6f,\"fps\":%.3f,\"cpu_ms\":%.3f,"
         "\"cpu_percent_of_one_core\":%.3f,\"peak_working_set_bytes\":%llu,\"hashes\":[",
-        count, warmup, setup_ms, first, total / count, (timings[count / 2 - 1] + timings[count / 2]) / 2,
-        timings[(count * 95 + 99) / 100 - 1], timings[(count * 99 + 99) / 100 - 1], timings.back(),
+        count, warmup, setup_ms, first, total / count, (sorted[count / 2 - 1] + sorted[count / 2]) / 2,
+        sorted[(count * 95 + 99) / 100 - 1], sorted[(count * 99 + 99) / 100 - 1], sorted.back(),
         1000 * count / total, cpu_ms, 100 * cpu_ms / total,
         static_cast<unsigned long long>(memory.PeakWorkingSetSize));
     for (size_t i = 0; i < hashes.size(); ++i)
         std::printf("%s\"%016llx\"", i ? "," : "", static_cast<unsigned long long>(hashes[i]));
     std::printf("]");
+    if (portable) {
+        std::printf(",\"frame_times_ms\":[");
+        for (size_t i = 0; i < timings.size(); ++i)
+            std::printf("%s%.6f", i ? "," : "", timings[i]);
+        std::printf("]");
+    }
     if (read_profile) {
         std::printf(",\"profile\":[");
         for (unsigned i = 0; i < stages; ++i)
@@ -220,13 +269,27 @@ void run_csri(HMODULE dll, const std::vector<char>& script, const Workload& work
         throw std::runtime_error("CSRI initialization failed");
     auto reset = reinterpret_cast<ProfileReset>(GetProcAddress(dll, "csri_oborodzuki_profile_reset"));
     auto read = reinterpret_cast<ProfileRead>(GetProcAddress(dll, "csri_oborodzuki_profile_read_v3"));
-    measure([&](int t, uint8_t* pixels) {
+    auto render = [&](int t, uint8_t* pixels) {
         csri_frame frame{};
         frame.pixfmt = format.pixfmt;
         frame.planes[0] = pixels;
         frame.strides[0] = pitch;
         csri_render(instance, &frame, t / 1000.0);
-    }, workload, elapsed(start), reset, read);
+    };
+    if (workload.name == L"worker-probe") {
+        std::vector<uint8_t> pixels(pitch * height);
+        const auto before = process_threads();
+        render(0, pixels.data());
+        render(1500, pixels.data());
+        render(3200, pixels.data());
+        const auto after = process_threads();
+        if (after < before)
+            throw std::runtime_error("Unexpected thread teardown during worker probe");
+        std::printf("{\"observed_workers\":%u,\"threads_before\":%u,\"threads_after\":%u}\n",
+            after - before + 1, before, after);
+    } else {
+        measure(render, workload, elapsed(start), reset, read);
+    }
     csri_close(instance);
 }
 

@@ -9,13 +9,15 @@ on:
       - 'vapoursynth/**'
       - '.gitattributes'
       - '.github/ci/**'
+      - '.github/parallel/scale_fixtures.py'
+      - 'Run-Benchmark.bat'
       - '.github/workflows/benchmark.yml'
   workflow_dispatch:
     inputs:
       suite:
         description: Benchmark suite
         type: choice
-        options: [iteration, full]
+        options: [iteration, full, portable]
         default: full
 
 permissions:
@@ -23,7 +25,7 @@ permissions:
 
 env:
   VCPKG_REVISION: f3419f137f1a1e79b33b880ae6845f873d87820b
-  BENCH_SUITE: "${{ inputs.suite || (contains(github.event.head_commit.message, 'Benchmark-Suite: full') && 'full') || 'iteration' }}"
+  BENCH_SUITE: "${{ inputs.suite || (contains(github.event.head_commit.message, 'Portable-Benchmark: package') && 'portable') || (contains(github.event.head_commit.message, 'Benchmark-Suite: full') && 'full') || 'iteration' }}"
 
 jobs:
   prepare:
@@ -158,8 +160,43 @@ jobs:
           path: bundle/
           if-no-files-found: error
 
+  portable:
+    name: Package Windows x64 portable benchmark
+    if: github.ref_name == 'astra/extra-optimization-JustInCase'
+    needs: [prepare, build-renderer, harness]
+    runs-on: windows-2022
+    timeout-minutes: 15
+    env:
+      BENCH_RENDERERS: ${{ needs.prepare.outputs.renderers }}
+      MANGETSU_REVISION: ${{ needs.prepare.outputs.mangetsu_revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: renderer-*
+          path: benchmark-bundles
+      - uses: actions/download-artifact@v4
+        with:
+          name: harness-${{ github.sha }}
+          path: benchmark-harness
+      - name: Assemble and verify the portable ZIP
+        shell: pwsh
+        run: .github/ci/package-portable.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oborodzuki-benchmark-windows-x64-${{ github.sha }}
+          path: |
+            portable-dist/*.zip
+            portable-dist/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 60
+
   compare:
     name: Compare renderer artifacts
+    if: inputs.suite != 'portable' && !contains(github.event.head_commit.message, 'Portable-Benchmark: package')
     needs: [prepare, build-renderer, harness]
     runs-on: windows-2022
     timeout-minutes: 45
@@ -192,6 +229,7 @@ jobs:
 
   profile:
     name: Profile instrumented Oborodzuki
+    if: inputs.suite != 'portable' && !contains(github.event.head_commit.message, 'Portable-Benchmark: package')
     needs: [prepare, harness]
     runs-on: windows-2022
     timeout-minutes: 30
