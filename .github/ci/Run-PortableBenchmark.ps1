@@ -40,6 +40,13 @@ function Read-GitHub($suffix) {
     Invoke-RestMethod -Uri "$api/$suffix" -Headers $headers -UseBasicParsing -TimeoutSec 30
 }
 
+function Get-Sha256($file) {
+    $stream = [IO.File]::OpenRead($file)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try { [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
+    finally { $algorithm.Dispose(); $stream.Dispose() }
+}
+
 function Save-Artifact($artifact, $file) {
     Add-Type -AssemblyName System.Net.Http
     $handler = [Net.Http.HttpClientHandler]::new()
@@ -107,7 +114,7 @@ function Get-Package {
         finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr); $secret.Dispose() }
         if (!(Save-Artifact $artifact $outer)) { throw 'GitHub denied the token access to this Actions artifact.' }
     }
-    if ((Get-FileHash -LiteralPath $outer).Hash.ToLowerInvariant() -cne $artifact.digest.Substring(7)) {
+    if ((Get-Sha256 $outer) -cne $artifact.digest.Substring(7)) {
         throw 'GitHub artifact SHA-256 mismatch.'
     }
     Write-RunLog 'Verifying and extracting the portable ZIP...'
@@ -117,7 +124,7 @@ function Get-Package {
     $zipName = "Oborodzuki-Benchmark-$revision-windows-x64.zip"
     $zip = Join-Path $download $zipName
     $checksum = Get-Content -LiteralPath "$zip.sha256" -Raw
-    if ($checksum.Trim() -cne ((Get-FileHash -LiteralPath $zip).Hash.ToLowerInvariant() + "  $zipName")) {
+    if ($checksum.Trim() -cne ((Get-Sha256 $zip) + "  $zipName")) {
         throw 'Portable ZIP SHA-256 mismatch.'
     }
     $destination = Join-Path $results 'package'
