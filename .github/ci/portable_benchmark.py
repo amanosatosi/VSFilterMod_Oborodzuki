@@ -1,4 +1,5 @@
 """Run the CI-built renderer hosts and record timings from this PC."""
+from collections import deque
 import csv
 import ctypes
 from ctypes import wintypes
@@ -196,6 +197,16 @@ class Progress:
             current = f"Current {bar(completed, total)} {completed}/{total} frames | Checking or saving"
         else:
             current = f"Current {bar(completed, total)} {completed}/{total} frames"
+            if self.phase == "Worker scaling" and self.workload not in ("kfx-sustained", "real", "kfx-sample"):
+                now = time.monotonic()
+                self.recent_frames.append((now, completed))
+                if completed >= total / 4 and len(self.recent_frames) == self.recent_frames.maxlen:
+                    rates = [(b[1] - a[1]) / (b[0] - a[0])
+                             for a, b in itertools.pairwise(self.recent_frames) if b[0] > a[0]]
+                    if rates and min(rates) > 0 and max(rates) <= 1.2 * min(rates):
+                        remaining = (total - completed) / statistics.median(rates)
+                        if remaining >= 1:
+                            current += f" | ETA ~{duration(remaining)}"
         print(("\x1b[2A" if self.previous_lines else "") + "\n".join(
             f"\r{line[:width].ljust(width)}" for line in (overall, label, current)), end="", flush=True)
         self.previous_lines = True
@@ -204,6 +215,7 @@ class Progress:
         if self.tty and not self.previous_lines:
             print("Starting local benchmark tests")
         self.index, self.phase, self.workload, self.engine, self.workers = index, phase, workload, engine, workers
+        self.recent_frames = deque(maxlen=4)
         self.update()
 
     def finish(self, completed):
@@ -352,6 +364,8 @@ def check_pixels(step, result, hashes, references, report):
 def aggregate(samples):
     grouped = {}
     for row in samples:
+        if row.get("correctness") != "passed":
+            continue
         key = tuple(row[field] for field in ("phase", "workload", "renderer", "workers"))
         grouped.setdefault(key, []).append(row)
     summaries = []
@@ -362,6 +376,9 @@ def aggregate(samples):
         one = grouped.get((*key[:3], 1))
         row["throughput_scaling"] = row["fps"] / statistics.median(s["fps"] for s in one) if one else None
         row["efficiency"] = row["throughput_scaling"] / row["workers"] if one else None
+        baseline = grouped.get((*key[:2], BASE, key[3]))
+        row["throughput_vs_baseline"] = (row["fps"] / statistics.median(s["fps"] for s in baseline)
+                                         if baseline and key[2] == CANDIDATE else None)
         row["comparison"] = ("Feature-dependent reference" if row["workload"] == "real" and
                              row["renderer"] not in MAX_WORKERS else
                              "Same-renderer scaling" if key[0] == "Worker scaling" else
@@ -372,7 +389,7 @@ def aggregate(samples):
 
 def csv_report(path, rows):
     columns = ["phase", "workload", "renderer", "workers", "completed_trials", *METRICS,
-               "throughput_scaling", "efficiency", "comparison"]
+               "throughput_scaling", "efficiency", "throughput_vs_baseline", "comparison"]
     with path.open("w", newline="", encoding="utf-8-sig") as output:
         writer = csv.DictWriter(output, columns)
         writer.writeheader()
@@ -428,6 +445,7 @@ def make_report(results, record):
         "Renderer wall time includes compositing. FPS is measured frames divided by summed rendering wall time. "
         "Warmup, clearing, RGB hashing and process startup are excluded from renderer timings.",
         "Aggregate columns are medians of per-trial statistics. Each speedup uses the same renderer and workload at one worker.",
+        "Candidate vs baseline compares FPS on the same workload and worker count after RGB validation.",
         "The pinned baseline supports up to eight workers. Candidate-only worker settings use the candidate's one-worker reference.",
         "Original VSFilterMod and Mangetsu runs are descriptive comparisons. The real ASS uses extensions with differing renderer support. "
         "RGB equality is required between the candidate and Oborodzuki baseline, and across settings and trials.",
@@ -437,14 +455,15 @@ def make_report(results, record):
     if record.get("error"):
         notes.append(f"Error: {record['error']}")
     headings = ["Phase", "Workload", "Renderer", "Workers", "Trials", "Avg ms", "Median ms",
-                "P95 ms", "P99 ms", "FPS", "Peak MiB", "Scaling", "Efficiency"]
+                "P95 ms", "P99 ms", "FPS", "Peak MiB", "Scaling", "Efficiency", "Candidate vs baseline"]
     table = []
     for r in rows:
         table.append([r["phase"], r["workload"], r["renderer"], str(r["workers"]),
                       str(r["completed_trials"]), *(f"{r[key]:.4f}" for key in METRICS[:4]),
                       f"{r['fps']:.2f}", f"{r['peak_working_set_bytes'] / 2**20:.1f}",
                       f"{r['throughput_scaling']:.2f}×" if r["throughput_scaling"] is not None else "—",
-                      f"{r['efficiency']:.1%}" if r["efficiency"] is not None else "—"])
+                      f"{r['efficiency']:.1%}" if r["efficiency"] is not None else "—",
+                      f"{r['throughput_vs_baseline']:.2f}×" if r["throughput_vs_baseline"] is not None else "—"])
     md = ["# Oborodzuki local benchmark", "", *[f"- {note}" for note in notes], "",
           "| " + " | ".join(headings) + " |", "|" + "---|" * len(headings)]
     md.extend("| " + " | ".join(row) + " |" for row in table)

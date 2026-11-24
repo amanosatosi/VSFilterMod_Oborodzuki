@@ -1,4 +1,5 @@
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 $root = (Resolve-Path "$PSScriptRoot/../..").Path
 $repo = 'amanosatosi/VSFilterMod_Oborodzuki'
 $branch = 'astra/extra-optimization-JustInCase'
@@ -79,11 +80,11 @@ function Get-Package {
     $ref = Read-GitHub "git/ref/heads/$branch"
     $revision = $ref.object.sha
     if ($revision -cnotmatch '^[a-f0-9]{40}$') { throw 'GitHub did not return a valid branch revision.' }
-    $runs = Read-GitHub "actions/workflows/benchmark.yml/runs?branch=$encodedBranch&head_sha=$revision&status=success&per_page=30"
+    $runs = Read-GitHub "actions/workflows/benchmark.yml/runs?branch=$encodedBranch&head_sha=$revision&per_page=30"
     $name = "oborodzuki-benchmark-windows-x64-$revision"
     $artifact = $null
     foreach ($run in $runs.workflow_runs) {
-        if ($run.head_sha -cne $revision -or $run.conclusion -ne 'success') { continue }
+        if ($run.head_sha -cne $revision -or $run.status -ne 'completed' -or $run.conclusion -ne 'success') { continue }
         $found = Read-GitHub "actions/runs/$($run.id)/artifacts?name=$name"
         $artifact = $found.artifacts | Where-Object { $_.name -ceq $name -and !$_.expired } | Select-Object -First 1
         if ($artifact) { break }

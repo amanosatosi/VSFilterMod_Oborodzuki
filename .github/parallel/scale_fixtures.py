@@ -1,5 +1,7 @@
 """Shared worker-scaling fixtures."""
 
+from textwrap import dedent
+
 
 def scale_fixtures(source, root):
     fixture = source.read_text(encoding="utf-8")
@@ -16,7 +18,8 @@ def scale_fixtures(source, root):
                  "random": (16, r"\rnd0.2\rnds42\jitter(1,1,1,1,50,7)"),
                  "lua": (16, r"\eventstyle")}
     lua = root / "callbacks.lua"
-    lua.write_text("""counter = 0
+    lua.write_text(dedent("""\
+    counter = 0
     function eventstyle(line)
         counter = counter + 1
         local result = {style = {frz = counter % 7 * 2, fscx = 100 + line.id % 3 * 3}}
@@ -34,7 +37,7 @@ def scale_fixtures(source, root):
             if coverage > 0 then pixels:mix(x, y, line.user.color, 255) end
         end
     end
-    """, encoding="ascii")
+    """), encoding="ascii")
     for name, (count, effects) in scenarios.items():
         text = header
         if name == "lua":
