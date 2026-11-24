@@ -18,6 +18,23 @@ function Set-GitHubToken($token) {
     if ($token) { $headers['Authorization'] = "Bearer $token" }
 }
 
+function Get-CachedGitCredential {
+    if (!(Get-Command git -ErrorAction SilentlyContinue)) { return }
+    $previousInteractive = $env:GCM_INTERACTIVE
+    $previousPrompt = $env:GIT_TERMINAL_PROMPT
+    try {
+        $env:GCM_INTERACTIVE = 'never'
+        $env:GIT_TERMINAL_PROMPT = '0'
+        $credential = @('protocol=https', 'host=github.com', "path=$repo.git", '') |
+            & git credential fill 2>$null |
+            Where-Object { $_ -like 'password=*' } | Select-Object -First 1
+        if ($credential) { $credential.Substring(9) }
+    } finally {
+        $env:GCM_INTERACTIVE = $previousInteractive
+        $env:GIT_TERMINAL_PROMPT = $previousPrompt
+    }
+}
+
 function Read-GitHub($suffix) {
     Invoke-RestMethod -Uri "$api/$suffix" -Headers $headers -UseBasicParsing -TimeoutSec 30
 }
@@ -55,6 +72,7 @@ function Get-Package {
     if (!$token -and (Get-Command gh -ErrorAction SilentlyContinue)) {
         $token = & gh auth token --hostname github.com 2>$null
     }
+    if (!$token) { $token = Get-CachedGitCredential }
     Set-GitHubToken $token
     $encodedBranch = [Uri]::EscapeDataString($branch)
     Write-RunLog "Finding the portable build for $branch..."

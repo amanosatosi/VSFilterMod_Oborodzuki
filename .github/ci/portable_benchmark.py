@@ -135,7 +135,7 @@ def windows_hardware():
                 offset += record_size
     kernel.GetActiveProcessorCount.restype = wintypes.DWORD
     return {"physical_cores": physical, "logical_processors": kernel.GetActiveProcessorCount(0xffff),
-            "available_logical_processors": os.process_cpu_count() or os.cpu_count() or 1,
+            "available_logical_processors": getattr(os, "process_cpu_count", os.cpu_count)() or 1,
             "ram_bytes": memory_total}
 
 

@@ -196,7 +196,8 @@ jobs:
 
   compare:
     name: Compare renderer artifacts
-    if: inputs.suite != 'portable' && !contains(github.event.head_commit.message, 'Portable-Benchmark: package')
+    if: >-
+      inputs.suite != 'portable' && !contains(github.event.head_commit.message, 'Portable-Benchmark: package')
     needs: [prepare, build-renderer, harness]
     runs-on: windows-2022
     timeout-minutes: 45
@@ -229,7 +230,8 @@ jobs:
 
   profile:
     name: Profile instrumented Oborodzuki
-    if: inputs.suite != 'portable' && !contains(github.event.head_commit.message, 'Portable-Benchmark: package')
+    if: >-
+      inputs.suite != 'portable' && !contains(github.event.head_commit.message, 'Portable-Benchmark: package')
     needs: [prepare, harness]
     runs-on: windows-2022
     timeout-minutes: 30
