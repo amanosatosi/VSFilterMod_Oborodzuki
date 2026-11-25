@@ -19,8 +19,8 @@ def timestamp_ms(value):
     return ((h * 60 + m) * 60 + s) * 1000 + cs * 10
 
 
-def inspect_fixture():
-    data = FIXTURE.read_bytes()
+def inspect_fixture(fixture=FIXTURE):
+    data = fixture.read_bytes()
     sha = hashlib.sha256(data).hexdigest()
     if sha != EXPECTED_SHA256:
         raise ValueError(f"KFX input SHA-256 mismatch: {sha}")
@@ -89,7 +89,7 @@ def inspect_fixture():
     peak = max(range(FRAMES), key=active.__getitem__)
     captures = sorted({0, 5399, peak, *range(600, 5400, 600)})
     return {
-        "fixture": FIXTURE.as_posix(), "sha256": sha, "size_bytes": len(data),
+        "fixture": fixture.as_posix(), "sha256": sha, "size_bytes": len(data),
         "dialogue_events": len(events), "comment_events": comments,
         "zero_duration_events": sum(start == end for start, end in events),
         "first_event_ms": min(start for start, _ in events),

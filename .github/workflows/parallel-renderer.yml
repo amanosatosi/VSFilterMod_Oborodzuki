@@ -7,17 +7,19 @@ on:
         type: boolean
         default: true
   push:
-    branches: [feature/parallel-event-rendering, codex/kfx-paint-extensions, codex/mangetsu-extensions-round-2, codex/mangetsu-extensions-round-3, codex/mangetsu-extensions-round-4]
+    branches: [feature/parallel-event-rendering, codex/kfx-paint-extensions, codex/mangetsu-extensions-round-2, codex/mangetsu-extensions-round-3, codex/mangetsu-extensions-round-4, astra/extra-optimization-JustInCase]
     paths: ['src/**', '.github/parallel/**', '.github/workflows/parallel-renderer.yml']
 permissions:
   contents: read
   actions: read
 env:
+  MANGETSU_REVISION: 39499c79d933c3fdd30c669964d2758a7721d679
+  VCPKG_REVISION: f3419f137f1a1e79b33b880ae6845f873d87820b
   PARALLEL_FULL: "${{ inputs.full || contains(github.event.head_commit.message, 'Parallel-KFX full') }}"
   PARALLEL_QUICK: "${{ contains(github.event.head_commit.message, 'Parallel-KFX quick') }}"
-  KFX_ROUND2: "${{ github.ref_name == 'codex/mangetsu-extensions-round-2' || (github.ref_name == 'codex/mangetsu-extensions-round-3' || github.ref_name == 'codex/mangetsu-extensions-round-4') }}"
-  KFX_ROUND4: "${{ github.ref_name == 'codex/mangetsu-extensions-round-4' }}"
-  KFX_ROUND3: "${{ (github.ref_name == 'codex/mangetsu-extensions-round-3' || github.ref_name == 'codex/mangetsu-extensions-round-4') }}"
+  KFX_ROUND2: "${{ github.ref_name == 'codex/mangetsu-extensions-round-2' || github.ref_name == 'codex/mangetsu-extensions-round-3' || github.ref_name == 'codex/mangetsu-extensions-round-4' || github.ref_name == 'astra/extra-optimization-JustInCase' }}"
+  KFX_ROUND4: "${{ github.ref_name == 'codex/mangetsu-extensions-round-4' || github.ref_name == 'astra/extra-optimization-JustInCase' }}"
+  KFX_ROUND3: "${{ github.ref_name == 'codex/mangetsu-extensions-round-3' || github.ref_name == 'codex/mangetsu-extensions-round-4' || github.ref_name == 'astra/extra-optimization-JustInCase' }}"
 jobs:
   build:
     runs-on: windows-2022
@@ -26,7 +28,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: amanosatosi/libassmod
-          ref: 60e06ef0d4535c5403f446fd46b996df4d0d2560
+          ref: ${{ env.MANGETSU_REVISION }}
           path: benchmark-source
           sparse-checkout: |
             libass
@@ -37,7 +39,6 @@ jobs:
           call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
           pwsh -File .github\ci\build-bench-component.ps1 -Component candidate -Revision "%GITHUB_SHA%" || exit /b 1
           move bundle renderer || exit /b 1
-          set "MANGETSU_REVISION=60e06ef0d4535c5403f446fd46b996df4d0d2560"
           pwsh -File .github\kfx\build-harness.ps1 -Revision "%GITHUB_SHA%" || exit /b 1
           move bundle hosts || exit /b 1
           copy benchmark-source\test\fonts\furi-tight-ascent.ttf hosts\furi-tight-ascent.ttf || exit /b 1
@@ -55,8 +56,42 @@ jobs:
             renderer/
             hosts/
           if-no-files-found: error
+  build-mangetsu:
+    name: Build pinned Mangetsu for shared metadata and KFX paint tests
+    runs-on: windows-2022
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: amanosatosi/libassmod
+          ref: ${{ env.MANGETSU_REVISION }}
+          path: benchmark-source
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: microsoft/vcpkg
+          ref: ${{ env.VCPKG_REVISION }}
+          path: benchmark-vcpkg
+          persist-credentials: false
+      - uses: actions/cache@v4
+        with:
+          path: vcpkg-binaries
+          key: parallel-mangetsu-vcpkg-${{ env.VCPKG_REVISION }}-${{ runner.os }}
+      - name: Compile Mangetsu
+        shell: cmd
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+          where nasm >nul 2>&1 || choco install nasm --yes --no-progress || exit /b 1
+          set "PATH=%ProgramFiles%\NASM;%PATH%"
+          pwsh -NoProfile -File .github\ci\build-bench-component.ps1 -Component mangetsu -Revision "%MANGETSU_REVISION%" || exit /b 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: parallel-mangetsu-${{ env.MANGETSU_REVISION }}
+          path: bundle/
+          if-no-files-found: error
   compare:
-    needs: build
+    needs: [build, build-mangetsu]
     runs-on: windows-2022
     timeout-minutes: 90
     steps:
@@ -65,12 +100,21 @@ jobs:
         with:
           name: parallel-hosts-${{ github.sha }}
       - name: Download the previous parallel renderer
+        if: github.ref_name != 'astra/extra-optimization-JustInCase'
         uses: actions/download-artifact@v4
         with:
           name: parallel-hosts-${{ env.KFX_ROUND4 == 'true' && '393b0acc89129a4531fb95bd0367c52be5532951' || env.KFX_ROUND3 == 'true' && 'ddaec6149e323f8d0d690e60af0e7ea8a6ad1acc' || (env.KFX_ROUND2 == 'true' && 'f81f31adac460894914aeab362b9906ce50d603a' || (github.ref_name == 'codex/kfx-paint-extensions' && '20c6174b9cc15292f77ea99605f22df39faf539c' || 'b110ccac5d1b9b55410b1d50df46dfaf29468503')) }}
           run-id: ${{ env.KFX_ROUND4 == 'true' && '44356341316' || env.KFX_ROUND3 == 'true' && '44317693536' || (env.KFX_ROUND2 == 'true' && '44218421620' || (github.ref_name == 'codex/kfx-paint-extensions' && '44199501549' || '44151605518')) }}
           github-token: ${{ github.token }}
           path: threading-baseline
+      - name: Download the unmodified merged Round 4 renderer
+        if: github.ref_name == 'astra/extra-optimization-JustInCase'
+        uses: actions/download-artifact@v4
+        with:
+          name: renderer-baseline-79db5609394b6f27465cd7f24ccf804f803e075e
+          run-id: 45186296884
+          github-token: ${{ github.token }}
+          path: threading-baseline/renderer
       - name: Record actual runner hardware
         shell: pwsh
         run: |
@@ -79,14 +123,18 @@ jobs:
              image = $env:ImageVersion
              ram = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
              revision = $env:GITHUB_SHA } | ConvertTo-Json -Depth 4 | Set-Content parallel-results/environment.json
-      - name: Download the pinned Mangetsu paint reference
+      - name: Check effective alpha and outline reuse across seeks and resolution changes
+        if: github.ref_name == 'astra/extra-optimization-JustInCase'
+        run: python .github/parallel/coverage-check.py threading-baseline/renderer/renderer.dll renderer/renderer.dll
+      - name: Download this run's pinned Mangetsu DLL
         if: github.ref_name != 'feature/parallel-event-rendering'
         uses: actions/download-artifact@v4
         with:
-          name: renderer-mangetsu-60e06ef0d4535c5403f446fd46b996df4d0d2560
-          run-id: 44199501683
-          github-token: ${{ github.token }}
+          name: parallel-mangetsu-${{ env.MANGETSU_REVISION }}
           path: mangetsu-paint
+      - name: Compare shared Actor Colorcoding through CSRI and Mangetsu
+        if: github.ref_name == 'astra/extra-optimization-JustInCase'
+        run: python .github/parallel/actor-colorcoding.py
       - name: Compare KFX paint pixels, seeks and worker budgets
         if: github.ref_name != 'feature/parallel-event-rendering'
         run: python .github/parallel/paint-check.py

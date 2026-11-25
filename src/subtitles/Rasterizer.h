@@ -22,6 +22,7 @@
 #pragma once
 
 #include <memory>
+#include <array>
 #include <map>
 #include <vector>
 #include "..\SubPic\ISubPic.h"
@@ -196,9 +197,9 @@ protected:
     int mOffsetX, mOffsetY;
     int mOverlayWidth, mOverlayHeight;
     byte *mpOverlayBuffer;
+    void _TrashPath();
 
 private:
-    void _TrashPath();
     void _TrashOverlay();
     void _TrashScanBuffers();
     void _ReallocEdgeBuffer(size_t edges);
@@ -223,6 +224,26 @@ public:
     bool PartialBeginPath(HDC hdc, bool bClearPath);
     bool PartialEndPath(HDC hdc, long dx, long dy);
     bool ScanConvert(bool geometric = false);
+    // Owned by a renderer's text context (one per preparation worker).
+    // Each slot admits at most 64 KiB of path and span data.
+    class OutlineCache
+    {
+        friend class Rasterizer;
+        struct Entry
+        {
+            std::vector<POINT> points;
+            std::vector<BYTE> types;
+            tSpanBuffer fill, border;
+            int rx, ry, width, height, offsetX, offsetY;
+        };
+        struct Slot
+        {
+            uint64_t lastProbe = 0;
+            std::unique_ptr<Entry> entry;
+        };
+        std::array<Slot, 64> slots{};
+    };
+    bool PrepareOutline(OutlineCache& cache, int rx, int ry);
     bool CreateWidenedRegion(int borderX, int borderY);
 #ifdef _VSMOD
     struct OutlineTarget

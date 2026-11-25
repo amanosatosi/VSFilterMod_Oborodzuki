@@ -289,6 +289,8 @@ public:
     bool hasFadeColor[2]{};
 };
 
+struct OverrideTag;
+
 #if defined (_VSMOD) && defined(_LUA)
 class CSubtitle : public CAtlList<CLine*>, public CMyLua
 #else
@@ -310,6 +312,9 @@ public:
     std::vector<std::unique_ptr<CWord>> m_eventBox;
     std::unique_ptr<AssNumeric::Context> m_layoutVariables;
     bool m_measuringLayout = false;
+    bool m_reuseTransform = false;
+    int m_stableFrom = INT_MIN, m_stableThrough = INT_MAX, m_transformDuration = 0;
+    unsigned long long m_fontGeneration = 0;
     std::unique_ptr<AssMotion::Track> m_motion;
     std::unique_ptr<std::array<AssNumeric::Operand, 2>> m_origin;
     std::shared_ptr<const RenderGeometry::Curve> m_curve;
@@ -340,11 +345,12 @@ public:
     Furigana::Options m_rubyOptions;
     struct InheritedMetadata
     {
-        CString style, actor;
+        CString style;
+        const std::vector<OverrideTag>* actorPatch = nullptr;
         STSStyle original;
         Furigana::Options ruby;
         int wrap = 0, boxMode = -1;
-        std::unique_ptr<KfxPaint::SlideSettings> slides;
+        KfxPaint::SlideDirection slideDirection;
     };
     std::unique_ptr<InheritedMetadata> m_inherited;
     int m_annotationLeft = 0, m_annotationRight = 0;
@@ -421,7 +427,6 @@ public:
 };
 
 struct OverrideTagCache;
-struct OverrideTag;
 struct TextGeometryCache;
 struct TextDeviceContext;
 class EventWorkerPool;
@@ -470,6 +475,7 @@ class CRenderedTextSubtitle : public CSimpleTextSubtitle, public ISubPicProvider
     bool ParseSSATag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org, bool fAnimate = false,
         const KfxPaint::SlideSettings* inheritedSlides = nullptr, const std::vector<OverrideTag>* compiled = nullptr);
 #ifdef _VSMOD
+    void CompileMetadata();
     void ApplyMetadata(CSubtitle& subtitle, const CString& styleName, STSStyle& style, bool initial, bool named);
 #endif
     bool ParseHtmlTag(CSubtitle* sub, CStringW str, STSStyle& style, STSStyle& org);
@@ -480,7 +486,8 @@ class CRenderedTextSubtitle : public CSimpleTextSubtitle, public ISubPicProvider
 
     double CalcAnimation(double dst, double src, bool fAnimate);
 
-    CSubtitle* GetSubtitle(int entry, bool measuringLayout = false);
+    CSubtitle* GetSubtitle(int entry, const std::vector<OverrideTag>* actorPatch,
+                           bool measuringLayout = false);
 
 protected:
     virtual void OnChanged();

@@ -61,6 +61,14 @@ inline Rect Unite(Rect a, Rect b)
             (std::max)(a.right, b.right), (std::max)(a.bottom, b.bottom)};
 }
 
+struct SlideDirection
+{
+    double angle = -1; // Automatic is outside the normalized angle range.
+
+    bool IsSet() const { return angle >= 0; }
+    double Resolve(double automatic) const { return IsSet() ? angle : automatic; }
+};
+
 struct Paint;
 using Source = std::shared_ptr<const Paint>;
 struct Paint
@@ -77,6 +85,7 @@ struct Paint
     Source from, to;
     unsigned depth = 0;
     double width = 0, progress = 0;
+    SlideDirection slideDirection;
 };
 
 struct DotState;
@@ -220,6 +229,7 @@ struct SlideSettings
     double positionedAlpha = 0;
     std::array<double, 2> decoration{};
     double global = 0;
+    SlideDirection direction;
 
     double Width(int part) const
     {
@@ -392,7 +402,8 @@ public:
         alpha = inverseAlpha;
         for (; paint->kind == Paint::Kind::Slide; paint = paint->from.get())
         {
-            const Projection axis(Position(*paint, bounds, offsetY), paint->angle);
+            const Projection axis(Position(*paint, bounds, offsetY),
+                                  paint->slideDirection.Resolve(paint->angle));
             const double scale = sx == sy ? sx : (sx > 0 && sy > 0 ?
                 1 / std::hypot(axis.dx / sx, axis.dy / sy) : 0);
             const double limit = (std::numeric_limits<double>::max)() / 2;

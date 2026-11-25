@@ -2,20 +2,22 @@ name: Renderer benchmarks
 
 on:
   push:
-    branches: [develop/oborodzuki, feature/parallel-event-rendering, codex/kfx-paint-extensions, codex/mangetsu-extensions-round-2, codex/mangetsu-extensions-round-3, codex/mangetsu-extensions-round-4]
+    branches: [develop/oborodzuki, feature/parallel-event-rendering, codex/kfx-paint-extensions, codex/mangetsu-extensions-round-2, codex/mangetsu-extensions-round-3, codex/mangetsu-extensions-round-4, astra/extra-optimization-JustInCase]
     paths:
       - 'src/**'
       - 'include/**'
       - 'vapoursynth/**'
       - '.gitattributes'
       - '.github/ci/**'
+      - '.github/parallel/scale_fixtures.py'
+      - 'Run-Benchmark.bat'
       - '.github/workflows/benchmark.yml'
   workflow_dispatch:
     inputs:
       suite:
         description: Benchmark suite
         type: choice
-        options: [iteration, full]
+        options: [iteration, full, portable]
         default: full
 
 permissions:
@@ -23,7 +25,7 @@ permissions:
 
 env:
   VCPKG_REVISION: f3419f137f1a1e79b33b880ae6845f873d87820b
-  BENCH_SUITE: "${{ inputs.suite || (contains(github.event.head_commit.message, 'Benchmark-Suite: full') && 'full') || 'iteration' }}"
+  BENCH_SUITE: "${{ inputs.suite || (contains(github.event.head_commit.message, 'Portable-Benchmark: package') && 'portable') || (contains(github.event.head_commit.message, 'Benchmark-Suite: full') && 'full') || 'iteration' }}"
 
 jobs:
   prepare:
@@ -41,11 +43,11 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $mangetsu = '60e06ef0d4535c5403f446fd46b996df4d0d2560'
+          $mangetsu = '39499c79d933c3fdd30c669964d2758a7721d679'
           $inputs = @(
               @{ kind = 'candidate'; repository = $env:GITHUB_REPOSITORY; ref = $env:GITHUB_SHA },
-              @{ kind = 'original'; repository = 'Masaiki/VSFilterMod'; ref = '808f492f2e6feb92c975cbed9faaa7b4272cfec5' },
-              @{ kind = 'baseline'; repository = $env:GITHUB_REPOSITORY; ref = 'b31674c1341487b706712ecc213482562687781a' },
+              @{ kind = 'original'; repository = 'Masaiki/VSFilterMod'; ref = '64ea41f6cf58c2e60e4ede75fe0a56de76ffef54' },
+              @{ kind = 'baseline'; repository = $env:GITHUB_REPOSITORY; ref = '79db5609394b6f27465cd7f24ccf804f803e075e' },
               @{ kind = 'mangetsu'; repository = 'amanosatosi/libassmod'; ref = $mangetsu }
           )
           $digest = (Get-FileHash -LiteralPath .github/ci/op.fx.4testing.ass).Hash.ToLowerInvariant()
@@ -55,6 +57,7 @@ jobs:
           "mangetsu_revision=$mangetsu" >> $env:GITHUB_OUTPUT
           "renderers=$(ConvertTo-Json -InputObject $inputs -Compress)" >> $env:GITHUB_OUTPUT
           "Primary benchmark: op.fx.4testing.ass (SHA-256 $digest)" >> $env:GITHUB_STEP_SUMMARY
+          "Mangetsu comparison: amanosatosi/libassmod mangetsu branch at $mangetsu" >> $env:GITHUB_STEP_SUMMARY
 
   build-renderer:
     name: Build ${{ matrix.kind }}
@@ -145,20 +148,64 @@ jobs:
         run: |
           call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
           pwsh -NoProfile -File .github\ci\build-bench-component.ps1 -Component harness -Revision "%GITHUB_SHA%" || exit /b 1
+          set "MANGETSU_REVISION=${{ needs.prepare.outputs.mangetsu_revision }}"
+          pwsh -NoProfile -File .github\kfx\build-harness.ps1 -Revision "%GITHUB_SHA%" || exit /b 1
+          cl /nologo /EHsc /O2 /MT .github\parallel\gaussian-check.cpp /Fe:gaussian-check.exe || exit /b 1
+          gaussian-check.exe || exit /b 1
+          cl /nologo /EHsc /O2 /MT .github\parallel\outline-check.cpp /Fe:outline-check.exe || exit /b 1
+          outline-check.exe || exit /b 1
       - uses: actions/upload-artifact@v4
         with:
           name: harness-${{ github.sha }}
           path: bundle/
           if-no-files-found: error
 
+  portable:
+    name: Package Windows x64 portable benchmark
+    if: github.ref_name == 'astra/extra-optimization-JustInCase'
+    needs: [prepare, build-renderer, harness]
+    runs-on: windows-2022
+    timeout-minutes: 15
+    env:
+      BENCH_RENDERERS: ${{ needs.prepare.outputs.renderers }}
+      MANGETSU_REVISION: ${{ needs.prepare.outputs.mangetsu_revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: renderer-*
+          path: benchmark-bundles
+      - uses: actions/download-artifact@v4
+        with:
+          name: harness-${{ github.sha }}
+          path: benchmark-harness
+      - name: Assemble and verify the portable ZIP
+        shell: pwsh
+        run: .github/ci/package-portable.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oborodzuki-benchmark-windows-x64-${{ github.sha }}
+          path: |
+            portable-dist/Oborodzuki-Benchmark-*.zip
+            portable-dist/Oborodzuki-Benchmark-*.zip.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 60
+
   compare:
     name: Compare renderer artifacts
+    if: >-
+      inputs.suite != 'portable' && !contains(github.event.head_commit.message, 'Portable-Benchmark: package')
     needs: [prepare, build-renderer, harness]
     runs-on: windows-2022
     timeout-minutes: 45
     env:
       BENCH_RENDERERS: ${{ needs.prepare.outputs.renderers }}
       BENCH_INPUT_SHA256: ${{ needs.prepare.outputs.input_sha256 }}
+      BENCH_MANGETSU_REVISION: ${{ needs.prepare.outputs.mangetsu_revision }}
+      OBORODZUKI_WORKERS: 1
     steps:
       - uses: actions/checkout@v4
         with:
@@ -183,6 +230,8 @@ jobs:
 
   profile:
     name: Profile instrumented Oborodzuki
+    if: >-
+      inputs.suite != 'portable' && !contains(github.event.head_commit.message, 'Portable-Benchmark: package')
     needs: [prepare, harness]
     runs-on: windows-2022
     timeout-minutes: 30
@@ -208,4 +257,5 @@ jobs:
           path: |
             profile-results/
             bundle/build.json
+            bundle/renderer.dll
           if-no-files-found: warn

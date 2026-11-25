@@ -10,7 +10,12 @@
 
 int wmain(int argc, wchar_t** argv)
 {
-    if (argc != 3)
+    if (argc != 3 && argc != 4)
+        return 2;
+    const auto workers = argc == 4 ? argv[3] : L"4";
+    wchar_t* end = nullptr;
+    const auto count = wcstol(workers, &end, 10);
+    if (*end || count < 1 || count > 12)
         return 2;
     const auto dll = LoadLibraryW(argv[1]);
     if (!dll)
@@ -66,7 +71,7 @@ int wmain(int argc, wchar_t** argv)
         }
         const DWORD gdiBefore = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
 
-        SetEnvironmentVariableW(L"OBORODZUKI_WORKERS", L"4");
+        SetEnvironmentVariableW(L"OBORODZUKI_WORKERS", workers);
         std::atomic<bool> failed{false};
         std::vector<std::thread> threads;
         for (int worker = 0; worker < 4; ++worker)

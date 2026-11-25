@@ -3,6 +3,60 @@
 #include "OverlayMix.h"
 #include <math.h>
 
+#ifdef _VSMOD
+static thread_local GradientCache* activeGradientCache = nullptr;
+
+GradientCacheScope::GradientCacheScope(GradientCache& cache) : previous(activeGradientCache)
+{
+    activeGradientCache = &cache;
+}
+GradientCacheScope::~GradientCacheScope()
+{
+    activeGradientCache = previous;
+}
+
+std::shared_ptr<std::vector<DWORD>> GradientCache::Lookup(const MOD_GRADIENT& gradient, int channel)
+{
+    const int w = gradient.width, h = gradient.height;
+    if (gradient.mode[channel] != 1 || w <= 0 || h <= 0 || w > 8192 / h)
+        return {};
+    Key key{w, h};
+    std::copy_n(gradient.color[channel], 4, key.colors);
+    memcpy(&key.alphas, gradient.alpha[channel], sizeof(key.alphas));
+    key.fade = gradient.fadalpha;
+    uint64_t hash = unsigned(w) * 16777619u + unsigned(h);
+    for (DWORD c : key.colors) hash = (hash ^ c) * 1099511628211ull;
+    hash = (hash ^ key.alphas) * 1099511628211ull ^ key.fade;
+    auto& slot = slots[(hash ^ (hash >> 31) ^ (hash >> 13)) % slots.size()];
+    if (slot.samples && !memcmp(&key, &slot.key, sizeof(key))) return slot.samples;
+    if (slot.lastProbe != hash) {
+        slot.lastProbe = hash;
+        return {};
+    }
+    auto samples = std::make_shared<std::vector<DWORD>>(w * h, 0xffffffff);
+    slot.key = key;
+    slot.samples = samples;
+    return samples;
+}
+
+DWORD COverlayGradient::Sample(int x, int y, int channel, Channel& state)
+{
+    if (!state.tried) {
+        state.tried = true;
+        if (activeGradientCache) state.samples = activeGradientCache->Lookup(mod_grad, channel);
+    }
+    const int tx = mod_grad.xoffset + x;
+    if (state.samples && unsigned(tx) < unsigned(mod_grad.width) && unsigned(y) < unsigned(mod_grad.height)) {
+        auto& color = (*state.samples)[y * mod_grad.width + tx];
+        // Legacy corner opacity is the high byte of a product of two bytes
+        // and can reach only 254. White at alpha 255 is a free sentinel.
+        if (color == 0xffffffff) color = mod_grad.getmixcolor(x, y, channel);
+        return color;
+    }
+    return mod_grad.getmixcolor(x, y, channel);
+}
+#endif
+
 static __forceinline DWORD blendMixColor(DWORD* dst, DWORD* color, MOD_BLEND mod_blendMode) {
     if (mod_blendMode == BLEND_NORMAL) {
         return *color;
@@ -217,6 +271,51 @@ static __forceinline void MixFourNormalPixels(DWORD* dst, __m128i colors, __m128
     _mm_storeu_si128(reinterpret_cast<__m128i*>(dst), _mm_packus_epi16(low, high));
 }
 
+// Solid paint shares its source lanes and opacity across the entire draw.
+// Both channels of eight interleaved mask pixels fit in a single SSE2 load.
+static void DrawSolidNormal(DWORD* dst, const BYTE* mask, int x, int end, DWORD color,
+    bool body, bool useBorder)
+{
+    const auto zero = _mm_setzero_si128();
+    const auto byteMask = _mm_set1_epi16(255);
+    const auto opacity = _mm_set1_epi16(short(color >> 24));
+    const auto rgb = _mm_set1_epi32(color & 0xffffff);
+    const auto source = _mm_unpacklo_epi8(rgb, zero);
+    for (; x <= end - 8; x += 8) {
+        const auto packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(mask + 2 * x));
+        const auto fill = _mm_and_si128(packed, byteMask);
+        const auto border = _mm_srli_epi16(packed, 8);
+        const auto coverage = body ? (useBorder ? border : fill) : _mm_subs_epu16(border, fill);
+        if (_mm_movemask_epi8(_mm_cmpeq_epi16(coverage, zero)) == 0xffff) continue;
+        auto* pixels = reinterpret_cast<__m128i*>(dst + x);
+        if ((color >> 24) == 255 &&
+            _mm_movemask_epi8(_mm_cmpeq_epi16(coverage, _mm_set1_epi16(64))) == 0xffff) {
+            _mm_storeu_si128(pixels, rgb);
+            _mm_storeu_si128(pixels + 1, rgb);
+            continue;
+        }
+        const auto alpha = _mm_and_si128(_mm_srli_epi16(_mm_mullo_epi16(coverage, opacity), 6), byteMask);
+        auto mixFour = [&](__m128i* dest, __m128i a) {
+            const auto d = _mm_loadu_si128(dest);
+            const auto lo = MixTwoNormalPixels(_mm_unpacklo_epi8(d, zero), source, _mm_unpacklo_epi32(a, a));
+            const auto hi = MixTwoNormalPixels(_mm_unpackhi_epi8(d, zero), source, _mm_unpackhi_epi32(a, a));
+            _mm_storeu_si128(dest, _mm_packus_epi16(lo, hi));
+        };
+        mixFour(pixels, _mm_unpacklo_epi16(alpha, alpha));
+        mixFour(pixels + 1, _mm_unpackhi_epi16(alpha, alpha));
+    }
+    for (; x < end; ++x) {
+        const int fill = mask[2*x], border = mask[2*x + 1];
+        const unsigned coverage = body ? (useBorder ? border : fill) : (std::max)(0, border - fill);
+        if (!coverage) continue;
+        const unsigned a = ((coverage * (color >> 24)) >> 6) & 255, ia = 256 - a;
+        const DWORD d = dst[x];
+        dst[x] = ((((d & 0xff00ff) * ia + (color & 0xff00ff) * (a + 1)) >> 8) & 0xff00ff)
+            | ((((d & 0xff00) * ia + (color & 0xff00) * (a + 1)) >> 8) & 0xff00)
+            | (((d >> 24) * ia >> 8) << 24);
+    }
+}
+
 void COverlayMixerSSE2::Draw(bool Body)
 {
     const int gran = (Info->sw[1] == 0xffffffff) ? Info->w : min(Info->sw[3] + 1 - Info->xo, Info->w);
@@ -233,11 +332,20 @@ void COverlayMixerSSE2::Draw(bool Body)
     const auto bodyMask = _mm_set1_epi16(255);
 
     const int bottom = Info->rowOffset;
+    if (solid) {
+        const DWORD first = solid->getcolor1(0, 0), second = solid->getcolor2(0, 0);
+        for (int row = 0; row < Info->h; ++row) {
+            DrawSolidNormal(dst, mask, 0, gran, first, Body, bodyUsesBorder);
+            if (gran < Info->w)
+                DrawSolidNormal(dst, mask, gran, Info->w, second, Body, bodyUsesBorder);
+            mask += 2 * Info->overlayp;
+            dst = reinterpret_cast<DWORD*>(reinterpret_cast<char*>(dst) + Info->pitch);
+        }
+        return;
+    }
     for (int y = Info->h + bottom - 1; y >= bottom; --y)
     {
         auto drawRange = [&](int x, int end, DWORD (COverlayGetter::*getColor)(int, int)) {
-            const DWORD color = solid ? (solid->*getColor)(0, 0) : 0;
-            const auto repeatedColor = _mm_set1_epi32(color);
             for (; x <= end - 4; x += 4)
             {
                 const auto both = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(mask + 2 * x));
@@ -249,7 +357,7 @@ void COverlayMixerSSE2::Draw(bool Body)
                 const int empty = _mm_movemask_epi8(_mm_cmpeq_epi16(coverage, _mm_setzero_si128()));
                 if ((empty & 0xff) == 0xff)
                     continue;
-                const auto colors = solid ? repeatedColor : _mm_setr_epi32(
+                const auto colors = _mm_setr_epi32(
                     (empty & 0x01) ? 0 : (Color->*getColor)(x, y),
                     (empty & 0x04) ? 0 : (Color->*getColor)(x + 1, y),
                     (empty & 0x10) ? 0 : (Color->*getColor)(x + 2, y),
@@ -262,7 +370,7 @@ void COverlayMixerSSE2::Draw(bool Body)
                 const auto border = mask[2 * x + 1];
                 const auto coverage = Body ? (bodyUsesBorder ? border : fill) : SafeSubstract(border, fill);
                 if (coverage)
-                    PixMix(dst + x, solid ? color : (Color->*getColor)(x, y), BYTE(coverage), BLEND_NORMAL);
+                    PixMix(dst + x, (Color->*getColor)(x, y), BYTE(coverage), BLEND_NORMAL);
             }
         };
         drawRange(0, gran, &COverlayGetter::getcolor1);

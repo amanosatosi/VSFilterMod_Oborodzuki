@@ -816,8 +816,8 @@ if ROUND4:
 
     # These hosts open the supplied script bytes with csri_open_mem.
     carriers = (
-        "Dialogue: 0,0:00:00.00,9:59:59.99,Default,,0,0,0,oborodzuki-style,{\\furis70}\n"
-        f"Dialogue: 0,0:00:00.00,9:59:59.99,Default,Nene,0,0,0,oborodzuki-colorcoding,"
+        "Dialogue: 0,0:00:00.00,9:59:59.99,Default,,0,0,0,OBRS,{\\furis70}\n"
+        f"Dialogue: 0,0:00:00.00,9:59:59.99,Default,Nene,0,0,0,OBRCC,"
         f"{{\\f[annotation]s50\\1c{GREEN}\\pos(10,10)}}\n"
     )
     inherited = write("metadata-carriers", [

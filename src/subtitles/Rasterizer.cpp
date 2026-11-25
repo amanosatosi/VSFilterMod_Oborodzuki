@@ -29,6 +29,7 @@
 #include <algorithm>
 #include "Rasterizer.h"
 #include "SeparableFilter.h"
+#include "RoundOutline.h"
 #include "OverlayMix.h"
 
 #ifndef _MAX	/* avoid collision with common (nonconforming) macros */
@@ -361,25 +362,8 @@ bool Rasterizer::CopyPath(const POINT* points, const BYTE* types, size_t count)
 
 bool Rasterizer::EndPath(HDC hdc)
 {
-    ::CloseFigure(hdc);
-
-    if(::EndPath(hdc))
-    {
-        mPathPoints = GetPath(hdc, NULL, NULL, 0);
-
-        if(!mPathPoints)
-            return true;
-
-        mpPathTypes = (BYTE*)malloc(sizeof(BYTE) * mPathPoints);
-        mpPathPoints = (POINT*)malloc(sizeof(POINT) * mPathPoints);
-
-        if(mPathPoints == GetPath(hdc, mpPathPoints, mpPathTypes, mPathPoints))
-            return true;
-    }
-
-    ::AbortPath(hdc);
-
-    return false;
+    _TrashPath();
+    return PartialEndPath(hdc, 0, 0);
 }
 
 bool Rasterizer::PartialBeginPath(HDC hdc, bool bClearPath)
@@ -392,56 +376,42 @@ bool Rasterizer::PartialBeginPath(HDC hdc, bool bClearPath)
 
 bool Rasterizer::PartialEndPath(HDC hdc, long dx, long dy)
 {
+    const auto fail = [&] {
+        ::AbortPath(hdc);
+        _TrashPath();
+        return false;
+    };
     ::CloseFigure(hdc);
+    if (!::EndPath(hdc)) return fail();
+    const int count = ::GetPath(hdc, nullptr, nullptr, 0);
+    if (count == 0) return true;
+    if (count < 0 || size_t(count) > SIZE_MAX / sizeof(POINT) - mPathPoints)
+        return fail();
 
-    if(::EndPath(hdc))
-    {
-        int nPoints;
-        BYTE* pNewTypes;
-        POINT* pNewPoints;
+    const size_t total = mPathPoints + size_t(count);
+    // GDI requires an aligned output buffer even for its byte-sized path types.
+    // An appended glyph can begin at any byte in our packed type array.
+    const size_t typeOffset = (mPathPoints + sizeof(DWORD) - 1) & ~(sizeof(DWORD) - 1);
+    auto* types = static_cast<BYTE*>(realloc(mpPathTypes, typeOffset + size_t(count)));
+    if (!types) return fail();
+    mpPathTypes = types;
+    auto* points = static_cast<POINT*>(realloc(mpPathPoints, total * sizeof(POINT)));
+    if (!points) return fail();
+    mpPathPoints = points;
 
-        nPoints = GetPath(hdc, NULL, NULL, 0);
-
-        if(!nPoints)
-            return true;
-
-        pNewTypes = (BYTE*)realloc(mpPathTypes, (mPathPoints + nPoints) * sizeof(BYTE));
-        pNewPoints = (POINT*)realloc(mpPathPoints, (mPathPoints + nPoints) * sizeof(POINT));
-
-        if(pNewTypes)
-            mpPathTypes = pNewTypes;
-
-        if(pNewPoints)
-            mpPathPoints = pNewPoints;
-
-        BYTE* pTypes = DNew BYTE[nPoints];
-        POINT* pPoints = DNew POINT[nPoints];
-
-        if(pNewTypes && pNewPoints && nPoints == GetPath(hdc, pPoints, pTypes, nPoints))
+    auto* added = points + mPathPoints;
+    if (::GetPath(hdc, added, types + typeOffset, count) != count)
+        return fail();
+    if (typeOffset != mPathPoints)
+        memmove(types + mPathPoints, types + typeOffset, size_t(count));
+    if (dx || dy)
+        for (int i = 0; i < count; ++i)
         {
-            for(ptrdiff_t i = 0; i < nPoints; ++i)
-            {
-                mpPathPoints[mPathPoints + i].x = pPoints[i].x + dx;
-                mpPathPoints[mPathPoints + i].y = pPoints[i].y + dy;
-                mpPathTypes[mPathPoints + i] = pTypes[i];
-            }
-
-            mPathPoints += nPoints;
-
-            delete[] pTypes;
-            delete[] pPoints;
-            return true;
+            added[i].x += dx;
+            added[i].y += dy;
         }
-        else
-            DebugBreak();
-
-        delete[] pTypes;
-        delete[] pPoints;
-    }
-
-    ::AbortPath(hdc);
-
-    return false;
+    mPathPoints = total;
+    return true;
 }
 
 bool Rasterizer::ScanConvert(bool geometric)
@@ -820,8 +790,30 @@ bool Rasterizer::WidenOutlineByRow(int rx, int ry)
     auto row = &rowStorage[0];
     auto scratch = &scratchStorage[0];
     mWideOutline.reserve(mOutline.size());
+    RoundOutline::Rows strips;
+    const bool useStrips = (g_cpuid.m_flags & CCpuID::sse2) &&
+        RoundOutline::Build(rows, sourceSpans, radius, strips);
     for (int y = -ry; y < mHeight + ry; ++y)
     {
+        const auto packedY = (static_cast<unsigned __int64>(y) + 0x40000000) << 32;
+        if (useStrips && strips.safe[y + ry])
+        {
+            auto& spans = strips.intervals;
+            const auto first = strips.offsets[y + ry], end = strips.offsets[y + ry + 1];
+            std::sort(spans.begin() + first, spans.begin() + end);
+            for (auto i = first; i < end;)
+            {
+                auto merged = spans[i++];
+                while (i < end && spans[i].first <= merged.second)
+                {
+                    merged.second = (std::max)(merged.second, spans[i].second);
+                    ++i;
+                }
+                mWideOutline.emplace_back(packedY | DWORD(0x40000000 + merged.first),
+                    packedY | DWORD(0x40000000 + merged.second));
+            }
+            continue;
+        }
         size_t rowCount = 0;
         const int firstSource = min(y + ry, mHeight - 1);
         const int lastSource = max(y - ry, 0);
@@ -911,10 +903,68 @@ bool Rasterizer::WidenOutlineByRow(int rx, int ry)
                 rowCount = count;
             }
         }
-        const auto packedY = (static_cast<unsigned __int64>(y) + 0x40000000) << 32;
         for (size_t i = 0; i < rowCount; ++i)
             mWideOutline.emplace_back(packedY | row[i].first, packedY | row[i].second);
     }
+    return true;
+}
+
+bool Rasterizer::PrepareOutline(OutlineCache& cache, int rx, int ry)
+{
+    const auto build = [&] {
+        return ScanConvert() && (!(rx || ry) || CreateWidenedRegion(rx, ry));
+    };
+    if (!mPathPoints || mPathPoints > 2048)
+        return build();
+
+    // Sampling chooses a slot only. The full transformed path and both
+    // integer radii must match before any geometry can be reused.
+    uint64_t probe = mPathPoints;
+    for (size_t i = 0; i < 8; ++i) {
+        const auto& p = mpPathPoints[(mPathPoints - 1) * i / 7];
+        probe = (probe ^ DWORD(p.x)) * 1099511628211ull;
+        probe = (probe ^ DWORD(p.y)) * 1099511628211ull;
+    }
+    probe = (probe ^ DWORD(rx)) * 1099511628211ull ^ DWORD(ry);
+    auto& slot = cache.slots[(probe ^ (probe >> 32) ^ (probe >> 17)) % cache.slots.size()];
+    const auto* hit = slot.entry.get();
+    if (hit && hit->points.size() == mPathPoints && hit->rx == rx && hit->ry == ry &&
+        !memcmp(hit->points.data(), mpPathPoints, mPathPoints * sizeof(POINT)) &&
+        !memcmp(hit->types.data(), mpPathTypes, mPathPoints)) {
+        mOutline = hit->fill;
+        mWideOutline = hit->border;
+        mWidth = hit->width;
+        mHeight = hit->height;
+        mPathOffsetX = hit->offsetX;
+        mPathOffsetY = hit->offsetY;
+        mWideBorder = (std::max)(rx, ry);
+        _TrashPath();
+        return true;
+    }
+
+    // An animation with a different outline every frame should not allocate
+    // cache entries or evict a useful shape on every miss.
+    if (slot.lastProbe != probe) {
+        slot.lastProbe = probe;
+        return build();
+    }
+    auto entry = std::make_unique<OutlineCache::Entry>();
+    entry->points.assign(mpPathPoints, mpPathPoints + mPathPoints);
+    entry->types.assign(mpPathTypes, mpPathTypes + mPathPoints);
+    if (!build()) return false;
+    const size_t pathBytes = entry->points.size() * (sizeof(POINT) + sizeof(BYTE));
+    const size_t spanLimit = (65536 - pathBytes) / sizeof(tSpan);
+    if (mOutline.size() > spanLimit || mWideOutline.size() > spanLimit - mOutline.size())
+        return true;
+    entry->rx = rx;
+    entry->ry = ry;
+    entry->width = mWidth;
+    entry->height = mHeight;
+    entry->offsetX = mPathOffsetX;
+    entry->offsetY = mPathOffsetY;
+    entry->fill = mOutline;
+    entry->border = mWideOutline;
+    slot.entry = std::move(entry);
     return true;
 }
 
@@ -1224,7 +1274,13 @@ bool Rasterizer::Rasterize(int xsub, int ysub, int fBlur, double fGaussianBlurX,
     if(fGaussianBlur > 0)
     {
         GaussianKernel filter(fGaussianBlur);
-        if(mOverlayWidth >= filter.width && mOverlayHeight >= filter.width)
+        if (mOverlayWidth >= filter.width && mOverlayHeight >= filter.width &&
+            (g_cpuid.m_flags & CCpuID::sse2) && filter.divisor > 1 && filter.divisor <= 257)
+        {
+            GaussianCoverage(mpOverlayBuffer, mOverlayWidth, mOverlayHeight, !mWideOutline.empty(),
+                filter, direction);
+        }
+        else if(mOverlayWidth >= filter.width && mOverlayHeight >= filter.width)
         {
             size_t pitch = mOverlayWidth * 2;
 
@@ -1329,6 +1385,65 @@ static void BlendOverlay(RasterizerNfo& info, bool body, COverlayGetter* color, 
 }
 
 #ifdef _VSMOD
+// Vector clips are often solid across whole glyph rows. Preserve the old
+// six-bit sampler's bottom-edge convention and group adjacent rows so the
+// ordinary SIMD mixer can process the opaque part of a clip directly.
+enum class ClipRow { Empty, Opaque, Partial };
+
+static ClipRow ClassifyClipRow(const BYTE* mask, int width)
+{
+    const BYTE first = mask[0];
+    if (first != 0 && first != 64) return ClipRow::Partial;
+    const auto expected = _mm_set1_epi8(char(first));
+    int x = 0;
+    for (; x <= width - 16; x += 16)
+    {
+        const auto values = _mm_loadu_si128(reinterpret_cast<const __m128i*>(mask + x));
+        if (_mm_movemask_epi8(_mm_cmpeq_epi8(values, expected)) != 0xffff)
+            return ClipRow::Partial;
+    }
+    for (; x < width; ++x)
+        if (mask[x] != first) return ClipRow::Partial;
+    return first ? ClipRow::Opaque : ClipRow::Empty;
+}
+
+static void BlendClippedSSE2(RasterizerNfo& info, bool body, COverlayGetter* color,
+    COverlayAlpha* alpha, const MOD_MOVEVC& clip)
+{
+    if (!alpha || clip.enable || info.mod_blendMode != BLEND_NORMAL || info.w > clip.spd.cx)
+    {
+        BlendOverlay<COverlayMixerSSE2>(info, body, color, alpha);
+        return;
+    }
+
+    const auto classify = [&](int row) {
+        const int wy = info.rowOffset + info.h - row - 1;
+        if (wy <= 0 || wy > clip.spd.cy) return ClipRow::Empty;
+        return ClassifyClipRow(clip.alphamask + ptrdiff_t(clip.hfull - wy) * clip.spd.cx, info.w);
+    };
+    ClipRow kind = classify(0);
+    for (int first = 0, next = 1; next <= info.h; ++next)
+    {
+        const auto following = next == info.h ? ClipRow::Empty : classify(next);
+        if (following == kind && next != info.h) continue;
+        if (kind != ClipRow::Empty)
+        {
+            auto span = info;
+            span.h = next - first;
+            span.rowOffset += info.h - next;
+            span.dst = reinterpret_cast<DWORD*>(reinterpret_cast<BYTE*>(info.dst) + ptrdiff_t(first) * info.pitch);
+            const auto offset = 2 * ptrdiff_t(first) * info.overlayp;
+            span.s += offset;
+            span.src += offset;
+            // The legacy clipped outline subtracts from the selected channel.
+            if (!body && kind == ClipRow::Opaque) span.src = span.s;
+            BlendOverlay<COverlayMixerSSE2>(span, body, color, kind == ClipRow::Opaque ? nullptr : alpha);
+        }
+        first = next;
+        kind = following;
+    }
+}
+
 // Each band makes its own sampler from immutable event paint and full bounds.
 class COverlayKfxPaint : public COverlayGetter
 {
@@ -1488,7 +1603,7 @@ void OverlayDraw::Blend(int top, int bottom) const
             band.s = band.src;
         COverlayKfxPaint extended(*this);
         if (g_cpuid.m_flags & CCpuID::sse2)
-            BlendOverlay<COverlayMixerSSE2>(band, body, &extended, alpha);
+            BlendClippedSSE2(band, body, &extended, alpha, maskPosition);
         else
             BlendOverlay<COverlayMixer>(band, body, &extended, alpha);
 #ifndef _M_X64
@@ -1498,7 +1613,11 @@ void OverlayDraw::Blend(int top, int bottom) const
     }
 #endif
     if (g_cpuid.m_flags & CCpuID::sse2)
+#ifdef _VSMOD
+        BlendClippedSSE2(band, body, color, alpha, maskPosition);
+#else
         BlendOverlay<COverlayMixerSSE2>(band, body, color, alpha);
+#endif
     else
         BlendOverlay<COverlayMixer>(band, body, color, alpha);
 #ifndef _M_X64

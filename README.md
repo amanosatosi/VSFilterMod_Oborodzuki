@@ -58,3 +58,5 @@ Oborodzuki uses the same DirectShow class IDs as VSFilterMod. Registering Oborod
 Knowing Issues
 =====
 * Opentype font (such as Source Han Sans) has a much smaller size when displayed vertically (used like @Source Han Sans). (subtitle renders which origin from VSFilter use GDI to render fonts, but GDI performs badly on opentype fonts.)
+
+[Actor Colorcoding and shared ASS metadata](docs/actor-colorcoding.md)

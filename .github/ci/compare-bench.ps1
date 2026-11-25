@@ -25,6 +25,12 @@ if (!(Test-Path $harness -PathType Leaf) -or !(Test-Path $harnessInfo -PathType 
 }
 $harnessMetadata = Get-Content $harnessInfo -Raw | ConvertFrom-Json
 if ($harnessMetadata.revision -ne $env:GITHUB_SHA) { throw 'Harness revision mismatch' }
+if (!$env:BENCH_MANGETSU_REVISION -or $renderers.mangetsu.revision -ne $env:BENCH_MANGETSU_REVISION) {
+    throw "Mangetsu DLL revision does not match the selected mangetsu branch commit $env:BENCH_MANGETSU_REVISION"
+}
+if ($harnessMetadata.headers_revision -ne $env:BENCH_MANGETSU_REVISION) {
+    throw "Mangetsu benchmark header revision does not match the renderer: $($harnessMetadata.headers_revision)"
+}
 $fontKeys = @(
     'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts',
     'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
